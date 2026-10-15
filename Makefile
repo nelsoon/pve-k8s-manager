@@ -12,7 +12,7 @@ JS_FILES   := $(shell find www -name '*.js')
 all: lint deb
 
 lint:
-	@for f in $(PERL_FILES); do perl -I. -c $$f || exit 1; done
+	@for f in $(PERL_FILES); do perl -I. -Itests/stubs -c $$f || exit 1; done
 	@for f in $(JS_FILES); do node --check $$f || exit 1; done
 	@echo "lint ok: $(words $(PERL_FILES)) perl modules, $(words $(JS_FILES)) js files"
 
