@@ -1,0 +1,5 @@
+#!/usr/bin/make -f
+# Skeleton rules file. The top-level Makefile builds the .deb
+# directly until the full debhelper flow is wired in Increment 4.
+%:
+	dh $@

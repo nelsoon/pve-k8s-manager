@@ -1,0 +1,13 @@
+Source: pve-k8s-manager
+Section: admin
+Priority: optional
+Maintainer: pve-k8s contributors
+Standards-Version: 4.6.2
+Homepage: https://pve.proxmox.com
+
+Package: pve-k8s-manager
+Architecture: all
+Depends: ${misc:Depends}
+Description: Kubernetes cluster management for Proxmox VE
+ Provisions and manages kubeadm Kubernetes clusters on Proxmox
+ VMs from the Proxmox web UI, using Proxmox SDN and storage.
