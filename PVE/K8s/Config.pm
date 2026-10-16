@@ -70,6 +70,35 @@ my $defaultData = {
             default => 3,
             optional => 1,
         },
+        workers => {
+            type => 'integer',
+            description => "Worker node count (single default pool for now).",
+            minimum => 0,
+            maximum => 50,
+            default => 2,
+            optional => 1,
+        },
+        'node-subnet' => {
+            type => 'string',
+            description => "SDN subnet for node VMs, e.g. '192.168.200.0/24'.",
+            optional => 1,
+        },
+        gateway => {
+            type => 'string',
+            description => "Gateway for node VMs, e.g. '192.168.200.1'.",
+            optional => 1,
+        },
+        'lb-range' => {
+            type => 'string',
+            description => "LoadBalancer address range, e.g. '192.168.200.100-192.168.200.120'.",
+            optional => 1,
+        },
+        storage => {
+            type => 'string',
+            format => 'pve-storage-id',
+            description => "PVE storage for node disks.",
+            optional => 1,
+        },
         state => {
             type => 'string',
             description => "Lifecycle state recorded by pve-k8sd.",
@@ -92,6 +121,16 @@ sub options {
         description => { optional => 1 },
         'k8s-version' => {},
         cp => { optional => 1 },
+        workers => { optional => 1 },
+        'node-subnet' => { optional => 1 },
+        gateway => { optional => 1 },
+        gateway => {
+            type => 'string',
+            description => "Gateway for node VMs, e.g. '192.168.200.1'.",
+            optional => 1,
+        },
+        'lb-range' => { optional => 1 },
+        storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },
     };

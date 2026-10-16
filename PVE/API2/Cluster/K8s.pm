@@ -6,6 +6,7 @@ use strict;
 use warnings;
 
 use PVE::K8s::Config;
+use PVE::K8s::Provision;
 
 use base qw(PVE::RESTHandler);
 
@@ -71,6 +72,36 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Control-plane node count (1, 3 or 5).",
             },
+            workers => {
+                type => 'integer',
+                minimum => 0,
+                maximum => 50,
+                default => 2,
+                optional => 1,
+                description => "Worker node count (single default pool for now).",
+            },
+            'node-subnet' => {
+                type => 'string',
+                optional => 1,
+                description => "SDN subnet for node VMs, e.g. '192.168.200.0/24'.",
+            },
+            gateway => {
+                type => 'string',
+                optional => 1,
+                description => "Gateway for node VMs, e.g. '192.168.200.1'.",
+            },
+            'lb-range' => {
+                type => 'string',
+                optional => 1,
+                description => "LoadBalancer address range, "
+                    . "e.g. '192.168.200.100-192.168.200.120'.",
+            },
+            storage => {
+                type => 'string',
+                format => 'pve-storage-id',
+                optional => 1,
+                description => "PVE storage for node disks.",
+            },
             description => {
                 type => 'string',
                 maxLength => 4096,
@@ -95,16 +126,43 @@ __PACKAGE__->register_method({
                 type => 'cluster',
                 'k8s-version' => $param->{'k8s-version'},
                 cp => $cp,
+                workers => $param->{workers} // 2,
                 state => 'config-only',
                 created => time(),
-                ($param->{description}
-                    ? (description => $param->{description})
-                    : ()),
+                (map { $param->{$_} ? ($_ => $param->{$_}) : () }
+                    qw(node-subnet gateway lb-range storage description)),
             };
 
             PVE::K8s::Config::store_config($cfg);
         });
 
+        return undef;
+    }});
+
+__PACKAGE__->register_method({
+    name => 'provision',
+    path => '{name}/provision',
+    method => 'POST',
+    protected => 1,
+    description => "Provision (or resume provisioning) the cluster's VMs and bootstrap Kubernetes.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        PVE::K8s::Provision::provision_cluster($param->{name});
         return undef;
     }});
 

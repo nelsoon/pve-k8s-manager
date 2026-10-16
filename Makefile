@@ -12,11 +12,14 @@ JS_FILES   := $(shell find www -name '*.js')
 all: lint deb
 
 lint:
+	@awk 'length>100{print FILENAME":"FNR": "length" columns"; bad=1} END{exit bad}' $(PERL_FILES)
 	@for f in $(PERL_FILES); do perl -I. -Itests/stubs -c $$f || exit 1; done
 	@for f in $(JS_FILES); do node --check $$f || exit 1; done
 	@echo "lint ok: $(words $(PERL_FILES)) perl modules, $(words $(JS_FILES)) js files"
 
 test: lint deb
+	@perl -I. -Itests/stubs tests/unit/provision-kubeadm.t
+	@perl -I. -Itests/stubs tests/unit/template-recipe.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Skeleton packaging: stage the payload and build with dpkg-deb.
