@@ -7,6 +7,7 @@ use warnings;
 
 use PVE::K8s::Config;
 use PVE::K8s::Provision;
+use PVE::RPCEnvironment;
 
 use base qw(PVE::RESTHandler);
 
@@ -158,12 +159,19 @@ __PACKAGE__->register_method({
             },
         },
     },
-    returns => { type => 'null' },
+    returns => { type => 'string' },
     code => sub {
         my ($param) = @_;
 
-        PVE::K8s::Provision::provision_cluster($param->{name});
-        return undef;
+        my $name = $param->{name};
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        # Provisioning takes minutes; run it as a PVE task so the
+        # UI can show progress in the task log like other actions.
+        return $rpcenv->fork_worker('k8sprovision', $name, $authuser, sub {
+            PVE::K8s::Provision::provision_cluster($name);
+        });
     }});
 
 __PACKAGE__->register_method({

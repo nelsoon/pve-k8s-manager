@@ -20,6 +20,7 @@ lint:
 test: lint deb
 	@perl -I. -Itests/stubs tests/unit/provision-kubeadm.t
 	@perl -I. -Itests/stubs tests/unit/template-recipe.t
+	@perl -I. -Itests/stubs tests/unit/ui-k8s.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Skeleton packaging: stage the payload and build with dpkg-deb.
