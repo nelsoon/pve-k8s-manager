@@ -81,6 +81,12 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Worker node count (single default pool for now).",
             },
+            pools => {
+                type => 'string',
+                optional => 1,
+                description => "Worker pools as JSON: [{name, size, labels, "
+                    . "taints, hosts, storage, device-profile}].",
+            },
             'node-subnet' => {
                 type => 'string',
                 optional => 1,
@@ -117,6 +123,10 @@ __PACKAGE__->register_method({
 
         my $name = $param->{name};
         my $cp = PVE::K8s::Config::assert_valid_cp_count($param->{cp} // 3);
+        # validate pools eagerly so a bad pool spec fails at
+        # create time, not halfway through provisioning
+        PVE::K8s::Config::parse_pools($param->{pools}, $param->{workers} // 2)
+            if defined $param->{pools};
 
         PVE::K8s::Config::lock_config(sub {
             my $cfg = PVE::K8s::Config->config();
@@ -131,7 +141,7 @@ __PACKAGE__->register_method({
                 state => 'config-only',
                 created => time(),
                 (map { $param->{$_} ? ($_ => $param->{$_}) : () }
-                    qw(node-subnet gateway lb-range storage description)),
+                    qw(node-subnet gateway lb-range pools storage description)),
             };
 
             PVE::K8s::Config::store_config($cfg);

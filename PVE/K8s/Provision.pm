@@ -6,6 +6,7 @@ use strict;
 use warnings;
 
 use JSON::PP ();
+use MIME::Base64 ();
 
 use PVE::Tools qw(run_command);
 
@@ -36,6 +37,142 @@ my sub qm {
     return run(['qm', @args], timeout => 600);
 }
 
+# --- multi-host placement (T2.1): VMs may live on any PVE
+# host in the cluster. Cluster members trust each other's
+# root SSH keys (pmxcfs-distributed), so remote qm/guest
+# operations go over ssh with shell-quoted arguments.
+my %VM_HOST;
+my $LOCAL_NODE;
+
+my sub shq {
+    my ($s) = @_;
+    $s =~ s/'/'\\''/g;
+    return "'$s'";
+}
+
+sub local_node_name {
+    if (!$LOCAL_NODE) {
+        $LOCAL_NODE = run(['hostname'], timeout => 30);
+        $LOCAL_NODE =~ s/\s+//g;
+    }
+    return $LOCAL_NODE;
+}
+
+my sub qm_on {
+    my ($host, @args) = @_;
+
+    return qm(@args) if !$host || $host eq local_node_name();
+    my $cmd = join ' ', 'qm', map { shq($_) } @args;
+    return run(['ssh', '-o', 'BatchMode=yes', $host, $cmd], timeout => 600);
+}
+
+# Run an arbitrary command on a PVE host (local or via ssh).
+my sub host_run_on {
+    my ($host, @args) = @_;
+
+    return run([@args], timeout => 120) if !$host || $host eq local_node_name();
+    my $cmd = join ' ', map { shq($_) } @args;
+    return run(['ssh', '-o', 'BatchMode=yes', $host, $cmd], timeout => 120);
+}
+
+# MTU of a bridge on a host; VXLAN SDN bridges are typically
+# 1450, and guests left at 1500 blackhole larger packets.
+my sub bridge_mtu_on {
+    my ($host, $bridge) = @_;
+
+    my $out = host_run_on($host, 'ip', '-o', 'link', 'show', $bridge);
+    return $out =~ /mtu (\d+)/ ? int $1 : 1500;
+}
+
+# Like qm_on but never dies on non-zero exit (guest exec
+# returns a pid with a non-zero status while still running).
+my sub qm_raw_on {
+    my ($host, @args) = @_;
+
+    if (!$host || $host eq local_node_name()) {
+        return run(['qm', @args], noerr => 1, timeout => 600);
+    }
+    my $cmd = join ' ', 'qm', map { shq($_) } @args;
+    return run(['ssh', '-o', 'BatchMode=yes', $host, $cmd],
+        noerr => 1, timeout => 600);
+}
+
+my sub host_of {
+    my ($vmid) = @_;
+    return $VM_HOST{$vmid} // local_node_name();
+}
+
+# Online PVE node names from cluster status.
+my sub pve_online_nodes {
+    my $out = run(['pvesh', 'get', '/cluster/status',
+        '--output-format', 'json'], timeout => 60);
+    my $status = JSON::PP->new->decode($out);
+    return [grep { defined }
+        map { ($_->{type} // '') eq 'node' && ($_->{online} // 0) ? $_->{name} : undef }
+        $status->@*];
+}
+
+# HA group per host (first group containing it), or undef.
+# HA groups are Proxmox's fault-domain unit (there are no
+# host labels), so placement spreads across them when set.
+my sub ha_group_by_host {
+    my $out = eval {
+        run(['pvesh', 'get', '/cluster/ha/groups',
+            '--output-format', 'json'], timeout => 60, noerr => 1);
+    } // '[]';
+    my $groups = eval { JSON::PP->new->decode($out) } // [];
+    my %by_host;
+    for my $group ($groups->@*) {
+        for my $entry (split /,/, $group->{nodes} // '') {
+            my ($host) = split /:/, $entry;
+            $by_host{$host} //= $group->{group};
+        }
+    }
+    return \%by_host;
+}
+
+# Cluster-wide VM inventory: name -> { vmid, node }.
+my sub cluster_vms {
+    my $out = run(['pvesh', 'get', '/cluster/resources',
+        '--type', 'vm', '--output-format', 'json'], timeout => 60);
+    my $res = JSON::PP->new->decode($out);
+    my %vms;
+    for my $vm ($res->@*) {
+        next if !defined $vm->{name};
+        $vms{$vm->{name}} = { vmid => $vm->{vmid}, node => $vm->{node} };
+        $VM_HOST{$vm->{vmid}} = $vm->{node};
+    }
+    return \%vms;
+}
+
+# Placement scorer: control plane spreads first across HA
+# groups, then across hosts; workers spread their own pool
+# first, then overall load. Pure and unit-tested.
+sub choose_host {
+    my ($candidates, $group_of, $counts, $mode) = @_;
+
+    my ($best, $best_key);
+    for my $host ($candidates->@*) {
+        my $group = $group_of->{$host} // $host;
+        my $key = $mode eq 'cp'
+            ? [ $counts->{"cp-group:$group"} // 0,
+                $counts->{"cp:$host"} // 0,
+                $counts->{"total:$host"} // 0 ]
+            : [ $counts->{"pool:$host"} // 0,
+                $counts->{"total:$host"} // 0 ];
+        my $better = !$best;
+        if ($best) {
+            for my $i (0 .. $key->$#*) {
+                next if $key->[$i] == $best_key->[$i];
+                $better = $key->[$i] < $best_key->[$i];
+                last;
+            }
+        }
+        ($best, $best_key) = ($host, $key) if $better;
+    }
+    return $best;
+}
+
 # qm guest exec returns only a pid once its timeout passes;
 # the command keeps running in the guest and must be polled
 # via exec-status instead of being treated as failed (a
@@ -52,8 +189,8 @@ my sub guest_exec {
 
     # noerr: qm exits non-zero when it hands back a pid for a
     # still-running command; the JSON payload is what matters.
-    my $json = run(['qm', 'guest', 'exec', $vmid, '--timeout', 540,
-        '--', '/bin/sh', '-c', $shell_cmd], noerr => 1, timeout => 600);
+    my $json = qm_raw_on(host_of($vmid), 'guest', 'exec', $vmid,
+        '--timeout', 540, '--', '/bin/sh', '-c', $shell_cmd) // '';
     # qm may prefix human notices ("timeout reached, returning
     # pid") ahead of the JSON payload.
     my $json_start = index($json, '{');
@@ -64,8 +201,8 @@ my sub guest_exec {
     for (1 .. 90) {
         last if !exec_pending($res);
         sleep 10;
-        my $status = run(['qm', 'guest', 'exec-status', $vmid, $pid],
-            noerr => 1, timeout => 600);
+        my $status = qm_raw_on(host_of($vmid), 'guest', 'exec-status',
+            $vmid, $pid);
         my $next = eval { JSON::PP->new->decode($status) };
         die "guest exec-status on $vmid failed: $status\n" if !$next;
         $res = $next;
@@ -84,35 +221,73 @@ my sub wait_agent {
     my ($vmid, $tries) = @_;
 
     for (1 .. ($tries // 80)) {
-        return 1 if eval { qm('agent', $vmid, 'ping'); 1 };
+        return 1 if eval { qm_on(host_of($vmid), 'agent', $vmid, 'ping'); 1 };
         sleep 15;
     }
     die "guest agent on $vmid never came up\n";
 }
 
-my sub find_template {
-    my ($k8s_version) = @_;
+# Templates are named k8s-node-<minor>-r<rev>; pick highest rev.
+sub find_template_in_list {
+    my ($list, $k8s_version) = @_;
 
-    # Templates are named k8s-node-<minor>-r<rev>; pick highest rev.
-    my $list = qm('list');
     my ($best_id, $best_rev) = (undef, -1);
-    for my $line (split /\n/, $list) {
+    for my $line (split /\n/, $list // '') {
         next if $line !~ /^\s*(\d+)\s+k8s-node-\Q$k8s_version\E-r(\d+)\s/;
         my ($id, $rev) = ($1, $2);
         ($best_id, $best_rev) = ($id, $rev) if $rev > $best_rev;
     }
+    return ($best_id, $best_rev);
+}
+
+my sub find_template {
+    my ($k8s_version) = @_;
+
+    my ($best_id) = find_template_in_list(qm('list'), $k8s_version);
     die "no template k8s-node-$k8s_version-r* found; build one first (images/)\n"
         if !defined $best_id;
     return $best_id;
 }
 
+# Template distribution (T2.1): on nothing-shared storage a
+# copy is made lazily, once per revision, only on hosts where
+# a node is placed (clone locally, migrate the copy, mark it
+# template there); shared storage needs no copies at all.
+my sub ensure_template_on {
+    my ($host, $k8s_version, $canon_id) = @_;
+
+    return $canon_id if $host eq local_node_name();
+    my ($existing) = find_template_in_list(
+        qm_on($host, 'list'), $k8s_version);
+    return $existing if defined $existing;
+
+    my ($canon_rev) = (find_template_in_list(qm('list'), $k8s_version))[1];
+    my $tpl_name = "k8s-node-$k8s_version-r$canon_rev";
+    # a previous distribution that died mid-migrate leaves a
+    # local copy behind; remove it before making a fresh one
+    for my $line (split /\n/, qm('list')) {
+        if ($line =~ /^\s*(\d+)\s+\Q$tpl_name\E\s/ && $1 != $canon_id) {
+            print "removing stale template copy $1\n";
+            qm('destroy', $1, '--purge');
+        }
+    }
+    my $copy_id = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
+    $copy_id =~ s/\D//g;
+    print "distributing template copy to $host (vmid $copy_id)\n";
+    # full clone: a linked clone cannot migrate to another host
+    qm('clone', $canon_id, $copy_id, '--full', 1, '--name', $tpl_name);
+    run(['qm', 'migrate', $copy_id, $host, '--with-local-disks', 1],
+        timeout => 3600);
+    qm_on($host, 'template', $copy_id);
+    return $copy_id;
+}
+
 my sub find_vmid_by_name {
     my ($name) = @_;
 
-    for my $line (split /\n/, qm('list')) {
-        return $1 if $line =~ /^\s*(\d+)\s+\Q$name\E\s/;
-    }
-    return undef;
+    my $vms = cluster_vms();
+    my $vm = $vms->{$name} or return undef;
+    return $vm->{vmid};
 }
 
 my sub set_state {
@@ -133,6 +308,30 @@ my sub write_snippet {
     print {$fh} $content;
     close($fh) or die "write $path: $!\n";
     return "local:snippets/$file";
+}
+
+# Snippets live on the target host's local storage.
+my sub write_snippet_on {
+    my ($host, $file, $content) = @_;
+
+    return write_snippet($file, $content) if $host eq local_node_name();
+    my $b64 = MIME::Base64::encode_base64($content, '');
+    run(['ssh', '-o', 'BatchMode=yes', $host,
+        "mkdir -p /var/lib/vz/snippets && echo $b64 | base64 -d "
+        . "> /var/lib/vz/snippets/$file"], timeout => 120);
+    return "local:snippets/$file";
+}
+
+my sub remove_snippet_on {
+    my ($host, $file) = @_;
+
+    if ($host eq local_node_name()) {
+        unlink "/var/lib/vz/snippets/$file";
+    } else {
+        run(['ssh', '-o', 'BatchMode=yes', $host,
+            "rm -f /var/lib/vz/snippets/$file"],
+            timeout => 60, noerr => 1);
+    }
 }
 
 sub kube_vip_manifest {
@@ -206,10 +405,10 @@ runcmd:
   # (manage_etc_hosts), so assert the kubernetes name again in
   # the final stage, in the hosts file and in the template
   # cloud-init regenerates it from.
-  - grep -q ' kubernetes$' /etc/hosts || echo '127.0.0.1 kubernetes' >> /etc/hosts
+  - grep -q ' kubernetes\$' /etc/hosts || echo '127.0.0.1 kubernetes' >> /etc/hosts
   - |
     T=/etc/cloud/templates/hosts.debian.tmpl
-    grep -q ' kubernetes$' \$T || echo '127.0.0.1 kubernetes' >> \$T
+    grep -q ' kubernetes\$' \$T || echo '127.0.0.1 kubernetes' >> \$T
   - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer || true
   - systemctl mask apt-daily.service apt-daily-upgrade.service || true
   - systemctl enable --now containerd qemu-guest-agent kubelet
@@ -396,18 +595,19 @@ sub cluster_vm_names {
     );
 }
 
-# Every VM that belongs to the cluster, by name pattern. This
-# also catches VMs from an earlier, larger layout.
+# Every VM that belongs to the cluster, cluster-wide by name
+# pattern (<cluster>-<node>). This also catches VMs from an
+# earlier, larger layout and from any pool naming.
 my sub find_cluster_vmids {
     my ($name) = @_;
 
-    my %vmids;
-    for my $line (split /\n/, qm('list')) {
-        if ($line =~ /^\s*(\d+)\s+(\Q$name\E-(?:cp|w)\d+)\s/) {
-            $vmids{$2} = $1;
-        }
+    my $vms = cluster_vms();
+    my %found;
+    for my $vmname (keys $vms->%*) {
+        next if $vmname !~ /^\Q$name\E-/;
+        $found{$vmname} = $vms->{$vmname};
     }
-    return \%vmids;
+    return \%found;
 }
 
 my sub pve_user_exists {
@@ -433,11 +633,12 @@ sub delete_cluster {
 
     my $vmids = find_cluster_vmids($name);
     for my $vmname (sort keys $vmids->%*) {
-        my $vmid = $vmids->{$vmname};
-        eval { qm('stop', $vmid) };
-        qm('destroy', $vmid, '--purge', '--destroy-unreferenced-disks', 1);
-        unlink "/var/lib/vz/snippets/k8s-$vmname.yaml";
-        print "destroyed $vmname (vmid $vmid) and its disks\n";
+        my ($vmid, $host) = $vmids->{$vmname}->@{qw(vmid node)};
+        eval { qm_on($host, 'stop', $vmid) };
+        qm_on($host, 'destroy', $vmid, '--purge',
+            '--destroy-unreferenced-disks', 1);
+        remove_snippet_on($host, "k8s-$vmname.yaml");
+        print "destroyed $vmname (vmid $vmid on $host) and its disks\n";
     }
 
     my $left = find_cluster_vmids($name);
@@ -516,41 +717,113 @@ sub provision_cluster {
     my $template = find_template($version);
     print "using template vmid $template for Kubernetes $version\n";
 
-    my $total = $cp_count + $workers;
+    my $pools = PVE::K8s::Config::parse_pools($scfg->{pools}, $workers);
+    my $total = $cp_count;
+    $total += $_->{size} for $pools->@*;
     my @nodes;
     for my $i (1 .. $cp_count) {
         push @nodes, {
-            host => "$name-cp$i", role => 'cp', ip => "$prefix." . (59 + $i), idx => $i
+            host => "$name-cp$i", role => 'cp', pool => 'control-plane',
+            ip => "$prefix." . (59 + $i), idx => $i
         };
     }
-    for my $i (1 .. $workers) {
-        push @nodes, {
-            host => "$name-w$i", role => 'worker', ip => "$prefix." . (69 + $i), idx => $i
-        };
+    my $worker_ip = 69;
+    for my $pool ($pools->@*) {
+        for my $i (1 .. $pool->{size}) {
+            my $vmname = $pool->{name} eq 'default'
+                ? "$name-w" . ($worker_ip - 68)
+                : "$name-$pool->{name}$i";
+            push @nodes, {
+                host => $vmname, role => 'worker', pool => $pool->{name},
+                pool_hosts => $pool->{hosts},
+                labels => $pool->{labels}, taints => $pool->{taints},
+                pool_storage => $pool->{storage},
+                ip => "$prefix." . (++$worker_ip), idx => $i,
+            };
+        }
+    }
+
+    # --- placement (T2.1): spread CP across HA groups, then
+    # hosts (strictly distinct when enough hosts exist); spread
+    # each worker pool softly. Existing VMs keep their host.
+    my $hosts = pve_online_nodes();
+    $hosts = [local_node_name()] if !$hosts->@*;
+    my $group_of = ha_group_by_host();
+    if ($cp_count > 1 && $cp_count > scalar $hosts->@*) {
+        print "WARNING: $cp_count control-plane nodes but only "
+            . scalar($hosts->@*) . " PVE hosts online; CP anti-affinity "
+            . "cannot be strict for cluster '$name'\n";
+    }
+    my $existing = cluster_vms();
+    my %counts;
+    for my $node (@nodes) {
+        my $host;
+        if (my $vm = $existing->{$node->{host}}) {
+            $host = $vm->{node};
+        } else {
+            my $candidates = $hosts;
+            if ($node->{pool_hosts}) {
+                my %allowed = map { $_ => 1 }
+                    grep { length } split /\s*,\s*/, $node->{pool_hosts};
+                $candidates = [grep { $allowed{$_} } $hosts->@*];
+                die "pool '$node->{pool}' placement hosts match no online "
+                    . "PVE node\n" if !$candidates->@*;
+            }
+            my %pool_counts = map { ("pool:$_" => $counts{"pool:$node->{pool}:$_"} // 0) }
+                $candidates->@*;
+            $host = choose_host($candidates, $group_of,
+                { %counts, %pool_counts },
+                $node->{role} eq 'cp' ? 'cp' : 'worker');
+        }
+        $node->{pvehost} = $host;
+        $node->{site} = $group_of->{$host} // $host;
+        my $group = $group_of->{$host} // $host;
+        $counts{"total:$host"}++;
+        $counts{"cp:$host"}++ if $node->{role} eq 'cp';
+        $counts{"cp-group:$group"}++ if $node->{role} eq 'cp';
+        $counts{"pool:$node->{pool}:$host"}++;
+        print "placement: $node->{host} -> $host (site $node->{site})\n";
     }
 
     my $create_node = sub {
         my ($node, $userdata) = @_;
 
         my $vmname = $node->{host};
+        my $target = $node->{pvehost};
         my $vmid = find_vmid_by_name($vmname);
         if (!$vmid) {
+            my $tpl = ensure_template_on($target, $version, $template);
             $vmid = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
             $vmid =~ s/\D//g;
-            qm('clone', $template, $vmid, '--name', $vmname);
-            my $snippet = write_snippet("k8s-$vmname.yaml", $userdata);
-            qm('set', $vmid,
+            $VM_HOST{$vmid} = $target;
+            my @clone = ('clone', $tpl, $vmid, '--name', $vmname);
+            push @clone, '--storage', $node->{pool_storage}
+                if $node->{pool_storage};
+            qm_on($target, @clone);
+            # match the guest MTU to the bridge (VXLAN SDN
+            # bridges run below 1500; larger packets blackhole)
+            my $vmcfg = qm_on($target, 'config', $vmid);
+            if ($vmcfg =~ /net0: virtio=([0-9A-Fa-f:]+),bridge=([^\s,]+)/) {
+                my ($mac, $bridge) = ($1, $2);
+                my $mtu = bridge_mtu_on($target, $bridge);
+                qm_on($target, 'set', $vmid, '--net0',
+                    "virtio=$mac,bridge=$bridge,mtu=$mtu") if $mtu < 1500;
+            }
+            my $snippet = write_snippet_on($target,
+                "k8s-$vmname.yaml", $userdata);
+            qm_on($target, 'set', $vmid,
                 '--cicustom', "user=$snippet",
                 '--ipconfig0', "ip=$node->{ip}/24,gw=$gateway",
                 '--nameserver', '1.1.1.1',
                 '--memory', $node->{role} eq 'cp' ? 3072 : 4096,
                 '--cores', $node->{role} eq 'cp' ? 4 : 2,
             );
-            qm('start', $vmid);
-            print "created $vmname (vmid $vmid, $node->{ip})\n";
+            qm_on($target, 'start', $vmid);
+            print "created $vmname (vmid $vmid on $target, $node->{ip})\n";
         } else {
-            eval { qm('start', $vmid) };
-            print "reusing $vmname (vmid $vmid)\n";
+            $VM_HOST{$vmid} = $target;
+            eval { qm_on($target, 'start', $vmid) };
+            print "reusing $vmname (vmid $vmid on $target)\n";
         }
         $node->{vmid} = $vmid;
         wait_agent($vmid);
@@ -666,6 +939,28 @@ sub provision_cluster {
         sleep 15;
     }
     die "only $ready/$total nodes Ready after waiting\n" if $ready < $total;
+
+    # --- pool labels/taints and site topology (T2.1)
+    for my $node (@nodes) {
+        my @label = ("pve-k8s.proxmox.com/pool=$node->{pool}",
+            "topology.pve-k8s.proxmox.com/site=$node->{site}");
+        push @label, grep { /^[a-zA-Z0-9.\/-]+=[^,]+$/ }
+            split /\s*,\s*/, $node->{labels} // '';
+        guest_exec($cp1->{vmid},
+            'kubectl --kubeconfig /root/local-super-admin.conf label nodes '
+            . "$node->{host} " . join(' ', @label) . ' --overwrite');
+        if ($node->{taints}) {
+            my $effect = '(NoSchedule|NoExecute|PreferNoSchedule)';
+            my @taint = grep { /^[a-zA-Z0-9.\/-]+(=[^:,]*)?:$effect$/
+                || /^[a-zA-Z0-9.\/-]+:$effect$/ }
+                split /\s*,\s*/, $node->{taints};
+            guest_exec($cp1->{vmid},
+                'kubectl --kubeconfig /root/local-super-admin.conf taint nodes '
+                . "$node->{host} " . join(' ', @taint) . ' --overwrite')
+                if @taint;
+        }
+        print "labelled $node->{host} pool=$node->{pool} site=$node->{site}\n";
+    }
 
     # --- Proxmox CCM: scoped token in, providerIDs out
     my ($token_id, $token_secret) = ensure_ccm_credentials($name);

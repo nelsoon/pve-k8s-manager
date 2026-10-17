@@ -141,6 +141,8 @@ like($userdata, qr{>> /etc/hosts},
     'userdata re-asserts the kubernetes hosts name after cloud-init regeneration');
 like($userdata, qr{/etc/cloud/templates/hosts\.debian\.tmpl},
     'userdata persists the kubernetes name in the cloud-init hosts template');
+like($userdata, qr/kubernetes\$' \/etc\/hosts/,
+    'the grep end-anchor dollar survives heredoc interpolation literally');
 
 is_deeply([PVE::K8s::Provision::cluster_vm_names('lab1', 3, 2)],
     [qw(lab1-cp1 lab1-cp2 lab1-cp3 lab1-w1 lab1-w2)],

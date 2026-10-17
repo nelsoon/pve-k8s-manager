@@ -18,7 +18,7 @@ like($js, qr/alias: 'widget\.pveDcK8sView'/,
     'view registers the pveDcK8sView xtype used by the dc.Config tab');
 like($js, qr|url: '/api2/json/cluster/k8s'|,
     'grid reads the cluster list from the REST API');
-for my $field (qw(name k8s-version cp workers node-subnet gateway lb-range storage)) {
+for my $field (qw(name k8s-version cp workers pools node-subnet gateway lb-range storage)) {
     like($js, qr/name: '\Q$field\E'/, "create wizard has the $field field");
 }
 like($js, qr|url: '/cluster/k8s/' \+ values\.name \+ '/provision'|,

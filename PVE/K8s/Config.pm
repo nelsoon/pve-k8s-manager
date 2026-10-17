@@ -5,6 +5,8 @@ package PVE::K8s::Config;
 use strict;
 use warnings;
 
+use JSON::PP ();
+
 use PVE::Cluster qw(cfs_register_file cfs_read_file cfs_lock_file cfs_write_file);
 use PVE::JSONSchema;
 use PVE::SectionConfig;
@@ -72,10 +74,16 @@ my $defaultData = {
         },
         workers => {
             type => 'integer',
-            description => "Worker node count (single default pool for now).",
+            description => "Worker node count (legacy single default pool).",
             minimum => 0,
             maximum => 50,
             default => 2,
+            optional => 1,
+        },
+        pools => {
+            type => 'string',
+            description => "Worker pools as JSON: [{name, size, labels, "
+                . "taints, hosts, storage, device-profile}]. Overrides workers.",
             optional => 1,
         },
         'node-subnet' => {
@@ -122,6 +130,7 @@ sub options {
         'k8s-version' => {},
         cp => { optional => 1 },
         workers => { optional => 1 },
+        pools => { optional => 1 },
         'node-subnet' => { optional => 1 },
         gateway => { optional => 1 },
         gateway => {
@@ -157,6 +166,44 @@ sub store_config {
 
 __PACKAGE__->register();
 __PACKAGE__->init();
+
+# Worker pools (T2.1). Stored as one JSON property so pmxcfs
+# stays a flat section file; an absent property means the
+# legacy single default pool sized by 'workers'. Labels and
+# taints are comma lists of key=value (taints key=value:Effect
+# or bare key). 'hosts' is a comma list of PVE node names the
+# pool may be placed on; 'device-profile' is reserved for
+# future GPU support and only carried, never acted on in v1.
+sub parse_pools {
+    my ($json, $workers) = @_;
+
+    if (!defined $json || $json eq '') {
+        return [{ name => 'default', size => $workers // 2 }];
+    }
+
+    my $pools = eval { JSON::PP->new->decode($json) };
+    die "pools is not valid JSON: $@\n" if $@;
+    die "pools must be a JSON array\n" if ref $pools ne 'ARRAY';
+
+    my %seen;
+    for my $pool ($pools->@*) {
+        die "each pool must be a JSON object\n" if ref $pool ne 'HASH';
+        my $name = $pool->{name} // die "each pool needs a name\n";
+        die "pool name '$name' is not a valid config id\n"
+            if $name !~ /^[a-z][a-z0-9-]*$/;
+        die "duplicate pool name '$name'\n" if $seen{$name}++;
+        my $size = $pool->{size} // die "pool '$name' needs a size\n";
+        die "pool '$name' size must be 0..50\n"
+            if $size !~ /^\d+$/ || $size > 50;
+        $pool->{size} = int $size;
+        for my $key (qw(labels taints hosts)) {
+            next if !defined $pool->{$key};
+            die "pool '$name' $key must be a string\n"
+                if ref $pool->{$key};
+        }
+    }
+    return $pools;
+}
 
 sub assert_valid_cp_count {
     my ($cp) = @_;

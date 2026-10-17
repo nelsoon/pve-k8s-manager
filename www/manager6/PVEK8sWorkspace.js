@@ -57,6 +57,13 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     maxValue: 50,
                 },
                 {
+                    xtype: 'textarea',
+                    name: 'pools',
+                    fieldLabel: gettext('Worker Pools (JSON)'),
+                    emptyText: '[{"name":"default","size":2}]',
+                    height: 60,
+                },
+                {
                     xtype: 'textfield',
                     name: 'node-subnet',
                     fieldLabel: gettext('SDN Node Subnet'),
