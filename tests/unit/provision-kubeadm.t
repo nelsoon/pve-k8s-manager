@@ -45,8 +45,60 @@ like($upload, qr/name: kubeadm:cluster-admins/,
     'provisioner creates the kubeadm:cluster-admins binding a full init would');
 like($upload, qr/name: cluster-admin/,
     'the binding maps the admin cert group to cluster-admin');
-like($completion, qr/local-super-admin\.conf apply .*flannel/,
-    'provisioner applies the bootstrap CNI with the local super-admin kubeconfig');
+unlike($completion, qr/flannel/,
+    'no Flannel anywhere: Cilium is the only v1 CNI');
+
+use PVE::K8s::Addons;
+my $cilium = PVE::K8s::Addons::cilium_install_cmd(
+    '/root/local-super-admin.conf', '192.168.201.59');
+like($cilium, qr/helm upgrade -i cilium cilium\/cilium --version \d+\.\d+\.\d+/,
+    'Cilium is installed by Helm at a pinned version (values stay upgradable)');
+like($cilium, qr/--version \d+\.\d+\.\d+ \\\n    -n kube-system -f \/root\/cilium-values\.yaml/,
+    'helm keeps its namespace and values arguments (continued line intact)');
+like($cilium, qr/clusterPoolIPv4PodCIDRList: \["10\.244\.0\.0\/16"\]/,
+    'Cilium pod CIDR matches the kubeadm pod subnet');
+like($cilium, qr/rollout status ds\/cilium/,
+    'install waits for the Cilium daemonset via the API (no node DNS needed)');
+like($cilium, qr/envoy:\n  enabled: false/,
+    'Envoy is off until the ingress/Gateway add-on needs L7');
+
+my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
+    'https://192.168.201.1:8006/api2/json', 'k8s-lab1@pve!ccm', 's3cret', 'pvek8s-lab');
+like($ccm_config, qr/token_id: "k8s-lab1\@pve!ccm"/,
+    'CCM config carries the scoped PVE token id');
+like($ccm_config, qr/region: "pvek8s-lab"/,
+    'CCM region is the Proxmox cluster name');
+my $ccm_apply = PVE::K8s::Addons::ccm_apply_cmd('/etc/kubernetes/admin.conf', $ccm_config);
+like($ccm_apply, qr/name: proxmox-cloud-controller-manager/,
+    'CCM credentials land in the expected secret');
+like($ccm_apply, qr|/proxmox-cloud-controller-manager/v\d+\.\d+\.\d+/docs/deploy/|,
+    'CCM manifest is pinned to a release version');
+like($ccm_apply, qr/^ +token_secret: "s3cret"$/m,
+    'secret config is indented inside the block scalar');
+
+my $csi_values = PVE::K8s::Addons::csi_values_yaml(
+    'https://192.168.201.1:8006/api2/json', 'k8s-lab1-csi@pve!csi', 's3cret',
+    'pvek8s-lab', 'local-zfs');
+like($csi_values, qr/- name: shared-block\n    storage: local-zfs/,
+    'CSI gets a shared-block class on the cluster storage');
+like($csi_values, qr/- name: local-block/,
+    'CSI gets a local-block class');
+my $csi_cmd = PVE::K8s::Addons::csi_install_cmd(
+    '/etc/kubernetes/admin.conf', $csi_values);
+like($csi_cmd, qr/proxmox-csi-plugin --version \d+\.\d+\.\d+/,
+    'CSI chart is installed at a pinned version');
+like($csi_cmd, qr/storageclass\.kubernetes\.io\/is-default-class/,
+    'shared-block becomes the default storage class');
+
+like($cilium, qr/kubeProxyReplacement: true/,
+    'Cilium replaces kube-proxy so LB L2 announcements work');
+like($cilium, qr/k8sServiceHost: "192\.168\.201\.59"/,
+    'Cilium agents reach the API on the VIP directly');
+my $pool = PVE::K8s::Addons::lb_pool_yaml('192.168.201.100-192.168.201.120');
+like($pool, qr/start: "192\.168\.201\.100"/, 'LB pool starts at the range start');
+like($pool, qr/CiliumL2AnnouncementPolicy/, 'LB pool comes with an L2 announcement policy');
+ok(!eval { PVE::K8s::Addons::lb_pool_yaml('bogus'); 1 },
+    'an invalid lb-range is rejected');
 like($completion, qr/--kubeconfig \/root\/local-super-admin\.conf/,
     'kubeadm phases use the local API endpoint, not the not-yet-up VIP');
 

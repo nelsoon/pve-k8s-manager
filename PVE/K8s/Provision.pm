@@ -9,6 +9,7 @@ use JSON::PP ();
 
 use PVE::Tools qw(run_command);
 
+use PVE::K8s::Addons;
 use PVE::K8s::Config;
 
 # Provisioning FSM (T1.4). Runs in a protected API task worker on
@@ -49,14 +50,22 @@ sub exec_pending {
 my sub guest_exec {
     my ($vmid, $shell_cmd) = @_;
 
-    my $json = qm('guest', 'exec', $vmid, '--timeout', 540, '--', '/bin/sh', '-c', $shell_cmd);
+    # noerr: qm exits non-zero when it hands back a pid for a
+    # still-running command; the JSON payload is what matters.
+    my $json = run(['qm', 'guest', 'exec', $vmid, '--timeout', 540,
+        '--', '/bin/sh', '-c', $shell_cmd], noerr => 1, timeout => 600);
+    # qm may prefix human notices ("timeout reached, returning
+    # pid") ahead of the JSON payload.
+    my $json_start = index($json, '{');
+    $json = substr($json, $json_start) if $json_start > 0;
     my $res = eval { JSON::PP->new->decode($json) };
     die "guest exec on $vmid failed: $json\n" if !$res;
     my $pid = $res->{pid};
     for (1 .. 90) {
         last if !exec_pending($res);
         sleep 10;
-        my $status = qm('guest', 'exec-status', $vmid, $pid);
+        my $status = run(['qm', 'guest', 'exec-status', $vmid, $pid],
+            noerr => 1, timeout => 600);
         my $next = eval { JSON::PP->new->decode($status) };
         die "guest exec-status on $vmid failed: $status\n" if !$next;
         $res = $next;
@@ -185,8 +194,16 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
 write_files:
+  # kube-vip talks to the local API server as "kubernetes" via
+  # loopback; that name must resolve from the node's own hosts
+  # file (pod hostAliases proved unreliable across restarts).
+  - path: /etc/hosts
+    append: true
+    content: "127.0.0.1 kubernetes\n"
 $vip_manifest
 runcmd:
+  - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer || true
+  - systemctl mask apt-daily.service apt-daily-upgrade.service || true
   - systemctl enable --now containerd qemu-guest-agent kubelet
 $a{extra_runcmd}
 EOF
@@ -281,9 +298,7 @@ sub init_completion_cmd {
         . '--kubeconfig /root/local-super-admin.conf '
         . '&& kubeadm init phase kubelet-finalize all --config kubeadm-config.yaml '
         . '&& kubeadm init phase addon all --config kubeadm-config.yaml '
-        . '--kubeconfig /root/local-super-admin.conf '
-        . '&& kubectl --kubeconfig /root/local-super-admin.conf apply '
-        . '-f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml';
+        . '--kubeconfig /root/local-super-admin.conf';
 }
 
 # Full kubeadm join command for one node, run by the provisioner
@@ -309,6 +324,79 @@ sub join_command {
     return $is_cp
         ? "$join_cmd --control-plane --certificate-key $cert_key"
         : $join_cmd;
+}
+
+# Scoped PVE API credentials for the in-cluster CCM (privileges
+# per the upstream CCM install doc). The token is (re)created on
+# every provision run and only ever stored in the in-cluster
+# Secret, never in pmxcfs or on disk.
+sub ensure_pve_token {
+    my ($user, $token_name, $role, $privs, $privsep) = @_;
+
+    # Role IDs starting with "PVE" are reserved for built-ins.
+    run(['pveum', 'role', 'add', $role, '-privs', $privs], noerr => 1);
+    run(['pveum', 'user', 'add', $user], noerr => 1);
+    run(['pveum', 'aclmod', '/', '-user', $user, '-role', $role],
+        noerr => 1);
+    run(['pvesh', 'delete', "/access/users/$user/token/$token_name"],
+        noerr => 1);
+    my $out = run(['pvesh', 'create', "/access/users/$user/token/$token_name",
+        '-privsep', $privsep, '--output-format', 'json']);
+    # pvesh may print human notices ahead of the JSON payload.
+    my $json_start = index($out, '{');
+    die "PVE token creation returned no JSON: $out\n" if $json_start < 0;
+    my $res = JSON::PP->new->decode(substr($out, $json_start));
+    my $secret = $res->{value} or die "PVE token creation returned no value\n";
+    if ($privsep) {
+        run(['pveum', 'aclmod', '/', '-tokens', "$user!$token_name",
+            '-role', $role], noerr => 1);
+    }
+    my $acl = JSON::PP->new->decode(
+        run(['pvesh', 'get', '/access/acl', '--output-format', 'json']));
+    my $want_ugid = $privsep ? "$user!$token_name" : $user;
+    my ($granted) = grep {
+        ($_->{ugid} // '') eq $want_ugid && ($_->{roleid} // '') eq $role
+    } @$acl;
+    die "$role role/ACL for $user did not land on this Proxmox host\n"
+        if !$granted;
+    return ("$user!$token_name", $secret);
+}
+
+sub ensure_ccm_credentials {
+    my ($name) = @_;
+
+    # VM.GuestAgent.Audit only exists on PVE 9; VM.Audit and
+    # Sys.Audit are what the CCM needs on PVE 8 and 9 alike.
+    return ensure_pve_token("k8s-$name\@pve", 'ccm', 'K8sCCM',
+        'VM.Audit Sys.Audit', 0);
+}
+
+sub ensure_csi_credentials {
+    my ($name) = @_;
+
+    return ensure_pve_token("k8s-$name-csi\@pve", 'csi', 'K8sCSI',
+        'VM.Audit VM.Config.Disk Datastore.Allocate '
+        . 'Datastore.AllocateSpace Datastore.Audit', 1);
+}
+
+sub pve_cluster_region {
+    my $out = run(['pvesh', 'get', '/cluster/status', '--output-format', 'json']);
+    my $status = JSON::PP->new->decode($out);
+    for my $entry (@$status) {
+        return $entry->{name} if ($entry->{type} // '') eq 'cluster';
+    }
+    die "could not determine Proxmox cluster name\n";
+}
+
+# External cloud provider on the kubelet, as the CCM requires;
+# idempotent and followed by a kubelet restart.
+sub set_external_cloud_provider {
+    my ($node) = @_;
+
+    guest_exec($node->{vmid},
+        'grep -q cloud-provider=external /var/lib/kubelet/kubeadm-flags.env '
+        . '|| sed -i \'s/"$/ --cloud-provider=external"/\' '
+        . '/var/lib/kubelet/kubeadm-flags.env; systemctl restart kubelet');
 }
 
 sub provision_cluster {
@@ -420,6 +508,9 @@ sub provision_cluster {
     }
     die "node $cp1->{host} never registered via the VIP\n" if !$node_seen;
     guest_exec($cp1->{vmid}, init_completion_cmd());
+    guest_exec($cp1->{vmid},
+        PVE::K8s::Addons::cilium_install_cmd('/root/local-super-admin.conf', $vip));
+    set_external_cloud_provider($cp1);
     print "control plane initialised on $cp1->{host}\n";
 
     # --- join material from cp1
@@ -470,6 +561,7 @@ sub provision_cluster {
             sleep 15;
         }
         die "$node->{host} joined but never registered with the API\n" if !$seen;
+        set_external_cloud_provider($node);
         print "$node->{host} joined\n";
     }
 
@@ -486,6 +578,72 @@ sub provision_cluster {
         sleep 15;
     }
     die "only $ready/$total nodes Ready after waiting\n" if $ready < $total;
+
+    # --- Proxmox CCM: scoped token in, providerIDs out
+    my ($token_id, $token_secret) = ensure_ccm_credentials($name);
+    my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
+        "https://$gateway:8006/api2/json",
+        $token_id, $token_secret, pve_cluster_region());
+    # Nodes that predate the external kubelet flag never got the
+    # uninitialized taint that makes the CCM initialise them
+    # (providerID, addresses, taint removal); add it explicitly.
+    for my $node (@nodes) {
+        eval {
+            guest_exec($cp1->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes '
+                . "$node->{host} node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule "
+                . '--overwrite');
+        };
+    }
+    guest_exec($cp1->{vmid}, PVE::K8s::Addons::ccm_apply_cmd(
+        '/etc/kubernetes/admin.conf', $ccm_config));
+    my $identified = 0;
+    for (1 .. 40) {
+        my $out = eval {
+            guest_exec($cp1->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+                . 'get nodes -o jsonpath=\'{range .items[*]}{.spec.providerID}{"\n"}{end}\'');
+        } // '';
+        my @ids = grep { /^proxmox:\/\// } split /\n/, $out;
+        $identified = scalar @ids;
+        last if $identified >= $total;
+        sleep 15;
+    }
+    die "CCM set providerID on only $identified/$total nodes\n"
+        if $identified < $total;
+    print "CCM initialised $identified/$total nodes\n";
+
+    # --- Proxmox CSI: shared-block (default) + local-block classes
+    my ($csi_token_id, $csi_secret) = ensure_csi_credentials($name);
+    my $csi_values = PVE::K8s::Addons::csi_values_yaml(
+        "https://$gateway:8006/api2/json",
+        $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
+    guest_exec($cp1->{vmid}, PVE::K8s::Addons::csi_install_cmd(
+        '/etc/kubernetes/admin.conf', $csi_values));
+    my $csi_ok = 0;
+    for (1 .. 20) {
+        $csi_ok = eval {
+            my $out = guest_exec($cp1->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf get csidriver '
+                . 'csi.proxmox.sinextra.dev -o name; '
+                . 'kubectl --kubeconfig /etc/kubernetes/admin.conf get sc '
+                . '-o name');
+            $out =~ /csidriver/ && $out =~ /shared-block/ && $out =~ /local-block/;
+        } // 0;
+        last if $csi_ok;
+        sleep 15;
+    }
+    die "Proxmox CSI did not come up (driver or storage classes missing)\n"
+        if !$csi_ok;
+    print "Proxmox CSI installed (shared-block default, local-block)\n";
+
+    # --- LoadBalancer pool from the cluster config, if configured
+    if (my $range = $scfg->{'lb-range'}) {
+        guest_exec($cp1->{vmid}, PVE::K8s::Addons::lb_apply_cmd(
+            '/etc/kubernetes/admin.conf',
+            PVE::K8s::Addons::lb_pool_yaml($range)));
+        print "LoadBalancer pool $range applied (Cilium LB IPAM, L2)\n";
+    }
 
     set_state($name, 'ready');
     print "cluster '$name' ready: $ready/$total nodes\n";

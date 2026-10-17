@@ -25,5 +25,7 @@ like($recipe, qr/runtime_type = "io\.containerd\.runc\.v2"/,
     'containerd config defines the runc runtime type');
 like($recipe, qr/SystemdCgroup = true/,
     'containerd config uses the systemd cgroup driver to match kubelet');
+like($recipe, qr/systemctl mask apt-daily\.service/,
+    'immutable nodes never run apt-daily (replaced, not upgraded)');
 
 done_testing();

@@ -49,6 +49,10 @@ write_files:
         SystemdCgroup = true
 
 runcmd:
+  # Immutable appliances: nodes are replaced, never apt-upgraded,
+  # so the daily apt machinery only wastes CPU/IO and must be off.
+  - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer || true
+  - systemctl mask apt-daily.service apt-daily-upgrade.service || true
   - modprobe overlay br_netfilter
   - sysctl --system
   - systemctl enable --now containerd qemu-guest-agent open-iscsi iscsid
