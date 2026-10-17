@@ -208,7 +208,9 @@ __PACKAGE__->register_method({
     path => '{name}',
     method => 'DELETE',
     protected => 1,
-    description => "Delete a managed Kubernetes cluster (config only for now).",
+    description => "Delete a managed Kubernetes cluster: destroys its VMs "
+        . "and disks, removes its scoped PVE users, and only then drops "
+        . "the config entry.",
     permissions => {
         check => ['perm', '/cluster', ['Sys.Modify']],
     },
@@ -222,24 +224,17 @@ __PACKAGE__->register_method({
             },
         },
     },
-    returns => { type => 'null' },
+    returns => { type => 'string' },
     code => sub {
         my ($param) = @_;
 
         my $name = $param->{name};
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
 
-        PVE::K8s::Config::lock_config(sub {
-            my $cfg = PVE::K8s::Config->config();
-
-            die "cluster '$name' does not exist\n" if !$cfg->{ids}->{$name};
-
-            delete $cfg->{ids}->{$name};
-            delete $cfg->{order}->{$name};
-
-            PVE::K8s::Config::store_config($cfg);
+        return $rpcenv->fork_worker('k8sdelete', $name, $authuser, sub {
+            PVE::K8s::Provision::delete_cluster($name);
         });
-
-        return undef;
     }});
 
 1;

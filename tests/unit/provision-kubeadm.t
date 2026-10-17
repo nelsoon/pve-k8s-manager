@@ -59,6 +59,8 @@ like($cilium, qr/clusterPoolIPv4PodCIDRList: \["10\.244\.0\.0\/16"\]/,
     'Cilium pod CIDR matches the kubeadm pod subnet');
 like($cilium, qr/rollout status ds\/cilium/,
     'install waits for the Cilium daemonset via the API (no node DNS needed)');
+unlike($cilium, qr/rollout status deploy\/cilium-operator/,
+    'no operator rollout wait: at bootstrap only cp1 exists for its 2 replicas');
 like($cilium, qr/envoy:\n  enabled: false/,
     'Envoy is off until the ingress/Gateway add-on needs L7');
 
@@ -132,5 +134,16 @@ unlike($vip, qr/enableControlPlane/,
     'kube-vip manifest does not use the unrecognised enableControlPlane var');
 like($vip, qr/hostPath: \{path: \/etc\/kubernetes\/admin\.conf, type: File\}/,
     'kube-vip kubeconfig hostPath is type File so kubelet cannot create a directory there first');
+
+my $userdata = PVE::K8s::Provision::node_userdata(
+    hostname => 'lab1-cp1', role => 'cp', vip => '192.168.201.59', extra_runcmd => '');
+like($userdata, qr{>> /etc/hosts},
+    'userdata re-asserts the kubernetes hosts name after cloud-init regeneration');
+like($userdata, qr{/etc/cloud/templates/hosts\.debian\.tmpl},
+    'userdata persists the kubernetes name in the cloud-init hosts template');
+
+is_deeply([PVE::K8s::Provision::cluster_vm_names('lab1', 3, 2)],
+    [qw(lab1-cp1 lab1-cp2 lab1-cp3 lab1-w1 lab1-w2)],
+    'delete targets exactly the cluster CP and worker VM names');
 
 done_testing();

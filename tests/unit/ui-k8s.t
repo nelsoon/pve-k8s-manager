@@ -35,5 +35,9 @@ my $api = do {
 };
 like($api, qr/fork_worker\('k8sprovision'/,
     'provision endpoint runs as a k8sprovision PVE task (UPID)');
+like($js, qr/method: 'DELETE'/,
+    'grid Remove button deletes through the REST API');
+like($api, qr/fork_worker\('k8sdelete'/,
+    'delete endpoint runs as a k8sdelete PVE task (UPID)');
 
 done_testing();

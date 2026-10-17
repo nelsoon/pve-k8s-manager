@@ -177,7 +177,7 @@ spec:
 EOF
 }
 
-my sub node_userdata {
+sub node_userdata {
     my (%a) = @_; # hostname, role, extra_runcmd, vip
 
     my $vip_manifest = $a{role} =~ /^cp/
@@ -202,6 +202,14 @@ write_files:
     content: "127.0.0.1 kubernetes\n"
 $vip_manifest
 runcmd:
+  # write_files runs before cloud-init regenerates /etc/hosts
+  # (manage_etc_hosts), so assert the kubernetes name again in
+  # the final stage, in the hosts file and in the template
+  # cloud-init regenerates it from.
+  - grep -q ' kubernetes$' /etc/hosts || echo '127.0.0.1 kubernetes' >> /etc/hosts
+  - |
+    T=/etc/cloud/templates/hosts.debian.tmpl
+    grep -q ' kubernetes$' \$T || echo '127.0.0.1 kubernetes' >> \$T
   - systemctl disable --now apt-daily.timer apt-daily-upgrade.timer || true
   - systemctl mask apt-daily.service apt-daily-upgrade.service || true
   - systemctl enable --now containerd qemu-guest-agent kubelet
@@ -377,6 +385,86 @@ sub ensure_csi_credentials {
     return ensure_pve_token("k8s-$name-csi\@pve", 'csi', 'K8sCSI',
         'VM.Audit VM.Config.Disk Datastore.Allocate '
         . 'Datastore.AllocateSpace Datastore.Audit', 1);
+}
+
+sub cluster_vm_names {
+    my ($name, $cp_count, $workers) = @_;
+
+    return (
+        (map { "$name-cp$_" } 1 .. $cp_count),
+        (map { "$name-w$_" } 1 .. $workers),
+    );
+}
+
+# Every VM that belongs to the cluster, by name pattern. This
+# also catches VMs from an earlier, larger layout.
+my sub find_cluster_vmids {
+    my ($name) = @_;
+
+    my %vmids;
+    for my $line (split /\n/, qm('list')) {
+        if ($line =~ /^\s*(\d+)\s+(\Q$name\E-(?:cp|w)\d+)\s/) {
+            $vmids{$2} = $1;
+        }
+    }
+    return \%vmids;
+}
+
+my sub pve_user_exists {
+    my ($user) = @_;
+
+    my $out = run(['pveum', 'user', 'list'], noerr => 1);
+    return $out =~ /\Q$user\E/;
+}
+
+# T1.7: destroy everything the cluster owns, then verify
+# nothing is left before dropping the config entry. Order
+# matters: VMs and their owned disks first (CSI volumes live
+# and die with the node VMs), scoped CCM/CSI users next, the
+# pmxcfs entry last, so a failed delete can simply be retried.
+sub delete_cluster {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+
+    set_state($name, 'deleting');
+
+    my $vmids = find_cluster_vmids($name);
+    for my $vmname (sort keys $vmids->%*) {
+        my $vmid = $vmids->{$vmname};
+        eval { qm('stop', $vmid) };
+        qm('destroy', $vmid, '--purge', '--destroy-unreferenced-disks', 1);
+        unlink "/var/lib/vz/snippets/k8s-$vmname.yaml";
+        print "destroyed $vmname (vmid $vmid) and its disks\n";
+    }
+
+    my $left = find_cluster_vmids($name);
+    die "orphan VMs remain for cluster '$name': "
+        . join(', ', sort keys $left->%*) . "\n"
+        if $left->%*;
+
+    for my $user ("k8s-$name\@pve", "k8s-$name-csi\@pve") {
+        # the user config update can lag a moment behind the
+        # delete, so poll instead of checking exactly once
+        for (1 .. 6) {
+            run(['pveum', 'user', 'delete', $user], noerr => 1);
+            last if !pve_user_exists($user);
+            sleep 5;
+        }
+        die "orphan PVE user '$user' remains for cluster '$name'\n"
+            if pve_user_exists($user);
+        print "removed scoped PVE user $user (tokens included)\n";
+    }
+
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        delete $locked->{ids}->{$name};
+        delete $locked->{order}->{$name};
+        PVE::K8s::Config::store_config($locked);
+    });
+    print "cluster '$name' deleted: no orphan VMs, disks or users\n";
 }
 
 sub pve_cluster_region {
@@ -570,7 +658,7 @@ sub provision_cluster {
     for (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers');
+                'kubectl --kubeconfig /root/local-super-admin.conf get nodes --no-headers');
         } // '';
         my @ready_nodes = grep { /\sReady\s/ } split /\n/, $out;
         $ready = scalar @ready_nodes;
@@ -590,18 +678,18 @@ sub provision_cluster {
     for my $node (@nodes) {
         eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes '
+                'kubectl --kubeconfig /root/local-super-admin.conf taint nodes '
                 . "$node->{host} node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule "
                 . '--overwrite');
         };
     }
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::ccm_apply_cmd(
-        '/etc/kubernetes/admin.conf', $ccm_config));
+        '/root/local-super-admin.conf', $ccm_config));
     my $identified = 0;
     for (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+                'kubectl --kubeconfig /root/local-super-admin.conf '
                 . 'get nodes -o jsonpath=\'{range .items[*]}{.spec.providerID}{"\n"}{end}\'');
         } // '';
         my @ids = grep { /^proxmox:\/\// } split /\n/, $out;
@@ -619,14 +707,14 @@ sub provision_cluster {
         "https://$gateway:8006/api2/json",
         $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::csi_install_cmd(
-        '/etc/kubernetes/admin.conf', $csi_values));
+        '/root/local-super-admin.conf', $csi_values));
     my $csi_ok = 0;
     for (1 .. 20) {
         $csi_ok = eval {
             my $out = guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf get csidriver '
+                'kubectl --kubeconfig /root/local-super-admin.conf get csidriver '
                 . 'csi.proxmox.sinextra.dev -o name; '
-                . 'kubectl --kubeconfig /etc/kubernetes/admin.conf get sc '
+                . 'kubectl --kubeconfig /root/local-super-admin.conf get sc '
                 . '-o name');
             $out =~ /csidriver/ && $out =~ /shared-block/ && $out =~ /local-block/;
         } // 0;
@@ -640,7 +728,7 @@ sub provision_cluster {
     # --- LoadBalancer pool from the cluster config, if configured
     if (my $range = $scfg->{'lb-range'}) {
         guest_exec($cp1->{vmid}, PVE::K8s::Addons::lb_apply_cmd(
-            '/etc/kubernetes/admin.conf',
+            '/root/local-super-admin.conf',
             PVE::K8s::Addons::lb_pool_yaml($range)));
         print "LoadBalancer pool $range applied (Cilium LB IPAM, L2)\n";
     }

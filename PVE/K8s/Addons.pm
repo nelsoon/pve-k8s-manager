@@ -62,8 +62,7 @@ helm repo update cilium >/dev/null
 helm upgrade -i cilium cilium/cilium --version %s \
     -n kube-system -f /root/cilium-values.yaml
 kubectl -n kube-system delete ds kube-proxy --ignore-not-found
-kubectl -n kube-system rollout status ds/cilium --timeout=600s
-kubectl -n kube-system rollout status deploy/cilium-operator --timeout=300s
+kubectl -n kube-system rollout status ds/cilium --timeout=480s
 EOF
 }
 

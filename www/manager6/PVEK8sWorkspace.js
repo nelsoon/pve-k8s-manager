@@ -200,6 +200,45 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        let removeBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Remove'),
+            iconCls: 'fa fa-fw fa-trash-o',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Ext.Msg.confirm(
+                    gettext('Confirm'),
+                    Ext.String.format(
+                        gettext('Delete cluster {0} and all its VMs?'), name),
+                    function(answer) {
+                        if (answer !== 'yes') {
+                            return;
+                        }
+                        Proxmox.Utils.API2Request({
+                            url: '/cluster/k8s/' + name,
+                            method: 'DELETE',
+                            failure: function(response) {
+                                Ext.Msg.alert(gettext('Error'),
+                                    Proxmox.Utils.extractRequestError(response, true));
+                            },
+                            success: function(response) {
+                                let upid = response.result.data;
+                                if (upid) {
+                                    Ext.create('Proxmox.window.TaskViewer', {
+                                        upid: upid,
+                                    }).show();
+                                }
+                                store.load();
+                            },
+                        });
+                    });
+            },
+        });
+
         Ext.apply(me, {
             store: store,
             columns: [
@@ -261,6 +300,7 @@ Ext.define('PVE.dc.K8sView', {
                     },
                 },
                 provisionBtn,
+                removeBtn,
                 '-',
                 {
                     text: gettext('Reload'),
@@ -272,7 +312,9 @@ Ext.define('PVE.dc.K8sView', {
             ],
             listeners: {
                 selectionchange: function(model, selected) {
-                    provisionBtn.setDisabled(!selected || selected.length < 1);
+                    let disabled = !selected || selected.length < 1;
+                    provisionBtn.setDisabled(disabled);
+                    removeBtn.setDisabled(disabled);
                 },
                 afterrender: function() {
                     me.pollTask = Ext.util.TaskManager.start({
