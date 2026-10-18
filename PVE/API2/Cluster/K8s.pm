@@ -63,7 +63,7 @@ __PACKAGE__->register_method({
             'k8s-version' => {
                 type => 'string',
                 pattern => '^\d+\.\d+(\.\d+)?$',
-                description => "Kubernetes version, e.g. '1.37'.",
+                description => "Kubernetes version, e.g. '1.36'.",
             },
             cp => {
                 type => 'integer',
@@ -253,7 +253,7 @@ __PACKAGE__->register_method({
             to => {
                 type => 'string',
                 pattern => '^\d+\.\d+(\.\d+)?$',
-                description => "Target Kubernetes minor, e.g. '1.37'.",
+                description => "Target Kubernetes minor, e.g. '1.36'.",
             },
             force => {
                 type => 'boolean',

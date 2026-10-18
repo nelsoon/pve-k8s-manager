@@ -25,7 +25,9 @@ for my $v ($supported->@*) {
     ok(-f "images/versions/$v.env", "template pin exists for $v");
 }
 
-for my $v (qw(1.31 1.32 1.33 1.34)) {
+# 1.37 is upstream-maintained but held back until the add-on
+# stack officially tests it; it must be rejected like the EOL lines.
+for my $v (qw(1.31 1.32 1.33 1.34 1.37)) {
     ok(!grep({ $_ eq $v } $supported->@*), "$v is outside the window");
     ok(!eval { PVE::K8s::Config::assert_supported_version($v); 1 },
         "$v is rejected for new clusters");

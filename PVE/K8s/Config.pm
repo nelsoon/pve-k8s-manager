@@ -61,7 +61,7 @@ my $defaultData = {
         },
         'k8s-version' => {
             type => 'string',
-            description => "Kubernetes version, e.g. '1.37'.",
+            description => "Kubernetes version, e.g. '1.36'.",
             pattern => '^\d+\.\d+(\.\d+)?$',
         },
         cp => {
@@ -223,13 +223,16 @@ sub parse_pools {
     return $pools;
 }
 
-# Supported Kubernetes minors: the three minor lines the
-# upstream project still maintains (roughly one year of patch
-# support each). New clusters may only be created on these;
-# older clusters upgrade one minor at a time until they are
-# back inside the window, so the upgrade path itself is not
-# gated on this list. Bump the window as upstream releases.
-our @SUPPORTED_VERSIONS = ('1.35', '1.36', '1.37');
+# Supported Kubernetes minors for NEW clusters: upstream-
+# maintained lines whose add-on stack (Cilium/CCM/CSI) is
+# tested end to end. This deliberately lags the newest
+# upstream minor: 1.37 is held back until Cilium officially
+# tests it (a lab cluster ran fine on Cilium 1.20.3, but
+# bleeding edge waits for the add-ons). Older clusters
+# upgrade one minor at a time until they are back inside
+# the window, so the upgrade path is not gated on this
+# list. Templates in the lab: v1.35.9 and v1.36.5.
+our @SUPPORTED_VERSIONS = ('1.35', '1.36');
 
 sub supported_versions {
     return [@SUPPORTED_VERSIONS];
@@ -245,7 +248,8 @@ sub assert_supported_version {
     my ($minor) = ($version // '') =~ /^(\d+\.\d+)(?:\.\d+)?$/;
     die "invalid Kubernetes version '$version'\n" if !defined $minor;
     return $minor if grep { $_ eq $minor } @SUPPORTED_VERSIONS;
-    die "Kubernetes $minor is not supported (end of life upstream); "
+    die "Kubernetes $minor is not supported for new clusters "
+        . "(end of life, or add-on testing still pending); "
         . "supported versions: " . join(', ', @SUPPORTED_VERSIONS) . "\n";
 }
 

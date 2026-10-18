@@ -37,10 +37,10 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     xtype: 'combobox',
                     name: 'k8s-version',
                     fieldLabel: gettext('Kubernetes Version'),
-                    // upstream-supported minors only; keep in
-                    // sync with PVE::K8s::Config supported list
-                    store: ['1.35', '1.36', '1.37'],
-                    value: '1.37',
+                    // add-on-tested minors only; keep in sync
+                    // with PVE::K8s::Config supported list
+                    store: ['1.35', '1.36'],
+                    value: '1.36',
                     editable: false,
                     allowBlank: false,
                 },
