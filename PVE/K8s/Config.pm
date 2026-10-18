@@ -107,6 +107,21 @@ my $defaultData = {
             description => "PVE storage for node disks.",
             optional => 1,
         },
+        nodes => {
+            type => 'string',
+            description => "Node inventory JSON recorded by the provisioner.",
+            optional => 1,
+        },
+        'template-rev' => {
+            type => 'integer',
+            description => "Template image revision the nodes should run.",
+            optional => 1,
+        },
+        'maintenance-window' => {
+            type => 'string',
+            description => "Rolling window HH:MM-HH:MM (local time).",
+            optional => 1,
+        },
         state => {
             type => 'string',
             description => "Lifecycle state recorded by pve-k8sd.",
@@ -139,6 +154,9 @@ sub options {
             optional => 1,
         },
         'lb-range' => { optional => 1 },
+        nodes => { optional => 1 },
+        'template-rev' => { optional => 1 },
+        'maintenance-window' => { optional => 1 },
         storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },

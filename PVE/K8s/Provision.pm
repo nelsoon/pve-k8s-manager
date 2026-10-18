@@ -257,16 +257,18 @@ my sub ensure_template_on {
     my ($host, $k8s_version, $canon_id) = @_;
 
     return $canon_id if $host eq local_node_name();
-    my ($existing) = find_template_in_list(
-        qm_on($host, 'list'), $k8s_version);
-    return $existing if defined $existing;
-
     my ($canon_rev) = (find_template_in_list(qm('list'), $k8s_version))[1];
+    my ($existing, $existing_rev) = find_template_in_list(
+        qm_on($host, 'list'), $k8s_version);
+    return $existing if defined $existing && $existing_rev >= $canon_rev;
     my $tpl_name = "k8s-node-$k8s_version-r$canon_rev";
     # a previous distribution that died mid-migrate leaves a
     # local copy behind; remove it before making a fresh one
     for my $line (split /\n/, qm('list')) {
         if ($line =~ /^\s*(\d+)\s+\Q$tpl_name\E\s/ && $1 != $canon_id) {
+            # never destroy a VM that is itself marked template
+            my $other = qm('config', $1);
+            next if $other =~ /^template:/m;
             print "removing stale template copy $1\n";
             qm('destroy', $1, '--purge');
         }
@@ -279,6 +281,11 @@ my sub ensure_template_on {
     run(['qm', 'migrate', $copy_id, $host, '--with-local-disks', 1],
         timeout => 3600);
     qm_on($host, 'template', $copy_id);
+    # prune the superseded revision copy on this host
+    if (defined $existing && $existing != $copy_id) {
+        eval { qm_on($host, 'destroy', $existing, '--purge') };
+        print "pruned stale template r$existing_rev on $host\n";
+    }
     return $copy_id;
 }
 
@@ -688,6 +695,114 @@ sub set_external_cloud_provider {
         . '/var/lib/kubelet/kubeadm-flags.env; systemctl restart kubelet');
 }
 
+# Node list for a cluster from its config: control plane
+# first, then workers pool by pool. Shared by provisioning,
+# rolling and upgrades.
+sub cluster_nodes {
+    my ($name, $scfg, $prefix) = @_;
+
+    my $pools = PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2);
+    my @nodes;
+    for my $i (1 .. ($scfg->{cp} // 3)) {
+        push @nodes, {
+            host => "$name-cp$i", role => 'cp', pool => 'control-plane',
+            ip => "$prefix." . (59 + $i), idx => $i
+        };
+    }
+    my $worker_ip = 69;
+    for my $pool ($pools->@*) {
+        for my $i (1 .. $pool->{size}) {
+            my $vmname = $pool->{name} eq 'default'
+                ? "$name-w" . ($worker_ip - 68)
+                : "$name-$pool->{name}$i";
+            push @nodes, {
+                host => $vmname, role => 'worker', pool => $pool->{name},
+                pool_hosts => $pool->{hosts},
+                labels => $pool->{labels}, taints => $pool->{taints},
+                pool_storage => $pool->{storage},
+                ip => "$prefix." . (++$worker_ip), idx => $i,
+            };
+        }
+    }
+    return \@nodes;
+}
+
+# Record the node inventory in the cluster config so rolls,
+# upgrades and the UI know what is running where.
+my sub store_inventory {
+    my ($name, $nodes, $rev) = @_;
+
+    my @inventory = map {
+        { name => $_->{host}, vmid => $_->{vmid}, pvehost => $_->{pvehost},
+          pool => $_->{pool}, ip => $_->{ip}, rev => $_->{rev} // $rev }
+    } $nodes->@*;
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        $cfg->{ids}->{$name}->{nodes} =
+            JSON::PP->new->canonical->encode(\@inventory);
+        $cfg->{ids}->{$name}->{'template-rev'} = $rev;
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+# Clone (or reuse) one node VM on its placed host and wait
+# for its guest agent. $ctx: { version, template, gateway }.
+sub create_node_vm {
+    my ($ctx, $node, $userdata) = @_;
+
+    my ($version, $template, $gateway) =
+        $ctx->@{qw(version template gateway)};
+    my $vmname = $node->{host};
+    my $target = $node->{pvehost};
+    my $vmid = find_vmid_by_name($vmname);
+    if (!$vmid) {
+        my $tpl = ensure_template_on($target, $version, $template);
+        $vmid = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
+        $vmid =~ s/\D//g;
+        $VM_HOST{$vmid} = $target;
+        my @clone = ('clone', $tpl, $vmid, '--name', $vmname);
+        push @clone, '--storage', $node->{pool_storage}
+            if $node->{pool_storage};
+        qm_on($target, @clone);
+        # match the guest MTU to the bridge (VXLAN SDN
+        # bridges run below 1500; larger packets blackhole)
+        my $vmcfg = qm_on($target, 'config', $vmid);
+        if ($vmcfg =~ /net0: virtio=([0-9A-Fa-f:]+),bridge=([^\s,]+)/) {
+            my ($mac, $bridge) = ($1, $2);
+            my $mtu = bridge_mtu_on($target, $bridge);
+            qm_on($target, 'set', $vmid, '--net0',
+                "virtio=$mac,bridge=$bridge,mtu=$mtu") if $mtu < 1500;
+        }
+        # A migrated template copy can lose or mangle its
+        # cloud-init drive; without it the guest finds no
+        # datasource and never configures network or userdata.
+        my $storage = $node->{pool_storage} // $ctx->{storage}
+            // 'local-zfs';
+        if ($vmcfg !~ /^ide2: .*cloudinit/m) {
+            qm_on($target, 'set', $vmid, '--ide2', "$storage:cloudinit");
+        }
+        my $snippet = write_snippet_on($target,
+            "k8s-$vmname.yaml", $userdata);
+        qm_on($target, 'set', $vmid,
+            '--cicustom', "user=$snippet",
+            '--ipconfig0', "ip=$node->{ip}/24,gw=$gateway",
+            '--nameserver', '1.1.1.1',
+            '--memory', $node->{role} eq 'cp' ? 3072 : 4096,
+            '--cores', $node->{role} eq 'cp' ? 4 : 2,
+        );
+        qm_on($target, 'start', $vmid);
+        print "created $vmname (vmid $vmid on $target, $node->{ip})\n";
+    } else {
+        $VM_HOST{$vmid} = $target;
+        eval { qm_on($target, 'start', $vmid) };
+        print "reusing $vmname (vmid $vmid on $target)\n";
+    }
+    $node->{vmid} = $vmid;
+    wait_agent($vmid);
+    return $vmid;
+}
+
 sub provision_cluster {
     my ($name) = @_;
 
@@ -716,32 +831,11 @@ sub provision_cluster {
 
     my $template = find_template($version);
     print "using template vmid $template for Kubernetes $version\n";
+    my $ctx = { version => $version, template => $template,
+        gateway => $gateway, storage => $storage };
 
-    my $pools = PVE::K8s::Config::parse_pools($scfg->{pools}, $workers);
-    my $total = $cp_count;
-    $total += $_->{size} for $pools->@*;
-    my @nodes;
-    for my $i (1 .. $cp_count) {
-        push @nodes, {
-            host => "$name-cp$i", role => 'cp', pool => 'control-plane',
-            ip => "$prefix." . (59 + $i), idx => $i
-        };
-    }
-    my $worker_ip = 69;
-    for my $pool ($pools->@*) {
-        for my $i (1 .. $pool->{size}) {
-            my $vmname = $pool->{name} eq 'default'
-                ? "$name-w" . ($worker_ip - 68)
-                : "$name-$pool->{name}$i";
-            push @nodes, {
-                host => $vmname, role => 'worker', pool => $pool->{name},
-                pool_hosts => $pool->{hosts},
-                labels => $pool->{labels}, taints => $pool->{taints},
-                pool_storage => $pool->{storage},
-                ip => "$prefix." . (++$worker_ip), idx => $i,
-            };
-        }
-    }
+    my @nodes = cluster_nodes($name, $scfg, $prefix)->@*;
+    my $total = scalar @nodes;
 
     # --- placement (T2.1): spread CP across HA groups, then
     # hosts (strictly distinct when enough hosts exist); spread
@@ -785,54 +879,9 @@ sub provision_cluster {
         print "placement: $node->{host} -> $host (site $node->{site})\n";
     }
 
-    my $create_node = sub {
-        my ($node, $userdata) = @_;
-
-        my $vmname = $node->{host};
-        my $target = $node->{pvehost};
-        my $vmid = find_vmid_by_name($vmname);
-        if (!$vmid) {
-            my $tpl = ensure_template_on($target, $version, $template);
-            $vmid = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
-            $vmid =~ s/\D//g;
-            $VM_HOST{$vmid} = $target;
-            my @clone = ('clone', $tpl, $vmid, '--name', $vmname);
-            push @clone, '--storage', $node->{pool_storage}
-                if $node->{pool_storage};
-            qm_on($target, @clone);
-            # match the guest MTU to the bridge (VXLAN SDN
-            # bridges run below 1500; larger packets blackhole)
-            my $vmcfg = qm_on($target, 'config', $vmid);
-            if ($vmcfg =~ /net0: virtio=([0-9A-Fa-f:]+),bridge=([^\s,]+)/) {
-                my ($mac, $bridge) = ($1, $2);
-                my $mtu = bridge_mtu_on($target, $bridge);
-                qm_on($target, 'set', $vmid, '--net0',
-                    "virtio=$mac,bridge=$bridge,mtu=$mtu") if $mtu < 1500;
-            }
-            my $snippet = write_snippet_on($target,
-                "k8s-$vmname.yaml", $userdata);
-            qm_on($target, 'set', $vmid,
-                '--cicustom', "user=$snippet",
-                '--ipconfig0', "ip=$node->{ip}/24,gw=$gateway",
-                '--nameserver', '1.1.1.1',
-                '--memory', $node->{role} eq 'cp' ? 3072 : 4096,
-                '--cores', $node->{role} eq 'cp' ? 4 : 2,
-            );
-            qm_on($target, 'start', $vmid);
-            print "created $vmname (vmid $vmid on $target, $node->{ip})\n";
-        } else {
-            $VM_HOST{$vmid} = $target;
-            eval { qm_on($target, 'start', $vmid) };
-            print "reusing $vmname (vmid $vmid on $target)\n";
-        }
-        $node->{vmid} = $vmid;
-        wait_agent($vmid);
-        return $vmid;
-    };
-
     # --- first control-plane node: kubeadm init
     my $cp1 = $nodes[0];
-    $create_node->($cp1, node_userdata(
+    create_node_vm($ctx, $cp1, node_userdata(
         hostname => $cp1->{host}, role => 'cp', vip => $vip,
         extra_runcmd => kubeadm_init_runcmd($vip),
     ));
@@ -869,15 +918,22 @@ sub provision_cluster {
     }
     die "node $cp1->{host} never registered via the VIP\n" if !$node_seen;
     guest_exec($cp1->{vmid}, init_completion_cmd());
+    # The VIP answers now, so point join discovery at it before
+    # any node joins: kubeadm writes the discovery endpoint
+    # into each node's kubelet.conf, and a node address there
+    # would strand every kubelet when that node is replaced.
+    guest_exec($cp1->{vmid},
+        'kubeadm init phase bootstrap-token '
+        . '--kubeconfig /etc/kubernetes/admin.conf');
     guest_exec($cp1->{vmid},
         PVE::K8s::Addons::cilium_install_cmd('/root/local-super-admin.conf', $vip));
     set_external_cloud_provider($cp1);
     print "control plane initialised on $cp1->{host}\n";
 
-    # --- join material from cp1
+    # --- join material from cp1 (discovery via the VIP, so
+    # kubelet.conf on joined nodes names the VIP, not cp1)
     my $join_cmd = guest_exec($cp1->{vmid}, 'kubeadm token create --print-join-command');
     chomp $join_cmd;
-    $join_cmd = join_endpoint_cmd($join_cmd, "$cp1->{ip}:6443");
     my $cert_key = guest_exec($cp1->{vmid},
         'kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1');
     chomp $cert_key;
@@ -889,7 +945,7 @@ sub provision_cluster {
     for my $node (@nodes[1 .. $#nodes]) {
         my $is_cp = $node->{role} eq 'cp';
         my $join = join_command($join_cmd, $cert_key, $is_cp);
-        $create_node->($node, node_userdata(
+        create_node_vm($ctx, $node, node_userdata(
             hostname => $node->{host}, role => $node->{role}, vip => $vip,
             extra_runcmd => '',
         ));
@@ -939,6 +995,15 @@ sub provision_cluster {
         sleep 15;
     }
     die "only $ready/$total nodes Ready after waiting\n" if $ready < $total;
+
+    # Point join discovery at the VIP from the start:
+    # cluster-info was created from the local endpoint during
+    # bootstrap and would otherwise name cp1's address forever.
+    eval {
+        guest_exec($cp1->{vmid},
+            'kubeadm init phase bootstrap-token '
+            . '--kubeconfig /etc/kubernetes/admin.conf');
+    };
 
     # --- pool labels/taints and site topology (T2.1)
     for my $node (@nodes) {
@@ -1028,9 +1093,444 @@ sub provision_cluster {
         print "LoadBalancer pool $range applied (Cilium LB IPAM, L2)\n";
     }
 
+    my (undef, $template_rev) = find_template_in_list(qm('list'), $version);
+    store_inventory($name, \@nodes, $template_rev);
     set_state($name, 'ready');
     print "cluster '$name' ready: $ready/$total nodes\n";
     return $total;
+}
+
+# --- Rolling engine (T2.2) and minor upgrades (T2.3) --------
+# Nodes are immutable: a roll replaces each node whose template
+# revision (or Kubernetes version) is behind, one at a time,
+# surging a replacement in before draining the old node out.
+# Control plane goes first, at most one at a time (maxSurge=1),
+# and only after an etcd snapshot exists.
+
+sub in_maintenance_window {
+    my ($window, $now) = @_;
+
+    return 1 if !$window;
+    my ($sh, $sm, $eh, $em) = $window =~ /^(\d\d):(\d\d)-(\d\d):(\d\d)$/
+        or die "maintenance-window must be HH:MM-HH:MM\n";
+    my @lt = localtime($now // time());
+    my $cur = $lt[2] * 60 + $lt[1];
+    my ($start, $end) = ($sh * 60 + $sm, $eh * 60 + $em);
+    return $start <= $end
+        ? ($cur >= $start && $cur < $end)
+        : ($cur >= $start || $cur < $end);
+}
+
+# One-minor-at-a-time gate for Kubernetes upgrades (T2.3).
+sub assert_minor_upgrade {
+    my ($current, $target) = @_;
+
+    my ($cmaj, $cmin) = $current =~ /^(\d+)\.(\d+)/
+        or die "cannot parse current Kubernetes version '$current'\n";
+    my ($tmaj, $tmin) = ($target // '') =~ /^(\d+)\.(\d+)/
+        or die "cannot parse target Kubernetes version '$target'\n";
+    die "Kubernetes upgrade must go one minor at a time: "
+        . "$current -> $target is not allowed (next is $cmaj."
+        . ($cmin + 1) . ")\n"
+        if $tmaj != $cmaj || $tmin != $cmin + 1;
+    return "$tmaj.$tmin";
+}
+
+my sub node_rev_on {
+    my ($node) = @_;
+
+    return $node->{rev} if defined $node->{rev};
+    my $cfg = eval {
+        qm_on($node->{pvehost}, 'config', $node->{vmid}) } // '';
+    return $cfg =~ /image-revision(?::|%3A)\s*(\d+)/ ? int $1 : undef;
+}
+
+my sub etcd_snapshot {
+    my ($cp) = @_;
+
+    my $file = "/var/lib/etcd/pre-roll-" . time() . ".db";
+    guest_exec($cp->{vmid},
+        'CID=$(crictl ps --name etcd -q | head -1); '
+        . 'ETCDCTL_API=3 crictl exec $CID etcdctl '
+        . '--endpoints=https://127.0.0.1:2379 '
+        . '--cacert=/etc/kubernetes/pki/etcd/ca.crt '
+        . '--cert=/etc/kubernetes/pki/etcd/server.crt '
+        . '--key=/etc/kubernetes/pki/etcd/server.key '
+        . "snapshot save $file >/dev/null && test -s $file && echo $file");
+    print "etcd snapshot saved on $cp->{host}: $file\n";
+    return $file;
+}
+
+my sub etcd_member_remove {
+    my ($survivor, $old_host) = @_;
+
+    my $list = guest_exec($survivor->{vmid},
+        'CID=$(crictl ps --name etcd -q | head -1); '
+        . 'ETCDCTL_API=3 crictl exec $CID etcdctl '
+        . '--endpoints=https://127.0.0.1:2379 '
+        . '--cacert=/etc/kubernetes/pki/etcd/ca.crt '
+        . '--cert=/etc/kubernetes/pki/etcd/server.crt '
+        . '--key=/etc/kubernetes/pki/etcd/server.key member list');
+    my ($id) = $list =~ /^([0-9a-f]+),[^,]+,\s*\Q$old_host\E,/m;
+    return if !$id;
+    guest_exec($survivor->{vmid},
+        'CID=$(crictl ps --name etcd -q | head -1); '
+        . 'ETCDCTL_API=3 crictl exec $CID etcdctl '
+        . '--endpoints=https://127.0.0.1:2379 '
+        . '--cacert=/etc/kubernetes/pki/etcd/ca.crt '
+        . '--cert=/etc/kubernetes/pki/etcd/server.crt '
+        . '--key=/etc/kubernetes/pki/etcd/server.key '
+        . "member remove $id >/dev/null");
+    print "etcd member $old_host ($id) removed\n";
+}
+
+my sub kubectl_on {
+    my ($cp, $args) = @_;
+    # admin.conf exists on every control-plane node;
+    # local-super-admin.conf only ever existed on the init node
+    return guest_exec($cp->{vmid},
+        "kubectl --kubeconfig /etc/kubernetes/admin.conf $args");
+}
+
+my sub wait_node_ready {
+    my ($cp, $host) = @_;
+
+    for (1 .. 80) {
+        my $out = eval { kubectl_on($cp, 'get nodes --no-headers') } // '';
+        return 1 if $out =~ /^\Q$host\E\s+Ready/m;
+        sleep 15;
+    }
+    die "node $host never became Ready\n";
+}
+
+my sub label_node {
+    my ($cp, $node) = @_;
+
+    my @label = ("pve-k8s.proxmox.com/pool=$node->{pool}",
+        "topology.pve-k8s.proxmox.com/site=$node->{site}");
+    push @label, grep { /^[a-zA-Z0-9.\/-]+=[^,]+$/ }
+        split /\s*,\s*/, $node->{labels} // '';
+    kubectl_on($cp, "label nodes $node->{host} "
+        . join(' ', @label) . ' --overwrite');
+    if ($node->{taints}) {
+        my $effect = '(NoSchedule|NoExecute|PreferNoSchedule)';
+        my @taint = grep { /^[a-zA-Z0-9.\/-]+(=[^:,]*)?:$effect$/
+            || /^[a-zA-Z0-9.\/-]+:$effect$/ }
+            split /\s*,\s*/, $node->{taints};
+        kubectl_on($cp, "taint nodes $node->{host} "
+            . join(' ', @taint) . ' --overwrite') if @taint;
+    }
+}
+
+my sub remove_node {
+    my ($cp, $old, $all) = @_;
+
+    eval { kubectl_on($cp, "cordon $old->{host}") };
+    eval { kubectl_on($cp, "drain $old->{host} --ignore-daemonsets "
+        . '--delete-emptydir-data --force --timeout=240s') };
+    if ($old->{role} eq 'cp') {
+        my ($survivor) = grep {
+            $_->{role} eq 'cp' && $_->{host} ne $old->{host} } $all->@*;
+        etcd_member_remove($survivor, $old->{host}) if $survivor;
+    }
+    eval { guest_exec($old->{vmid}, 'kubeadm reset -f') };
+    eval { kubectl_on($cp, "delete node $old->{host}") };
+    eval { qm_on($old->{pvehost}, 'stop', $old->{vmid}) };
+    qm_on($old->{pvehost}, 'destroy', $old->{vmid}, '--purge',
+        '--destroy-unreferenced-disks', 1);
+    remove_snippet_on($old->{pvehost}, "k8s-$old->{host}.yaml");
+    print "removed $old->{host} (vmid $old->{vmid} on $old->{pvehost})\n";
+}
+
+sub roll_cluster {
+    my ($name, %opts) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    if (!$opts{force} && $scfg->{'maintenance-window'}
+        && !in_maintenance_window($scfg->{'maintenance-window'})) {
+        die "outside maintenance window "
+            . "$scfg->{'maintenance-window'} for cluster '$name' "
+            . "(retry with force to roll anyway)\n";
+    }
+
+    my $subnet = $scfg->{'node-subnet'}
+        or die "cluster '$name' has no node-subnet configured\n";
+    $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
+    my $prefix = $1;
+    my $vip = "$prefix.59";
+    my $gateway = $scfg->{gateway} // "$prefix.1";
+    my $version = $opts{target_version} // $scfg->{'k8s-version'};
+
+    my $template = find_template($version);
+    my (undef, $want_rev) = find_template_in_list(qm('list'), $version);
+    print "rolling '$name' to Kubernetes $version template r$want_rev\n";
+
+    # After a roll, node names no longer match the canonical
+    # provision layout, so the stored inventory is authoritative
+    # when present.
+    my @nodes;
+    if ($scfg->{nodes}) {
+        my $pools = PVE::K8s::Config::parse_pools(
+            $scfg->{pools}, $scfg->{workers} // 2);
+        my %pool_by_name = map { $_->{name} => $_ } $pools->@*;
+        my $inventory = JSON::PP->new->decode($scfg->{nodes});
+        for my $item ($inventory->@*) {
+            my ($idx) = $item->{name} =~ /(\d+)$/;
+            my $pool = $item->{pool} // 'default';
+            my $pdef = $pool_by_name{$pool} // {};
+            push @nodes, {
+                host => $item->{name},
+                role => $pool eq 'control-plane' ? 'cp' : 'worker',
+                pool => $pool, idx => $idx // 1, ip => $item->{ip},
+                vmid => $item->{vmid}, pvehost => $item->{pvehost},
+                rev => $item->{rev},
+                labels => $pdef->{labels}, taints => $pdef->{taints},
+                pool_hosts => $pdef->{hosts},
+                pool_storage => $pdef->{storage},
+            };
+        }
+        @nodes = sort { $a->{role} cmp $b->{role} } @nodes;
+    } else {
+        @nodes = cluster_nodes($name, $scfg, $prefix)->@*;
+        my $existing = cluster_vms();
+        for my $node (@nodes) {
+            my $vm = $existing->{$node->{host}}
+                or die "node VM $node->{host} not found; "
+                . "run provision first\n";
+            $node->{vmid} = $vm->{vmid};
+            $node->{pvehost} = $vm->{node};
+        }
+    }
+    for my $node (@nodes) {
+        $node->{site} = $node->{pvehost};
+        $VM_HOST{$node->{vmid}} = $node->{pvehost} if $node->{vmid};
+        $node->{rev} = node_rev_on($node);
+    }
+    my $group_of = ha_group_by_host();
+    $_->{site} = $group_of->{$_->{pvehost}} // $_->{pvehost} for @nodes;
+
+    my @behind = grep {
+        !defined $_->{rev} || $_->{rev} != $want_rev
+        || ($opts{target_version}
+            && $version ne $scfg->{'k8s-version'})
+    } @nodes;
+    if (!@behind) {
+        print "all nodes already on Kubernetes $version r$want_rev\n";
+        return 0;
+    }
+
+    set_state($name, 'rolling');
+    my $ctx = { version => $version, template => $template,
+        gateway => $gateway, storage => $scfg->{storage} // 'local-zfs' };
+    my $hosts = pve_online_nodes();
+    # Operations (snapshot, join material, upgrade apply,
+    # kubectl) run from the first control-plane node whose
+    # guest agent actually answers; any CP can serve, and the
+    # first by name may be the least healthy one.
+    my ($cp1) = grep { $_->{role} eq 'cp' } @nodes;
+    for my $candidate (grep { $_->{role} eq 'cp' } @nodes) {
+        my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
+        if ($ok) {
+            $cp1 = $candidate;
+            last;
+        }
+        print "roll operations: $candidate->{host} not answering, "
+            . "trying next control-plane node\n";
+    }
+    print "roll operations via $cp1->{host}\n";
+
+    # etcd snapshot gate before any control-plane replacement
+    etcd_snapshot($cp1) if grep { $_->{role} eq 'cp' } @behind;
+
+    # cluster-info may still point at the first CP's address
+    # (it is created during provisioning from the local
+    # endpoint); point discovery at the VIP so joins survive
+    # that node being rolled away.
+    eval {
+        guest_exec($cp1->{vmid},
+            'kubeadm init phase bootstrap-token '
+            . '--kubeconfig /etc/kubernetes/admin.conf');
+    };
+
+    my ($join_cmd, $cert_key);
+    my $upgraded = 0;
+    for my $old (@behind) {
+        # surge: build the replacement first, with a fresh
+        # name/IP (next free index in its role/pool)
+        my $new = { $old->%* };
+        if ($old->{role} eq 'cp') {
+            my $next = 1 + (sort { $b <=> $a }
+                map { $_->{idx} } grep { $_->{role} eq 'cp' } @nodes)[0];
+            $new->{host} = "$name-cp$next";
+            $new->{idx} = $next;
+            $new->{ip} = "$prefix." . (59 + $next);
+        } else {
+            my @pool = grep { $_->{pool} eq $old->{pool} } @nodes;
+            my $next = 1 + (sort { $b <=> $a } map { $_->{idx} } @pool)[0];
+            $new->{host} = $old->{pool} eq 'default'
+                ? "$name-w$next" : "$name-$old->{pool}$next";
+            $new->{idx} = $next;
+            my $max_ip = (sort { $b <=> $a }
+                map { /(\d+)$/ ? int $1 : 69 }
+                map { $_->{ip} } @nodes)[0];
+            $new->{ip} = "$prefix." . ($max_ip + 1);
+        }
+        delete $new->{vmid};
+        delete $new->{rev};
+
+        # placement: prefer a different host than the old node
+        my %counts;
+        for my $n (@nodes) {
+            $counts{"total:$n->{pvehost}"}++;
+            $counts{"cp:$n->{pvehost}"}++ if $n->{role} eq 'cp';
+            my $g = $group_of->{$n->{pvehost}} // $n->{pvehost};
+            $counts{"cp-group:$g"}++ if $n->{role} eq 'cp';
+            $counts{"pool:$n->{pool}:$n->{pvehost}"}++;
+        }
+        my @candidates = grep { $_ ne $old->{pvehost} } $hosts->@*;
+        @candidates = $hosts->@* if !@candidates;
+        if ($new->{pool_hosts}) {
+            my %allowed = map { $_ => 1 }
+                split /\s*,\s*/, $new->{pool_hosts};
+            @candidates = grep { $allowed{$_} } @candidates;
+        }
+        my %pool_counts = map {
+            ("pool:$_" => $counts{"pool:$new->{pool}:$_"} // 0) } @candidates;
+        $new->{pvehost} = choose_host(\@candidates, $group_of,
+            { %counts, %pool_counts },
+            $new->{role} eq 'cp' ? 'cp' : 'worker');
+        $new->{site} = $group_of->{$new->{pvehost}} // $new->{pvehost};
+        print "surge: replacing $old->{host} with $new->{host} "
+            . "on $new->{pvehost}\n";
+
+        # A resumed roll may find its replacement already
+        # created and joined (the previous run died waiting for
+        # it); adopt it instead of surging yet another node.
+        my $adopted = 0;
+        if ((cluster_vms()->{$new->{host}} // {})->{vmid}) {
+            my $out = eval {
+                kubectl_on($cp1, 'get nodes --no-headers') } // '';
+            $adopted = $out =~ /^\Q$new->{host}\E\s/m ? 1 : 0;
+        }
+        if ($adopted) {
+            $new->{vmid} = cluster_vms()->{$new->{host}}->{vmid};
+            $VM_HOST{$new->{vmid}} = $new->{pvehost};
+            print "adopting already-joined replacement $new->{host}\n";
+            goto ADOPTED;
+        }
+
+        create_node_vm($ctx, $new, node_userdata(
+            hostname => $new->{host}, role => $new->{role}, vip => $vip,
+            extra_runcmd => ''));
+        # the external flag must be set before kubeadm join so
+        # the kubelet registers with the uninitialized taint
+        # the CCM needs to initialise the node
+        set_external_cloud_provider($new);
+
+        # Kubernetes minor upgrade (T2.3): before the first
+        # new-version CP joins, run kubeadm upgrade apply on an
+        # existing CP with the target kubeadm binary fetched to
+        # /tmp (the node itself stays immutable and is replaced
+        # later in this same roll).
+        if ($opts{target_version} && !$upgraded
+            && $new->{role} eq 'cp') {
+            my $kver = guest_exec($new->{vmid},
+                'kubeadm version -o short');
+            chomp $kver;
+            guest_exec($cp1->{vmid},
+                "curl -sL https://dl.k8s.io/release/$kver/bin/linux/"
+                . 'amd64/kubeadm -o /tmp/kubeadm && chmod +x /tmp/kubeadm');
+            # upgrade apply pulls all control-plane images and
+            # can outrun any exec transport timeout on slow
+            # hosts, so it runs detached in the guest and is
+            # polled to completion
+            guest_exec($cp1->{vmid},
+                'rm -f /root/upgrade.rc; nohup sh -c '
+                . "'/tmp/kubeadm upgrade apply $kver --yes "
+                . '> /root/upgrade.log 2>&1; echo $? > /root/upgrade.rc'
+                . "' >/dev/null 2>&1 &");
+            my $rc;
+            for (1 .. 80) {
+                $rc = eval {
+                    guest_exec($cp1->{vmid}, 'cat /root/upgrade.rc')
+                } // '';
+                chomp $rc;
+                last if $rc =~ /^\d+$/;
+                sleep 30;
+            }
+            die "kubeadm upgrade apply did not finish on $cp1->{host}\n"
+                if $rc !~ /^\d+$/;
+            if ($rc != 0) {
+                my $log = eval {
+                    guest_exec($cp1->{vmid}, 'tail -5 /root/upgrade.log')
+                } // '';
+                die "kubeadm upgrade apply failed on $cp1->{host}: $log\n";
+            }
+            $upgraded = 1;
+            print "control plane upgraded to $kver via $cp1->{host}\n";
+        }
+
+        # Join material is refreshed for every replacement, and
+        # discovery uses the VIP (cluster-info was refreshed to
+        # it above): the node material came from may itself
+        # have been rolled away, so a node address is not stable
+        # enough here, unlike during initial provisioning.
+        $join_cmd = guest_exec($cp1->{vmid},
+            'kubeadm token create --print-join-command');
+        chomp $join_cmd;
+        $cert_key = guest_exec($cp1->{vmid},
+            'kubeadm init phase upload-certs --upload-certs '
+            . '2>/dev/null | tail -1');
+        chomp $cert_key;
+        my $join = join_command($join_cmd, $cert_key,
+            $new->{role} eq 'cp' ? 1 : 0);
+        my $joined = 0;
+        for my $attempt (1 .. 3) {
+            $joined = eval { guest_exec($new->{vmid}, $join); 1 } // 0;
+            last if $joined;
+            eval { guest_exec($new->{vmid}, 'kubeadm reset -f') };
+            sleep 20;
+        }
+        die "replacement $new->{host} failed to join\n" if !$joined;
+      ADOPTED:
+        set_external_cloud_provider($new);
+        wait_node_ready($cp1, $new->{host});
+        label_node($cp1, $new);
+
+        $new->{rev} = $want_rev;
+        @nodes = map { $_->{host} eq $old->{host} ? $new : $_ } @nodes;
+        remove_node($cp1, $old, \@nodes);
+        $cp1 = (grep { $_->{role} eq 'cp' } @nodes)[0]
+            if $cp1->{host} eq $old->{host};
+        store_inventory($name, \@nodes, $want_rev);
+        print "rolled $old->{host} -> $new->{host}\n";
+    }
+
+    if ($opts{target_version}) {
+        PVE::K8s::Config::lock_config(sub {
+            my $locked = PVE::K8s::Config->config();
+            $locked->{ids}->{$name}->{'k8s-version'} = $version;
+            PVE::K8s::Config::store_config($locked);
+        });
+    }
+    store_inventory($name, \@nodes, $want_rev);
+    set_state($name, 'ready');
+    print "cluster '$name' rolled: all nodes on $version r$want_rev\n";
+    return 1;
+}
+
+sub upgrade_cluster {
+    my ($name, $target, %opts) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $to = assert_minor_upgrade($scfg->{'k8s-version'}, $target);
+    # template must exist before anything is touched
+    find_template($to);
+    return roll_cluster($name, target_version => $to, force => $opts{force});
 }
 
 1;

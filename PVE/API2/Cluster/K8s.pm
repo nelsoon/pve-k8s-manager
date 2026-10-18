@@ -109,6 +109,12 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "PVE storage for node disks.",
             },
+            'maintenance-window' => {
+                type => 'string',
+                pattern => '^\d{2}:\d{2}-\d{2}:\d{2}$',
+                optional => 1,
+                description => "Rolling window HH:MM-HH:MM (local time).",
+            },
             description => {
                 type => 'string',
                 maxLength => 4096,
@@ -141,7 +147,8 @@ __PACKAGE__->register_method({
                 state => 'config-only',
                 created => time(),
                 (map { $param->{$_} ? ($_ => $param->{$_}) : () }
-                    qw(node-subnet gateway lb-range pools storage description)),
+                    qw(node-subnet gateway lb-range pools storage
+                        maintenance-window description)),
             };
 
             PVE::K8s::Config::store_config($cfg);
@@ -181,6 +188,89 @@ __PACKAGE__->register_method({
         # UI can show progress in the task log like other actions.
         return $rpcenv->fork_worker('k8sprovision', $name, $authuser, sub {
             PVE::K8s::Provision::provision_cluster($name);
+        });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'roll',
+    path => '{name}/roll',
+    method => 'POST',
+    protected => 1,
+    description => "Roll nodes onto the latest template revision "
+        . "(surge replacement, one at a time).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            force => {
+                type => 'boolean',
+                optional => 1,
+                description => "Roll even outside the maintenance window.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $name = $param->{name};
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8sroll', $name, $authuser, sub {
+            PVE::K8s::Provision::roll_cluster(
+                $name, force => $param->{force} // 0);
+        });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'upgrade',
+    path => '{name}/upgrade',
+    method => 'POST',
+    protected => 1,
+    description => "Upgrade Kubernetes by one minor version "
+        . "(kubeadm sequencing + rolling replacement).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            to => {
+                type => 'string',
+                pattern => '^\d+\.\d+(\.\d+)?$',
+                description => "Target Kubernetes minor, e.g. '1.32'.",
+            },
+            force => {
+                type => 'boolean',
+                optional => 1,
+                description => "Upgrade even outside the maintenance window.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $name = $param->{name};
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8supgrade', $name, $authuser, sub {
+            PVE::K8s::Provision::upgrade_cluster(
+                $name, $param->{to}, force => $param->{force} // 0);
         });
     }});
 

@@ -168,7 +168,7 @@ Ext.define('PVE.dc.K8sView', {
         let me = this;
 
         let store = Ext.create('Ext.data.Store', {
-            fields: ['name', 'state', 'k8s-version', 'cp', 'workers',
+            fields: ['name', 'state', 'k8s-version', 'template-rev', 'cp', 'workers',
                 'node-subnet', 'gateway', 'lb-range', 'storage'],
             proxy: {
                 type: 'proxmox',
@@ -246,6 +246,85 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        let rollBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Roll'),
+            iconCls: 'fa fa-fw fa-refresh',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Ext.Msg.confirm(
+                    gettext('Confirm'),
+                    Ext.String.format(
+                        gettext('Roll cluster {0} onto the latest node image?'), name),
+                    function(answer) {
+                        if (answer !== 'yes') {
+                            return;
+                        }
+                        Proxmox.Utils.API2Request({
+                            url: '/cluster/k8s/' + name + '/roll',
+                            method: 'POST',
+                            params: { force: 1 },
+                            failure: function(response) {
+                                Ext.Msg.alert(gettext('Error'),
+                                    Proxmox.Utils.extractRequestError(response, true));
+                            },
+                            success: function(response) {
+                                let upid = response.result.data;
+                                if (upid) {
+                                    Ext.create('Proxmox.window.TaskViewer', {
+                                        upid: upid,
+                                    }).show();
+                                }
+                                store.load();
+                            },
+                        });
+                    });
+            },
+        });
+
+        let upgradeBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Upgrade'),
+            iconCls: 'fa fa-fw fa-arrow-circle-up',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Ext.Msg.prompt(
+                    gettext('Upgrade Kubernetes'),
+                    gettext('Target version (one minor up, e.g. 1.32):'),
+                    function(answer, value) {
+                        if (answer !== 'ok' || !value) {
+                            return;
+                        }
+                        Proxmox.Utils.API2Request({
+                            url: '/cluster/k8s/' + name + '/upgrade',
+                            method: 'POST',
+                            params: { to: value, force: 1 },
+                            failure: function(response) {
+                                Ext.Msg.alert(gettext('Error'),
+                                    Proxmox.Utils.extractRequestError(response, true));
+                            },
+                            success: function(response) {
+                                let upid = response.result.data;
+                                if (upid) {
+                                    Ext.create('Proxmox.window.TaskViewer', {
+                                        upid: upid,
+                                    }).show();
+                                }
+                                store.load();
+                            },
+                        });
+                    });
+            },
+        });
+
         Ext.apply(me, {
             store: store,
             columns: [
@@ -271,6 +350,11 @@ Ext.define('PVE.dc.K8sView', {
                 {
                     text: gettext('Version'),
                     dataIndex: 'k8s-version',
+                    width: 90,
+                },
+                {
+                    text: gettext('Image Rev'),
+                    dataIndex: 'template-rev',
                     width: 90,
                 },
                 {
@@ -307,6 +391,8 @@ Ext.define('PVE.dc.K8sView', {
                     },
                 },
                 provisionBtn,
+                rollBtn,
+                upgradeBtn,
                 removeBtn,
                 '-',
                 {
@@ -321,6 +407,8 @@ Ext.define('PVE.dc.K8sView', {
                 selectionchange: function(model, selected) {
                     let disabled = !selected || selected.length < 1;
                     provisionBtn.setDisabled(disabled);
+                    rollBtn.setDisabled(disabled);
+                    upgradeBtn.setDisabled(disabled);
                     removeBtn.setDisabled(disabled);
                 },
                 afterrender: function() {
