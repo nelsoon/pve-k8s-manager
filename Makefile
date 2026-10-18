@@ -23,6 +23,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/ui-k8s.t
 	@perl -I. -Itests/stubs tests/unit/pools-placement.t
 	@perl -I. -Itests/stubs tests/unit/roll-upgrade.t
+	@perl -I. -Itests/stubs tests/unit/supported-versions.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Skeleton packaging: stage the payload and build with dpkg-deb.

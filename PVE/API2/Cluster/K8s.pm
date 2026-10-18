@@ -63,7 +63,7 @@ __PACKAGE__->register_method({
             'k8s-version' => {
                 type => 'string',
                 pattern => '^\d+\.\d+(\.\d+)?$',
-                description => "Kubernetes version, e.g. '1.31'.",
+                description => "Kubernetes version, e.g. '1.37'.",
             },
             cp => {
                 type => 'integer',
@@ -129,6 +129,8 @@ __PACKAGE__->register_method({
 
         my $name = $param->{name};
         my $cp = PVE::K8s::Config::assert_valid_cp_count($param->{cp} // 3);
+        # new clusters only on upstream-supported minors
+        PVE::K8s::Config::assert_supported_version($param->{'k8s-version'});
         # validate pools eagerly so a bad pool spec fails at
         # create time, not halfway through provisioning
         PVE::K8s::Config::parse_pools($param->{pools}, $param->{workers} // 2)
@@ -251,7 +253,7 @@ __PACKAGE__->register_method({
             to => {
                 type => 'string',
                 pattern => '^\d+\.\d+(\.\d+)?$',
-                description => "Target Kubernetes minor, e.g. '1.32'.",
+                description => "Target Kubernetes minor, e.g. '1.37'.",
             },
             force => {
                 type => 'boolean',

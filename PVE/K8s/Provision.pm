@@ -139,8 +139,16 @@ my sub cluster_vms {
     my %vms;
     for my $vm ($res->@*) {
         next if !defined $vm->{name};
-        $vms{$vm->{name}} = { vmid => $vm->{vmid}, node => $vm->{node} };
-        $VM_HOST{$vm->{vmid}} = $vm->{node};
+        # Validate through regex captures: values decoded from
+        # JSON are tainted under the daemon's -T, and passing
+        # them to exec (ssh/qm) dies with "Insecure dependency".
+        next if ($vm->{vmid} // '') !~ /^(\d+)$/;
+        my $vmid = $1;
+        next if ($vm->{node} // '') !~ /^([a-zA-Z0-9._-]+)$/;
+        my $node = $1;
+        next if $vm->{name} !~ /^([a-zA-Z0-9._-]+)$/;
+        $vms{$1} = { vmid => $vmid, node => $node };
+        $VM_HOST{$vmid} = $node;
     }
     return \%vms;
 }

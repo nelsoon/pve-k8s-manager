@@ -61,7 +61,7 @@ my $defaultData = {
         },
         'k8s-version' => {
             type => 'string',
-            description => "Kubernetes version, e.g. '1.31'.",
+            description => "Kubernetes version, e.g. '1.37'.",
             pattern => '^\d+\.\d+(\.\d+)?$',
         },
         cp => {
@@ -221,6 +221,32 @@ sub parse_pools {
         }
     }
     return $pools;
+}
+
+# Supported Kubernetes minors: the three minor lines the
+# upstream project still maintains (roughly one year of patch
+# support each). New clusters may only be created on these;
+# older clusters upgrade one minor at a time until they are
+# back inside the window, so the upgrade path itself is not
+# gated on this list. Bump the window as upstream releases.
+our @SUPPORTED_VERSIONS = ('1.35', '1.36', '1.37');
+
+sub supported_versions {
+    return [@SUPPORTED_VERSIONS];
+}
+
+sub latest_supported_version {
+    return $SUPPORTED_VERSIONS[-1];
+}
+
+sub assert_supported_version {
+    my ($version) = @_;
+
+    my ($minor) = ($version // '') =~ /^(\d+\.\d+)(?:\.\d+)?$/;
+    die "invalid Kubernetes version '$version'\n" if !defined $minor;
+    return $minor if grep { $_ eq $minor } @SUPPORTED_VERSIONS;
+    die "Kubernetes $minor is not supported (end of life upstream); "
+        . "supported versions: " . join(', ', @SUPPORTED_VERSIONS) . "\n";
 }
 
 sub assert_valid_cp_count {

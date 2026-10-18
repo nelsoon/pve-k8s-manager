@@ -26,7 +26,7 @@ Decisions).
 
 ```sh
 cd images
-./build-template.sh --k8s-version 1.31 --storage local-zfs --vmid 9000
+./build-template.sh --k8s-version 1.37 --storage local-zfs --vmid 9000
 ```
 
 The resulting template is named `k8s-node-<k8s-version>-r<rev>`.

@@ -10,7 +10,11 @@ use warnings;
 # inside the cluster. Install commands run on the first
 # control-plane node via the guest agent.
 
-our $CILIUM_VERSION = '1.16.6';
+# Cilium 1.20.x is e2e-tested upstream up to Kubernetes 1.36;
+# 1.37 support lands in Cilium 1.21 (pre-release at pin time),
+# so 1.37 clusters rely on Kubernetes backward compatibility
+# until 1.21 is stable - proven in the lab before release.
+our $CILIUM_VERSION = '1.20.3';
 our $HELM_VERSION = '3.16.3';
 our $POD_CIDR = '10.244.0.0/16';
 
