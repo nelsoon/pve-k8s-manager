@@ -401,6 +401,14 @@ sub node_userdata {
             . join('', map { "      $_\n" } split(/\n/, kube_vip_manifest($a{vip}, 'eth0')))
         : '';
 
+    my $enc_file = '';
+    if ($a{role} =~ /^cp/ && $a{enc_key}) {
+        my $yaml = encryption_config_yaml($a{enc_key});
+        $enc_file = "  - path: /etc/kubernetes/enc/enc.yaml\n"
+            . "    permissions: '0600'\n    content: |\n"
+            . join('', map { "      $_\n" } split(/\n/, $yaml));
+    }
+
     return <<EOF;
 #cloud-config
 hostname: $a{hostname}
@@ -416,7 +424,7 @@ write_files:
   - path: /etc/hosts
     append: true
     content: "127.0.0.1 kubernetes\n"
-$vip_manifest
+$vip_manifest$enc_file
 runcmd:
   # write_files runs before cloud-init regenerates /etc/hosts
   # (manage_etc_hosts), so assert the kubernetes name again in
@@ -438,6 +446,62 @@ EOF
 # but kubeadm rejects a bare minor as kubernetesVersion, so the
 # full version is read from the kubeadm binary baked into the
 # immutable template at boot time.
+# Etcd encryption at rest (T3.2): one plugin-managed key
+# per cluster, kept as a 0600 file in pmxcfs (replicated to
+# every PVE host, never exposed through the API). Written
+# into each control-plane node's EncryptionConfiguration
+# at creation; the kubeadm ClusterConfiguration points the
+# apiserver at it. Clusters created before this existed
+# simply never get the apiserver argument (their init is
+# long done) - encryption is a create-time property in v1.
+sub cluster_encryption_key {
+    my ($name) = @_;
+
+    my $key;
+    PVE::K8s::Config::lock_config(sub {
+        my $dir = '/etc/pve/k8s/keys';
+        mkdir $dir if !-d $dir;
+        my $file = "$dir/$name.key";
+        if (open my $fh, '<', $file) {
+            $key = <$fh>;
+            close $fh;
+            $key =~ s/\s+//g if $key;
+        }
+        if (!$key) {
+            open my $rnd, '<', '/dev/urandom'
+                or die "open /dev/urandom: $!\n";
+            binmode $rnd;
+            my $raw = '';
+            read($rnd, $raw, 32) == 32
+                or die "could not read 32 random bytes\n";
+            close $rnd;
+            $key = MIME::Base64::encode_base64($raw, '');
+            open my $fh, '>', $file or die "$file: $!\n";
+            chmod 0600, $file;
+            print $fh "$key\n";
+            close $fh or die "$file: $!\n";
+        }
+    });
+    return $key;
+}
+
+sub encryption_config_yaml {
+    my ($key) = @_;
+
+    return <<EOF;
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources: ["secrets"]
+    providers:
+      - aescbc:
+          keys:
+            - name: pve-k8s-1
+              secret: $key
+      - identity: {}
+EOF
+}
+
 sub kubeadm_init_runcmd {
     my ($vip) = @_;
 
@@ -450,6 +514,15 @@ sub kubeadm_init_runcmd {
     kubernetesVersion: $KVER
     controlPlaneEndpoint: "%s:6443"
     networking: {podSubnet: "10.244.0.0/16"}
+    apiServer:
+      extraArgs:
+      - {name: encryption-provider-config, value: /etc/kubernetes/enc/enc.yaml}
+      extraVolumes:
+      - name: enc
+        hostPath: /etc/kubernetes/enc
+        mountPath: /etc/kubernetes/enc
+        readOnly: true
+        pathType: DirectoryOrCreate
     etcd:
       local:
         extraArgs:
@@ -521,6 +594,17 @@ sub init_completion_cmd {
         . '&& kubeadm init phase bootstrap-token --config kubeadm-config.yaml '
         . '--kubeconfig /root/local-super-admin.conf '
         . '&& kubeadm init phase kubelet-finalize all --config kubeadm-config.yaml '
+        # if cloud-init's kubeadm init died before its own
+        # mark step (slow lab image pulls did exactly this),
+        # the node has no control-plane label/taint and the
+        # CCM (which selects CP nodes) can never schedule
+        . '&& kubectl --kubeconfig /root/local-super-admin.conf '
+        . 'label node $(hostname) '
+        . 'node-role.kubernetes.io/control-plane= --overwrite '
+        . '&& kubectl --kubeconfig /root/local-super-admin.conf '
+        . 'taint node $(hostname) '
+        . 'node-role.kubernetes.io/control-plane:NoSchedule '
+        . '--overwrite '
         . '&& kubeadm init phase addon all --config kubeadm-config.yaml '
         . '--kubeconfig /root/local-super-admin.conf';
 }
@@ -681,6 +765,10 @@ sub delete_cluster {
         delete $locked->{ids}->{$name};
         delete $locked->{order}->{$name};
         PVE::K8s::Config::store_config($locked);
+        # the etcd encryption key is the cluster master key:
+        # it must not outlive the cluster it protects
+        my $key_file = "/etc/pve/k8s/keys/$name.key";
+        unlink $key_file if -e $key_file;
     });
     print "cluster '$name' deleted: no orphan VMs, disks or users\n";
 }
@@ -765,7 +853,27 @@ sub create_node_vm {
         $ctx->@{qw(version template gateway)};
     my $vmname = $node->{host};
     my $target = $node->{pvehost};
-    my $vmid = find_vmid_by_name($vmname);
+    # Reuse is decided by where the VM actually is, never
+    # by the placement guess: the aggregated cluster view
+    # can lag a loaded host, and cloning then would create
+    # a duplicate name/IP (seen in the lab, 2026-10-19).
+    # If the aggregate misses it, ask every online host
+    # directly before believing the VM does not exist.
+    my $vm = cluster_vms()->{$vmname};
+    if (!$vm) {
+        for my $host (pve_online_nodes()->@*) {
+            my $list = eval { qm_on($host, 'list') } // '';
+            if ($list =~ /^\s*(\d+)\s+\Q$vmname\E\s/m) {
+                $vm = { vmid => $1, node => $host };
+                last;
+            }
+        }
+    }
+    my $vmid = $vm ? $vm->{vmid} : undef;
+    if ($vm) {
+        $target = $vm->{node};
+        $node->{pvehost} = $target;
+    }
     if (!$vmid) {
         my $tpl = ensure_template_on($target, $version, $template);
         $vmid = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
@@ -943,8 +1051,10 @@ sub provision_cluster {
 
     # --- first control-plane node: kubeadm init
     my $cp1 = $nodes[0];
+    my $enc_key = cluster_encryption_key($name);
     create_node_vm($ctx, $cp1, node_userdata(
         hostname => $cp1->{host}, role => 'cp', vip => $vip,
+        enc_key => $enc_key,
         extra_runcmd => kubeadm_init_runcmd($vip),
     ));
     # kubeadm init runs inside cloud-init, which may still be
@@ -1009,6 +1119,7 @@ sub provision_cluster {
         my $join = join_command($join_cmd, $cert_key, $is_cp);
         create_node_vm($ctx, $node, node_userdata(
             hostname => $node->{host}, role => $node->{role}, vip => $vip,
+            enc_key => $is_cp ? $enc_key : undef,
             extra_runcmd => '',
         ));
         my $joined = eval {
@@ -1216,6 +1327,8 @@ my sub etcdctl_cmd {
 
     return 'IMG=$(ctr -n k8s.io containers list '
         . "| awk '\$2 ~ /etcd/ {print \$2; exit}'); "
+        . '[ -z "$IMG" ] && IMG=$(ctr -n k8s.io images list '
+        . "| awk '\$1 ~ /etcd/ {print \$1; exit}'); "
         . 'ctr -n k8s.io run --rm --net-host '
         . '--mount type=bind,src=/etc/kubernetes/pki/etcd,'
         . 'dst=/pki,options=rbind:ro '
@@ -1778,6 +1891,8 @@ sub roll_cluster {
 
         create_node_vm($ctx, $new, node_userdata(
             hostname => $new->{host}, role => $new->{role}, vip => $vip,
+            enc_key => $new->{role} eq 'cp'
+                ? cluster_encryption_key($name) : undef,
             extra_runcmd => ''));
         # the external flag must be set before kubeadm join so
         # the kubelet registers with the uninitialized taint
@@ -2208,11 +2323,30 @@ sub backup_cluster {
             $d->addfile($file);
             $d->hexdigest;
         };
+        # The PKI (CA, etcd CA, SA keys) travels with the
+        # snapshot: without it a fresh control-plane set
+        # would mint a new CA and every worker certificate
+        # would become invalid (T3.1b). It contains the
+        # cluster CA private key - files are 0600 and the
+        # backup-dir must be protected accordingly.
+        guest_exec($cp->{vmid},
+            'tar czf /tmp/pve-k8s-pki.tgz -C /etc/kubernetes pki');
+        my $pki_size = guest_fetch_file($cp->{vmid},
+            '/tmp/pve-k8s-pki.tgz', "$file.pki.tgz");
+        my $pki_sha = do {
+            require Digest::SHA;
+            my $d = Digest::SHA->new(256);
+            $d->addfile("$file.pki.tgz");
+            $d->hexdigest;
+        };
+        chmod 0600, $file, "$file.pki.tgz";
         my $manifest = JSON::PP->new->canonical->encode({
             cluster => $name, file => "$name-etcd-$stamp.db",
             size => $size + 0, sha256 => $sha, at => $stamp,
             'k8s-version' => $scfg->{'k8s-version'},
             from => $cp->{host},
+            pki => { file => "$name-etcd-$stamp.db.pki.tgz",
+                size => $pki_size + 0, sha256 => $pki_sha },
         });
         open my $mf, '>', "$file.json" or die "$file.json: $!\n";
         print $mf "$manifest\n";
@@ -2225,7 +2359,7 @@ sub backup_cluster {
             glob("$dir/$name-etcd-*.db");
         while (@backups > $keep) {
             my $old = shift @backups;
-            unlink $old, "$old.json";
+            unlink $old, "$old.json", "$old.pki.tgz";
             print "pruned old backup $old\n";
         }
         1;
@@ -2273,12 +2407,90 @@ sub restore_cluster {
     my $dir = backup_dir_for($scfg, $name);
     my $path = "$dir/$file";
     die "backup '$file' not found in $dir\n" if !-f $path;
+    my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
+    $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$|
+        or die "bad node-subnet\n";
+    my $vip = "$1.59";
 
     my $nodes = load_nodes($name, $scfg);
     my @cps = grep { $_->{role} eq 'cp' } $nodes->@*;
     my $initial = join ',', map {
         "$_->{host}=https://$_->{ip}:2380" } @cps;
     my $token = 'pve-k8s-restore-' . time();
+
+    # Fresh-set restore (T3.1b): control-plane VMs that no
+    # longer exist are recreated blank and rebuilt from the
+    # backup's PKI + etcd data, keeping the cluster's
+    # original identity. Only when NO control-plane node
+    # answers - with quorum alive the right move is member
+    # replacement, not a snapshot rollback.
+    my $vms = cluster_vms();
+    my (@fresh, @answering);
+    for my $cp (@cps) {
+        if (!$vms->{$cp->{host}}) {
+            push @fresh, $cp;
+            next;
+        }
+        my $ok = eval {
+            qm_on($cp->{pvehost}, 'agent', $cp->{vmid}, 'ping');
+            1;
+        } // 0;
+        if ($ok) {
+            # A VM recreated by an earlier, interrupted
+            # fresh restore answers the agent but has no
+            # control plane yet: it is fresh, not answering.
+            my $has_cp = eval {
+                guest_exec($cp->{vmid},
+                    'test -f /etc/kubernetes/admin.conf');
+                1;
+            } // 0;
+            if ($has_cp) {
+                push @answering, $cp;
+            } else {
+                push @fresh, $cp;
+            }
+        }
+    }
+    if (@fresh && @answering) {
+        die "control-plane VM(s) missing ("
+            . join(', ', map { $_->{host} } @fresh)
+            . ") but quorum survives on "
+            . join(', ', map { $_->{host} } @answering)
+            . "; replace the missing member(s) via "
+            . "provision/roll instead of restoring a backup\n";
+    }
+    if (@fresh) {
+        die "backup '$file' has no PKI archive; fresh-set "
+            . "restore is impossible (workers could not "
+            . "trust a new CA)\n" if !-f "$path.pki.tgz";
+        my $ctx = { version => $scfg->{'k8s-version'},
+            template => find_template($scfg->{'k8s-version'}),
+            gateway => $scfg->{gateway}
+                // do { my $g = $vip; $g =~ s/\.59$/.1/; $g },
+            storage => $scfg->{storage} // 'local-zfs' };
+        my $hosts = pve_online_nodes();
+        my $group_of = ha_group_by_host();
+        for my $cp (@fresh) {
+            my %online = map { $_ => 1 } $hosts->@*;
+            $cp->{pvehost} = ($cp->{pvehost}
+                && $online{$cp->{pvehost}})
+                ? $cp->{pvehost}
+                : choose_host($hosts, $group_of, {}, 'cp');
+            $cp->{site} = $group_of->{$cp->{pvehost}}
+                // $cp->{pvehost};
+            if (!$vms->{$cp->{host}}) {
+                create_node_vm($ctx, $cp, node_userdata(
+                    hostname => $cp->{host}, role => 'cp',
+                    enc_key => (-s "/etc/pve/k8s/keys/$name.key")
+                        ? cluster_encryption_key($name) : undef,
+                    vip => $vip));
+                print "recreated fresh control-plane VM "
+                    . "$cp->{host} (vmid $cp->{vmid} on "
+                    . "$cp->{pvehost})\n";
+            }
+        }
+    }
+    my %fresh_vm = map { $_->{vmid} => 1 } @fresh;
 
     # Fast path: when this host owns the cluster gateway
     # address, serve the backup over HTTP and let the
@@ -2309,6 +2521,22 @@ sub restore_cluster {
                 '/var/lib/restore.db');
         }
     }
+    for my $cp (@fresh) {
+        if ($serve_pid) {
+            guest_exec($cp->{vmid},
+                "curl -fsS http://$gateway:18099/$file.pki.tgz "
+                . '-o /tmp/pki.tgz');
+        } else {
+            guest_push_file($cp->{vmid}, "$path.pki.tgz",
+                '/tmp/pki.tgz');
+        }
+        guest_exec($cp->{vmid},
+            'mkdir -p /etc/kubernetes && '
+            . 'tar xzf /tmp/pki.tgz -C /etc/kubernetes && '
+            . 'test -f /etc/kubernetes/pki/ca.key');
+        print "installed backed-up PKI on fresh "
+            . "$cp->{host}\n";
+    }
     if ($serve_pid) {
         kill 'TERM', $serve_pid;
         waitpid $serve_pid, 0;
@@ -2332,6 +2560,8 @@ sub restore_cluster {
     for my $cp (@cps) {
         my $cmd = 'IMG=$(ctr -n k8s.io containers list '
             . "| awk '\$2 ~ /etcd/ {print \$2; exit}'); "
+            . '[ -z "$IMG" ] && IMG=$(ctr -n k8s.io images '
+            . "list | awk '\$1 ~ /etcd/ {print \$1; exit}'); "
             . 'ctr -n k8s.io run --rm '
             . '--mount type=bind,src=/var/lib,'
             . 'dst=/varlib,options=rbind '
@@ -2345,10 +2575,81 @@ sub restore_cluster {
             . '--data-dir /varlib/etcd';
         guest_exec($cp->{vmid}, $cmd);
     }
+    # Fresh members need their kubeadm phases (certs and
+    # kubeconfigs are skipped where the backed-up PKI
+    # already provides them) before kubelet starts.
+    for my $cp (@fresh) {
+        my $full = guest_exec($cp->{vmid},
+            'kubeadm version -o short');
+        $full =~ s/\s+//g;
+        $full =~ s/^v//;
+        guest_exec($cp->{vmid},
+            "cat > /root/kubeadm-restore.yaml <<'CFG'
+"
+            . "apiVersion: kubeadm.k8s.io/v1beta4
+"
+            . "kind: ClusterConfiguration
+"
+            . "kubernetesVersion: v$full
+"
+            . "controlPlaneEndpoint: \"$vip:6443\"
+"
+            . "networking:
+"
+            . "  podSubnet: 10.244.0.0/16
+"
+            . "  serviceSubnet: 10.96.0.0/12
+"
+            . "etcd:
+  local:
+    extraArgs:
+"
+            . "      - {name: heartbeat-interval, value: \"500\"}
+"
+            . "      - {name: election-timeout, value: \"5000\"}
+"
+            . "apiServer:
+  certSANs:
+"
+            . "    - \"$vip\"
+    - \"$cp->{ip}\"
+"
+            . ((-s "/etc/pve/k8s/keys/$name.key")
+                ? "  extraArgs:
+"
+                . "    - {name: encryption-provider-config, value: /etc/kubernetes/enc/enc.yaml}
+"
+                . "  extraVolumes:
+"
+                . "    - name: enc
+"
+                . "      hostPath: /etc/kubernetes/enc
+"
+                . "      mountPath: /etc/kubernetes/enc
+"
+                . "      readOnly: true
+"
+                . "      pathType: DirectoryOrCreate
+"
+                : '')
+            . "CFG
+"
+            . 'kubeadm init phase certs all '
+            . '--config /root/kubeadm-restore.yaml; '
+            . 'kubeadm init phase kubeconfig all '
+            . '--config /root/kubeadm-restore.yaml; '
+            . 'kubeadm init phase kubelet-start '
+            . '--config /root/kubeadm-restore.yaml; '
+            . 'kubeadm init phase etcd local '
+            . '--config /root/kubeadm-restore.yaml; '
+            . 'kubeadm init phase control-plane all '
+            . '--config /root/kubeadm-restore.yaml');
+        print "kubeadm phases complete on fresh $cp->{host}\n";
+    }
     for my $cp (@cps) {
         guest_exec($cp->{vmid},
             'mv /root/manifests-restore/*.yaml '
-            . '/etc/kubernetes/manifests/; '
+            . '/etc/kubernetes/manifests/ 2>/dev/null || true; '
             . 'systemctl start kubelet');
     }
     my $cp1 = $cps[0];
@@ -2378,6 +2679,16 @@ sub restore_cluster {
             kubectl_on($cp1, 'get nodes --no-headers') } // '';
         my $ready = () = $out =~ /^\S+\s+Ready\b/gm;
         if ($ready >= scalar @cps) {
+            for my $cp (@fresh) {
+                eval { kubectl_on($cp1,
+                    "label node $cp->{host} "
+                    . 'node-role.kubernetes.io/control-plane= '
+                    . '--overwrite') };
+                eval { kubectl_on($cp1,
+                    "taint node $cp->{host} "
+                    . 'node-role.kubernetes.io/control-plane:'
+                    . 'NoSchedule --overwrite') };
+            }
             print "etcd restored from $file on "
                 . scalar(@cps) . " control-plane node(s), "
                 . "all Ready\n";

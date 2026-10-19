@@ -144,6 +144,39 @@ like($userdata, qr{/etc/cloud/templates/hosts\.debian\.tmpl},
 like($userdata, qr/kubernetes\$' \/etc\/hosts/,
     'the grep end-anchor dollar survives heredoc interpolation literally');
 
+# --- T3.2: etcd encryption at rest
+like($runcmd, qr/encryption-provider-config, value: \/etc\/kubernetes\/enc\/enc\.yaml/,
+    'apiserver gets the encryption provider config at init');
+like($runcmd, qr/hostPath: \/etc\/kubernetes\/enc/,
+    'encryption config dir is mounted into the apiserver');
+
+my $enc = PVE::K8s::Provision::encryption_config_yaml(
+    'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=');
+like($enc, qr/kind: EncryptionConfiguration/,
+    'encryption config is an EncryptionConfiguration');
+like($enc, qr/resources: \["secrets"\]/,
+    'encryption covers Secrets');
+like($enc, qr/secret: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=/,
+    'encryption config carries the cluster key');
+like($enc, qr/- identity: \{\}/,
+    'identity fallback allows reading pre-encryption data');
+
+my $cp_userdata = PVE::K8s::Provision::node_userdata(
+    hostname => 'lab1-cp1', role => 'cp', vip => '192.168.201.59',
+    enc_key => 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+    extra_runcmd => '');
+like($cp_userdata, qr{path: /etc/kubernetes/enc/enc\.yaml},
+    'CP userdata writes the EncryptionConfiguration');
+like($cp_userdata, qr{permissions: '0600'},
+    'EncryptionConfiguration is 0600 on the node');
+
+my $worker_userdata = PVE::K8s::Provision::node_userdata(
+    hostname => 'lab1-w1', role => 'worker', vip => '192.168.201.59',
+    enc_key => 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+    extra_runcmd => '');
+unlike($worker_userdata, qr{enc/enc\.yaml},
+    'worker userdata never receives the encryption key');
+
 is_deeply([PVE::K8s::Provision::cluster_vm_names('lab1', 3, 2)],
     [qw(lab1-cp1 lab1-cp2 lab1-cp3 lab1-w1 lab1-w2)],
     'delete targets exactly the cluster CP and worker VM names');
