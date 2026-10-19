@@ -643,6 +643,121 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'addons',
+    path => '{name}/addons',
+    method => 'GET',
+    description => "List add-ons for a cluster: Cilium "
+        . "ingress/Gateway (installed), cert-manager and "
+        . "external-dns (unconfigured until enabled), and "
+        . "catalog entries available for later.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::list_addons($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'addon_enable',
+    path => '{name}/addons/{addon}/enable',
+    method => 'POST',
+    protected => 1,
+    description => "Enable an opt-in add-on (cert-manager or "
+        . "external-dns) on a ready cluster.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            addon => {
+                type => 'string',
+                pattern => '^(cert-manager|external-dns)$',
+                description => "The add-on to enable.",
+            },
+            issuer => {
+                type => 'string',
+                pattern => '^(ca|acme)$',
+                optional => 1,
+                description => "cert-manager issuer (default ca).",
+            },
+            email => {
+                type => 'string',
+                optional => 1,
+                description => "ACME account email.",
+            },
+            'acme-server' => {
+                type => 'string',
+                optional => 1,
+                description => "ACME directory URL (default "
+                    . "Let's Encrypt production).",
+            },
+            provider => {
+                type => 'string',
+                pattern => '^pdns$',
+                optional => 1,
+                description => "external-dns provider (pdns).",
+            },
+            'pdns-url' => {
+                type => 'string',
+                optional => 1,
+                description => "PowerDNS API URL, e.g. "
+                    . "http://dns.example.com:8081/api/v1/servers/localhost.",
+            },
+            'pdns-api-key' => {
+                type => 'string',
+                optional => 1,
+                description => "PowerDNS API key (stored only "
+                    . "in the in-cluster Secret).",
+            },
+            zone => {
+                type => 'string',
+                optional => 1,
+                description => "DNS zone (domain filter).",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $addon = $param->{addon};
+        my %opts = map { $_ => $param->{$_} }
+            grep { defined $param->{$_} }
+            qw(issuer email acme-server provider
+                pdns-url pdns-api-key zone);
+
+        return $rpcenv->fork_worker('k8saddon',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::enable_addon(
+                    $param->{name}, $addon, \%opts);
+            });
+    }});
+
+__PACKAGE__->register_method({
     name => 'delete',
     path => '{name}',
     method => 'DELETE',

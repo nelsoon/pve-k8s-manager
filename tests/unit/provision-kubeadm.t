@@ -61,8 +61,14 @@ like($cilium, qr/rollout status ds\/cilium/,
     'install waits for the Cilium daemonset via the API (no node DNS needed)');
 unlike($cilium, qr/rollout status deploy\/cilium-operator/,
     'no operator rollout wait: at bootstrap only cp1 exists for its 2 replicas');
-like($cilium, qr/envoy:\n  enabled: false/,
-    'Envoy is off until the ingress/Gateway add-on needs L7');
+like($cilium, qr/envoy:\n  enabled: true/,
+    'Envoy is on: the Cilium ingress/Gateway (T3.3) needs L7');
+like($cilium, qr/ingressController:\n  enabled: true/,
+    'Cilium ingress controller is enabled with the CNI install');
+like($cilium, qr/gatewayAPI:\n  enabled: true/,
+    'Cilium Gateway API support is enabled with the CNI install');
+like($cilium, qr/gateway-api\/releases\/download\/v\d+\.\d+\.\d+\/experimental-install\.yaml/,
+    'Gateway API CRDs (experimental channel) install before Cilium');
 
 my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
     'https://192.168.201.1:8006/api2/json', 'k8s-lab1@pve!ccm', 's3cret', 'pvek8s-lab');

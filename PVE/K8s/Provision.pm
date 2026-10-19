@@ -2370,6 +2370,130 @@ sub backup_cluster {
     return $done;
 }
 
+# --- T3.3 add-ons: Cilium ingress/Gateway ship with every
+# cluster; cert-manager and external-dns are must-deploy but
+# stay "unconfigured" until enabled here; the rest are
+# catalog entries for a later add/remove UI.
+
+sub addons_state {
+    my ($scfg) = @_;
+
+    return {} if !$scfg->{addons};
+    my $state = eval {
+        JSON::PP->new->decode($scfg->{addons}) };
+    return $state // {};
+}
+
+sub list_addons {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $state = addons_state($scfg);
+
+    my @addons = ({
+        name => 'cilium-ingress',
+        status => ($scfg->{state} // '') eq 'ready'
+            ? 'installed' : 'pending',
+        mustdeploy => 0,
+        summary => 'Cilium ingress controller + Gateway API '
+            . '(part of the Cilium install)',
+    });
+    for my $addon (
+        ['cert-manager', 'TLS certificates (internal CA by '
+            . 'default, ACME optional)'],
+        ['external-dns', 'Publishes Ingress/Gateway hostnames '
+            . 'to a DNS provider (PowerDNS)'],
+    ) {
+        my ($addon_name, $summary) = @$addon;
+        my $conf = $state->{$addon_name};
+        push @addons, {
+            name => $addon_name,
+            status => $conf ? 'configured' : 'unconfigured',
+            mustdeploy => 1,
+            summary => $summary,
+            ($conf ? (config => $conf) : ()),
+        };
+    }
+    for my $addon (
+        ['cilium-mesh', 'Cilium service mesh features (mTLS, '
+            . 'L7 policy, Hubble)'],
+        ['prometheus', 'Prometheus/Grafana monitoring stack'],
+        ['velero', 'Application-level backup to object '
+            . 'storage'],
+    ) {
+        my ($addon_name, $summary) = @$addon;
+        push @addons, {
+            name => $addon_name,
+            status => 'available',
+            mustdeploy => 0,
+            summary => $summary,
+        };
+    }
+    return \@addons;
+}
+
+sub enable_addon {
+    my ($name, $addon, $opts) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "cluster '$name' is not ready\n"
+        if ($scfg->{state} // '') ne 'ready';
+
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    my $kubeconfig = '/etc/kubernetes/admin.conf';
+    my %record;
+
+    if ($addon eq 'cert-manager') {
+        my $issuer_yaml =
+            PVE::K8s::Addons::certmanager_issuer_yaml($opts);
+        guest_exec($cp->{vmid},
+            PVE::K8s::Addons::certmanager_install_cmd(
+                $kubeconfig, $issuer_yaml));
+        %record = (
+            issuer => $opts->{issuer} // 'ca',
+            ($opts->{email} ? (email => $opts->{email}) : ()),
+        );
+        print "cert-manager enabled on cluster '$name' "
+            . "with issuer '$record{issuer}'\n";
+    } elsif ($addon eq 'external-dns') {
+        my $values =
+            PVE::K8s::Addons::external_dns_values_yaml(
+                $name, $opts);
+        my $api_key = $opts->{'pdns-api-key'}
+            or die "external-dns needs a pdns-api-key\n";
+        guest_exec($cp->{vmid},
+            PVE::K8s::Addons::external_dns_install_cmd(
+                $kubeconfig, $values, $api_key));
+        # the API key lives only in the in-cluster Secret,
+        # never in the cluster config on pmxcfs
+        %record = (
+            provider => $opts->{provider} // 'pdns',
+            'pdns-url' => $opts->{'pdns-url'},
+            zone => $opts->{zone},
+        );
+        print "external-dns enabled on cluster '$name' "
+            . "for zone '$record{zone}'\n";
+    } else {
+        die "add-on '$addon' cannot be enabled "
+            . "(want cert-manager or external-dns)\n";
+    }
+
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        my $state = addons_state($locked->{ids}->{$name});
+        $state->{$addon} = \%record;
+        $locked->{ids}->{$name}->{addons} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($locked);
+    });
+    return 1;
+}
+
 sub list_backups {
     my ($name) = @_;
 

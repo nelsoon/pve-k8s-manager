@@ -569,6 +569,169 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        let addonsBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Add-ons'),
+            iconCls: 'fa fa-fw fa-puzzle-piece',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                let store = Ext.create('Ext.data.Store', {
+                    fields: ['name', 'status', 'mustdeploy', 'summary'],
+                    proxy: {
+                        type: 'proxmox',
+                        url: '/api2/json/cluster/k8s/' + name + '/addons',
+                    },
+                    autoLoad: true,
+                });
+                let enableBtn = Ext.create('Ext.button.Button', {
+                    text: gettext('Configure / Enable'),
+                    iconCls: 'fa fa-fw fa-cog',
+                    disabled: true,
+                    handler: function() {
+                        let sel = grid.getSelection();
+                        if (!sel || sel.length < 1) {
+                            return;
+                        }
+                        let addon = sel[0].data.name;
+                        let items = [];
+                        if (addon === 'cert-manager') {
+                            items = [
+                                {
+                                    xtype: 'combobox',
+                                    name: 'issuer',
+                                    fieldLabel: gettext('Issuer'),
+                                    store: ['ca', 'acme'],
+                                    value: 'ca',
+                                    editable: false,
+                                    allowBlank: false,
+                                },
+                                {
+                                    xtype: 'textfield',
+                                    name: 'email',
+                                    fieldLabel: gettext('ACME Email'),
+                                    emptyText: gettext('only for the acme issuer'),
+                                },
+                            ];
+                        } else if (addon === 'external-dns') {
+                            items = [
+                                {
+                                    xtype: 'textfield',
+                                    name: 'pdns-url',
+                                    fieldLabel: gettext('PowerDNS API URL'),
+                                    emptyText: 'http://dns.example.com:8081/api/v1/servers/localhost',
+                                    allowBlank: false,
+                                },
+                                {
+                                    xtype: 'textfield',
+                                    name: 'zone',
+                                    fieldLabel: gettext('Zone'),
+                                    emptyText: 'example.com',
+                                    allowBlank: false,
+                                },
+                                {
+                                    xtype: 'textfield',
+                                    name: 'pdns-api-key',
+                                    fieldLabel: gettext('PowerDNS API Key'),
+                                    inputType: 'password',
+                                    allowBlank: false,
+                                },
+                            ];
+                        } else {
+                            return;
+                        }
+                        let formWin = Ext.create('Ext.window.Window', {
+                            title: Ext.String.format(
+                                gettext('Configure {0}'), addon),
+                            modal: true,
+                            width: 560,
+                            layout: 'fit',
+                            items: [{
+                                xtype: 'form',
+                                bodyPadding: 10,
+                                border: false,
+                                fieldDefaults: {
+                                    labelWidth: 170,
+                                    anchor: '100%',
+                                },
+                                items: items,
+                                buttons: [{
+                                    text: gettext('Enable'),
+                                    handler: function() {
+                                        let form = formWin.down('form').getForm();
+                                        if (!form.isValid()) {
+                                            return;
+                                        }
+                                        Proxmox.Utils.API2Request({
+                                            url: '/cluster/k8s/' + name
+                                                + '/addons/' + addon + '/enable',
+                                            method: 'POST',
+                                            params: form.getValues(),
+                                            failure: function(response) {
+                                                Ext.Msg.alert(gettext('Error'),
+                                                    Proxmox.Utils.extractRequestError(response, true));
+                                            },
+                                            success: function(response) {
+                                                formWin.close();
+                                                store.load();
+                                                let upid = response.result.data;
+                                                if (upid) {
+                                                    Ext.create('Proxmox.window.TaskViewer', {
+                                                        upid: upid,
+                                                    }).show();
+                                                }
+                                            },
+                                        });
+                                    },
+                                }, {
+                                    text: gettext('Cancel'),
+                                    handler: function() {
+                                        formWin.close();
+                                    },
+                                }],
+                            }],
+                        });
+                        formWin.show();
+                    },
+                });
+                let grid = Ext.create('Ext.grid.Panel', {
+                    store: store,
+                    tbar: [enableBtn],
+                    columns: [
+                        { text: gettext('Add-on'), dataIndex: 'name', width: 150 },
+                        { text: gettext('Status'), dataIndex: 'status', width: 130 },
+                        {
+                            text: gettext('Recommended'),
+                            dataIndex: 'mustdeploy',
+                            width: 120,
+                            renderer: function(v) {
+                                return v ? gettext('Yes') : '';
+                            },
+                        },
+                        { text: gettext('Description'), dataIndex: 'summary', flex: 1 },
+                    ],
+                    listeners: {
+                        selectionchange: function(model, selected) {
+                            let rec = selected && selected[0];
+                            enableBtn.setDisabled(!rec
+                                || (rec.data.name !== 'cert-manager'
+                                    && rec.data.name !== 'external-dns'));
+                        },
+                    },
+                });
+                Ext.create('Ext.window.Window', {
+                    title: Ext.String.format(gettext('Add-ons of {0}'), name),
+                    width: 780,
+                    height: 420,
+                    layout: 'fit',
+                    items: [grid],
+                }).show();
+            },
+        });
+
         let backupBtn = Ext.create('Ext.button.Button', {
             text: gettext('Backup'),
             iconCls: 'fa fa-fw fa-save',
@@ -709,6 +872,7 @@ Ext.define('PVE.dc.K8sView', {
                 nodesBtn,
                 kubeconfigBtn,
                 eventsBtn,
+                addonsBtn,
                 backupBtn,
                 restoreBtn,
                 removeBtn,
@@ -731,6 +895,7 @@ Ext.define('PVE.dc.K8sView', {
                     nodesBtn.setDisabled(disabled);
                     kubeconfigBtn.setDisabled(disabled);
                     eventsBtn.setDisabled(disabled);
+                    addonsBtn.setDisabled(disabled);
                     backupBtn.setDisabled(disabled);
                     restoreBtn.setDisabled(disabled);
                     removeBtn.setDisabled(disabled);

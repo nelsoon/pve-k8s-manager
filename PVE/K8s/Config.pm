@@ -132,6 +132,11 @@ my $defaultData = {
             description => "Force-retired node ghosts JSON (T2.6).",
             optional => 1,
         },
+        addons => {
+            type => 'string',
+            description => "Enabled opt-in add-ons JSON (T3.3).",
+            optional => 1,
+        },
         'backup-dir' => {
             type => 'string',
             description => "Host directory for etcd backups "
@@ -182,6 +187,7 @@ sub options {
         'maintenance-window' => { optional => 1 },
         'scaler-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },
+        addons => { optional => 1 },
         'backup-dir' => { optional => 1 },
         'backup-retention' => { optional => 1 },
         storage => { optional => 1 },
