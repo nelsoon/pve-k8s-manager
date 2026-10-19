@@ -24,14 +24,19 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/pools-placement.t
 	@perl -I. -Itests/stubs tests/unit/roll-upgrade.t
 	@perl -I. -Itests/stubs tests/unit/supported-versions.t
+	@perl -I. -Itests/stubs tests/unit/scaler.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Skeleton packaging: stage the payload and build with dpkg-deb.
 # A full debhelper build replaces this in Increment 4 (T4.3).
 deb:
 	@mkdir -p $(STAGE)/DEBIAN $(STAGE)/usr/share/perl5 $(STAGE)/usr/share/pve-manager/js
+	@mkdir -p $(STAGE)/usr/sbin $(STAGE)/lib/systemd/system
 	@cp -r PVE $(STAGE)/usr/share/perl5/
 	@cp www/manager6/*.js $(STAGE)/usr/share/pve-manager/js/
+	@install -m 0755 tools/pve-k8s-scaler $(STAGE)/usr/sbin/pve-k8s-scaler
+	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
+		$(STAGE)/lib/systemd/system/
 	@printf 'Package: $(PACKAGE)\nVersion: $(VERSION)\nArchitecture: all\nMaintainer: pve-k8s contributors\nDescription: Kubernetes cluster management for Proxmox VE\n Provisions and manages kubeadm Kubernetes clusters on Proxmox\n VMs from the Proxmox web UI, using Proxmox SDN and storage.\n' > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEB) >/dev/null
 	@echo "built $(DEB)"

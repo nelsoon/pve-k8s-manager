@@ -1,0 +1,24 @@
+#!/usr/bin/perl
+# Copyright (C) 2026 pve-k8s contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Autoscaler driver (T2.4): runs one reconcile pass per
+# managed cluster. Installed on every PVE host and driven by
+# pve-k8s-scaler.timer; the leader stamp in pmxcfs makes
+# sure only one host acts per cluster, the others stand
+# down. Decisions and actions live in PVE::K8s::Provision.
+use strict;
+use warnings;
+
+use PVE::K8s::Config;
+use PVE::K8s::Provision;
+
+my $cfg = PVE::K8s::Config->config();
+for my $name (sort keys $cfg->{ids}->%*) {
+    my $acted = eval { PVE::K8s::Provision::scale_cluster($name) };
+    if (my $err = $@) {
+        $err =~ s/\s+$//;
+        print "cluster $name: scaler pass failed: $err\n";
+    } elsif ($acted) {
+        print "cluster $name: action taken\n";
+    }
+}

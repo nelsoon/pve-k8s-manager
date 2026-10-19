@@ -122,6 +122,11 @@ my $defaultData = {
             description => "Rolling window HH:MM-HH:MM (local time).",
             optional => 1,
         },
+        'scaler-state' => {
+            type => 'string',
+            description => "Scaler leader/action state JSON (T2.4).",
+            optional => 1,
+        },
         state => {
             type => 'string',
             description => "Lifecycle state recorded by pve-k8sd.",
@@ -157,6 +162,7 @@ sub options {
         nodes => { optional => 1 },
         'template-rev' => { optional => 1 },
         'maintenance-window' => { optional => 1 },
+        'scaler-state' => { optional => 1 },
         storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },
@@ -214,6 +220,17 @@ sub parse_pools {
         die "pool '$name' size must be 0..50\n"
             if $size !~ /^\d+$/ || $size > 50;
         $pool->{size} = int $size;
+        # Autoscaling bounds (T2.4): absent min/max pins the
+        # pool at its size (no scaling). When given, the
+        # scaler keeps min <= size <= max.
+        my $min = $pool->{min} // $pool->{size};
+        my $max = $pool->{max} // $pool->{size};
+        die "pool '$name' min/max must be 0..50\n"
+            if "$min" !~ /^\d+$/ || "$max" !~ /^\d+$/ || $max > 50;
+        die "pool '$name' needs min <= size <= max\n"
+            if $min > $pool->{size} || $pool->{size} > $max;
+        $pool->{min} = int $min;
+        $pool->{max} = int $max;
         for my $key (qw(labels taints hosts)) {
             next if !defined $pool->{$key};
             die "pool '$name' $key must be a string\n"

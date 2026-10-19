@@ -290,6 +290,36 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        let scaleBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Scale'),
+            iconCls: 'fa fa-fw fa-arrows-alt',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Proxmox.Utils.API2Request({
+                    url: '/cluster/k8s/' + name + '/scale',
+                    method: 'POST',
+                    failure: function(response) {
+                        Ext.Msg.alert(gettext('Error'),
+                            Proxmox.Utils.extractRequestError(response, true));
+                    },
+                    success: function(response) {
+                        let upid = response.result.data;
+                        if (upid) {
+                            Ext.create('Proxmox.window.TaskViewer', {
+                                upid: upid,
+                            }).show();
+                        }
+                        store.load();
+                    },
+                });
+            },
+        });
+
         let upgradeBtn = Ext.create('Ext.button.Button', {
             text: gettext('Upgrade'),
             iconCls: 'fa fa-fw fa-arrow-circle-up',
@@ -396,6 +426,7 @@ Ext.define('PVE.dc.K8sView', {
                 },
                 provisionBtn,
                 rollBtn,
+                scaleBtn,
                 upgradeBtn,
                 removeBtn,
                 '-',
@@ -412,6 +443,7 @@ Ext.define('PVE.dc.K8sView', {
                     let disabled = !selected || selected.length < 1;
                     provisionBtn.setDisabled(disabled);
                     rollBtn.setDisabled(disabled);
+                    scaleBtn.setDisabled(disabled);
                     upgradeBtn.setDisabled(disabled);
                     removeBtn.setDisabled(disabled);
                 },

@@ -7,11 +7,13 @@ use warnings;
 
 use JSON::PP ();
 use MIME::Base64 ();
+use Time::Local ();
 
 use PVE::Tools qw(run_command);
 
 use PVE::K8s::Addons;
 use PVE::K8s::Config;
+use PVE::K8s::Scaler;
 
 # Provisioning FSM (T1.4). Runs in a protected API task worker on
 # one PVE node. All node VMs for a cluster are created on the
@@ -811,8 +813,27 @@ sub create_node_vm {
     return $vmid;
 }
 
+# Provisioning (and anything built on it, like the scaler)
+# must never run while a PVE host is offline: that host's
+# VMs vanish from the cluster-wide inventory, and the
+# provisioner would recreate live nodes on other hosts -
+# duplicate names and IPs (seen in the lab, 2026-10-18).
+my sub assert_all_hosts_online {
+    my $out = run(['pvesh', 'get', '/cluster/status',
+        '--output-format', 'json'], timeout => 60);
+    my $status = JSON::PP->new->decode($out);
+    my @offline = map { $_->{name} }
+        grep { ($_->{type} // '') eq 'node' && !($_->{online} // 0) }
+        $status->@*;
+    die "Proxmox host(s) offline: " . join(', ', @offline)
+        . "; refusing to provision (their VMs would look "
+        . "missing and be recreated elsewhere)\n" if @offline;
+}
+
 sub provision_cluster {
     my ($name) = @_;
+
+    assert_all_hosts_online();
 
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}
@@ -1153,18 +1174,33 @@ my sub node_rev_on {
     return $cfg =~ /image-revision(?::|%3A)\s*(\d+)/ ? int $1 : undef;
 }
 
+# etcdctl runs as a one-off ctr container with the node's
+# own etcd image: newer Kubernetes images no longer ship
+# crictl, and ctr is part of containerd, which is always
+# there. The PKI and data dir are bind-mounted in.
+my sub etcdctl_cmd {
+    my ($args) = @_;
+
+    return 'IMG=$(ctr -n k8s.io containers list '
+        . "| awk '\$2 ~ /etcd/ {print \$2; exit}'); "
+        . 'ctr -n k8s.io run --rm --net-host '
+        . '--mount type=bind,src=/etc/kubernetes/pki/etcd,'
+        . 'dst=/pki,options=rbind:ro '
+        . '--mount type=bind,src=/var/lib/etcd,'
+        . 'dst=/var/lib/etcd,options=rbind '
+        . '"$IMG" etcdctl-$$ etcdctl '
+        . '--endpoints=https://127.0.0.1:2379 '
+        . '--cacert=/pki/ca.crt --cert=/pki/server.crt '
+        . "--key=/pki/server.key $args";
+}
+
 my sub etcd_snapshot {
     my ($cp) = @_;
 
     my $file = "/var/lib/etcd/pre-roll-" . time() . ".db";
     guest_exec($cp->{vmid},
-        'CID=$(crictl ps --name etcd -q | head -1); '
-        . 'ETCDCTL_API=3 crictl exec $CID etcdctl '
-        . '--endpoints=https://127.0.0.1:2379 '
-        . '--cacert=/etc/kubernetes/pki/etcd/ca.crt '
-        . '--cert=/etc/kubernetes/pki/etcd/server.crt '
-        . '--key=/etc/kubernetes/pki/etcd/server.key '
-        . "snapshot save $file >/dev/null && test -s $file && echo $file");
+        etcdctl_cmd("snapshot save $file >/dev/null")
+        . " && test -s $file && echo $file");
     print "etcd snapshot saved on $cp->{host}: $file\n";
     return $file;
 }
@@ -1173,22 +1209,11 @@ my sub etcd_member_remove {
     my ($survivor, $old_host) = @_;
 
     my $list = guest_exec($survivor->{vmid},
-        'CID=$(crictl ps --name etcd -q | head -1); '
-        . 'ETCDCTL_API=3 crictl exec $CID etcdctl '
-        . '--endpoints=https://127.0.0.1:2379 '
-        . '--cacert=/etc/kubernetes/pki/etcd/ca.crt '
-        . '--cert=/etc/kubernetes/pki/etcd/server.crt '
-        . '--key=/etc/kubernetes/pki/etcd/server.key member list');
+        etcdctl_cmd('member list'));
     my ($id) = $list =~ /^([0-9a-f]+),[^,]+,\s*\Q$old_host\E,/m;
     return if !$id;
     guest_exec($survivor->{vmid},
-        'CID=$(crictl ps --name etcd -q | head -1); '
-        . 'ETCDCTL_API=3 crictl exec $CID etcdctl '
-        . '--endpoints=https://127.0.0.1:2379 '
-        . '--cacert=/etc/kubernetes/pki/etcd/ca.crt '
-        . '--cert=/etc/kubernetes/pki/etcd/server.crt '
-        . '--key=/etc/kubernetes/pki/etcd/server.key '
-        . "member remove $id >/dev/null");
+        etcdctl_cmd("member remove $id >/dev/null"));
     print "etcd member $old_host ($id) removed\n";
 }
 
@@ -1248,6 +1273,295 @@ my sub remove_node {
         '--destroy-unreferenced-disks', 1);
     remove_snippet_on($old->{pvehost}, "k8s-$old->{host}.yaml");
     print "removed $old->{host} (vmid $old->{vmid} on $old->{pvehost})\n";
+}
+
+# --- autoscaler (T2.4) -------------------------------------
+# One reconcile pass per call, driven by the API task or the
+# systemd timer on every PVE host. Leadership is a stamp in
+# the cluster config (host + time, pmxcfs-replicated): only
+# the host holding a fresh stamp acts, another takes over
+# when the stamp goes stale (pve-ha-manager pattern, at
+# config-file scale). Decisions come from PVE::K8s::Scaler
+# simulation; at most one action per pass.
+
+my sub iso_epoch {
+    my ($iso) = @_;
+
+    return 0 if ($iso // '') !~ /^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)Z$/;
+    return Time::Local::timegm($6, $5, $4, $3, $2 - 1, $1);
+}
+
+my sub kubectl_json {
+    my ($cp, $args) = @_;
+
+    my $out = kubectl_on($cp, "$args -o json");
+    my $start = index($out, '{');
+    $out = substr($out, $start) if $start > 0;
+    return JSON::PP->new->decode($out);
+}
+
+my sub claim_scaler_leadership {
+    my ($name) = @_;
+
+    my $me = local_node_name();
+    my $now = time();
+    my $claimed = 0;
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or die "no cluster '$name'\n";
+        my $state = eval {
+            JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
+        if (($state->{busy} // 0) && ($now - ($state->{at} // 0)) < 1800) {
+            print "scaler pass already running on "
+                . "$state->{leader}, standing down\n";
+            return;
+        }
+        $state->{leader} = $me;
+        $state->{at} = $now;
+        $state->{busy} = 1;
+        $scfg->{'scaler-state'} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($cfg);
+        $claimed = 1;
+    });
+    return $claimed;
+}
+
+my sub set_pool_size {
+    my ($name, $pool_name, $size) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or die "no cluster '$name'\n";
+        my $pools = PVE::K8s::Config::parse_pools(
+            $scfg->{pools}, $scfg->{workers} // 2);
+        for my $pool ($pools->@*) {
+            $pool->{size} = $size if $pool->{name} eq $pool_name;
+        }
+        $scfg->{pools} = JSON::PP->new->canonical->encode($pools);
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+my sub release_scaler_leadership {
+    my ($name, $acted) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $state = eval {
+            JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
+        $state->{busy} = 0;
+        $state->{at} = time();
+        $state->{'last-action'} = time() if $acted;
+        $scfg->{'scaler-state'} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+sub scale_cluster {
+    my ($name) = @_;
+
+    return 0 if !claim_scaler_leadership($name);
+    my $acted = eval { scale_reconcile($name) };
+    my $err = $@;
+    release_scaler_leadership($name, $acted // 0);
+    die $err if $err;
+    return $acted;
+}
+
+sub scale_reconcile {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "cluster '$name' is not provisioned yet\n"
+        if !$scfg->{nodes};
+    my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
+    $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
+    my $prefix = $1;
+
+    my $pools = PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2);
+    my %pool_by_name = map { $_->{name} => $_ } $pools->@*;
+
+    my $inventory = JSON::PP->new->decode($scfg->{nodes});
+    my @nodes;
+    for my $item ($inventory->@*) {
+        my ($idx) = $item->{name} =~ /(\d+)$/;
+        my $pool = $item->{pool} // 'default';
+        push @nodes, {
+            host => $item->{name},
+            role => $pool eq 'control-plane' ? 'cp' : 'worker',
+            pool => $pool, idx => $idx // 1, ip => $item->{ip},
+            vmid => $item->{vmid}, pvehost => $item->{pvehost},
+            labels => ($pool_by_name{$pool} // {})->{labels},
+            taints => ($pool_by_name{$pool} // {})->{taints},
+        };
+        $VM_HOST{$item->{vmid}} = $item->{pvehost};
+    }
+
+    my ($cp) = grep { $_->{role} eq 'cp' } @nodes;
+    for my $candidate (grep { $_->{role} eq 'cp' } @nodes) {
+        my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
+        if ($ok) { $cp = $candidate; last }
+    }
+    die "no control-plane node answers for '$name'\n" if !$cp;
+
+    my $knodes = kubectl_json($cp, 'get nodes')->{items} // [];
+    my $kpods = kubectl_json($cp, 'get pods -A')->{items} // [];
+    my %k8s_node = map { $_->{metadata}{name} => $_ } $knodes->@*;
+
+    # Repair first: a worker whose kubelet is gone AND whose
+    # VM does not answer is replaced; a merely unhappy
+    # kubelet on a live VM is reported, never destroyed.
+    for my $node (grep { $_->{role} eq 'worker' } @nodes) {
+        my $kn = $k8s_node{$node->{host}} or next;
+        my ($ready) = grep { ($_->{type} // '') eq 'Ready' }
+            ($kn->{status}{conditions} // [])->@*;
+        next if !$ready || ($ready->{status} // '') eq 'True';
+        my $since = time() - iso_epoch($ready->{lastTransitionTime});
+        next if $since < 300;
+        my $vm_alive = eval {
+            qm_on($node->{pvehost}, 'agent', $node->{vmid}, 'ping'); 1
+        } // 0;
+        if ($vm_alive) {
+            print "repair: $node->{host} NotReady for ${since}s but "
+                . "its VM answers; leaving it alone\n";
+            next;
+        }
+        print "repair: replacing dead node $node->{host} "
+            . "(NotReady ${since}s, VM silent)\n";
+        remove_node($cp, $node, \@nodes);
+        provision_cluster($name);
+        print "repair: $node->{host} replaced\n";
+        return 1;
+    }
+
+    # Build simulator state from the live cluster.
+    my %pods_by_node;
+    push $pods_by_node{$_->{spec}{nodeName}}->@*, $_
+        for grep { $_->{spec}{nodeName} } $kpods->@*;
+    my @sim_nodes;
+    for my $kn ($knodes->@*) {
+        my $alloc = $kn->{status}{allocatable} // {};
+        my $sim = PVE::K8s::Scaler::make_node(
+            $kn->{metadata}{name}, $kn->{metadata}{labels} // {},
+            $kn->{spec}{taints} // [],
+            PVE::K8s::Scaler::parse_cpu($alloc->{cpu}),
+            PVE::K8s::Scaler::parse_mem($alloc->{memory}));
+        for my $pod (($pods_by_node{$kn->{metadata}{name}} // [])->@*) {
+            next if ($pod->{status}{phase} // '') eq 'Succeeded'
+                || ($pod->{status}{phase} // '') eq 'Failed';
+            my $r = PVE::K8s::Scaler::pod_requests($pod);
+            $sim->{used_cpu} += $r->{cpu};
+            $sim->{used_mem} += $r->{mem};
+            push $sim->{pods}->@*, $pod;
+        }
+        push @sim_nodes, $sim;
+    }
+    my ($worker_sim) = grep {
+        ($_->{labels}{'pve-k8s.proxmox.com/pool'} // '') ne 'control-plane'
+    } @sim_nodes;
+    my $tmpl = $worker_sim
+        ? { cpu => $worker_sim->{cpu}, mem => $worker_sim->{mem} }
+        : { cpu => 2000, mem => 4 * 1024**3 };
+
+    my $now = time();
+    my @pending = grep {
+        $now - iso_epoch($_->{metadata}{creationTimestamp}) > 120
+    } PVE::K8s::Scaler::schedulable_pending($kpods)->@*;
+
+    # Scale out, one pool per pass.
+    if (@pending) {
+        for my $pool ($pools->@*) {
+            my $room = $pool->{max} - $pool->{size};
+            next if $room <= 0;
+            my $needed = PVE::K8s::Scaler::nodes_needed(
+                \@sim_nodes, \@pending, $pool, $room, $tmpl);
+            next if !$needed;
+            my $res = eval {
+                run(['pvesh', 'get', '/cluster/resources',
+                    '--type', 'node', '--output-format', 'json'],
+                    timeout => 60);
+            } // '';
+            my $hosts = eval { JSON::PP->new->decode($res) } // [];
+            my $free = grep {
+                ($_->{maxmem} // 0) - ($_->{mem} // 0) > 4 * 1024**3
+            } $hosts->@*;
+            if (!$free) {
+                print "scale: $name pool $pool->{name} needs "
+                    . "$needed node(s) but all Proxmox hosts are "
+                    . "saturated (no host with 4GiB free); not "
+                    . "scaling\n";
+                next;
+            }
+            print "scale: pool $pool->{name} $pool->{size} -> "
+                . ($pool->{size} + $needed)
+                . " for " . scalar(@pending) . " pending pod(s)\n";
+            set_pool_size($name, $pool->{name},
+                $pool->{size} + $needed);
+            provision_cluster($name);
+            return 1;
+        }
+        print "scale: pending pods exist but no pool can host "
+            . "them (labels/taints/size/max); not scaling\n";
+    }
+
+    # Scale in: only the highest-index node of a pool is a
+    # candidate, so canonical node naming stays consistent.
+    my $candidates = PVE::K8s::Scaler::scale_in_candidates(
+        \@sim_nodes, 0.3);
+    for my $host ($candidates->@*) {
+        my ($node) = grep { $_->{host} eq $host } @nodes;
+        next if !$node || $node->{role} ne 'worker';
+        my $pool = $pool_by_name{$node->{pool}} or next;
+        next if $pool->{size} <= $pool->{min};
+        my @pool_nodes = grep { $_->{pool} eq $node->{pool} } @nodes;
+        my $last = (sort { $b->{idx} <=> $a->{idx} } @pool_nodes)[0];
+        next if $last->{host} ne $host;
+        my $kn = $k8s_node{$host};
+        next if $now - iso_epoch($kn->{metadata}{creationTimestamp})
+            < 1800;
+        print "scale: removing idle node $host "
+            . "(pool $pool->{name} $pool->{size} -> "
+            . ($pool->{size} - 1) . ")\n";
+        # Drain via eviction (PDB-safe). kubectl drain
+        # retries PDB-refused evictions forever, so the
+        # drain is time-boxed in the guest; a blocked drain
+        # uncordons the node and ends the pass - the VM is
+        # never force-drained past a PDB.
+        kubectl_on($cp, "cordon $host");
+        my $drained = eval {
+            guest_exec($cp->{vmid},
+                'timeout 240 kubectl '
+                . '--kubeconfig /etc/kubernetes/admin.conf '
+                . "drain $host --ignore-daemonsets "
+                . '--delete-emptydir-data --timeout=200s');
+            1;
+        } // 0;
+        if (!$drained) {
+            eval { kubectl_on($cp, "uncordon $host") };
+            print "scale: drain of $host blocked (likely a "
+                . "PodDisruptionBudget); node uncordoned and "
+                . "left in place\n";
+            return 0;
+        }
+        eval { guest_exec($node->{vmid}, 'kubeadm reset -f') };
+        kubectl_on($cp, "delete node $host");
+        eval { qm_on($node->{pvehost}, 'stop', $node->{vmid}) };
+        qm_on($node->{pvehost}, 'destroy', $node->{vmid},
+            '--purge', '--destroy-unreferenced-disks', 1);
+        remove_snippet_on($node->{pvehost}, "k8s-$host.yaml");
+        set_pool_size($name, $pool->{name}, $pool->{size} - 1);
+        provision_cluster($name);
+        return 1;
+    }
+
+    print "scale: $name steady (no repair, no scaling)\n";
+    return 0;
 }
 
 sub roll_cluster {

@@ -277,6 +277,39 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'scale',
+    path => '{name}/scale',
+    method => 'POST',
+    protected => 1,
+    description => "Run one autoscaler reconcile pass (repair, "
+        . "scale out/in by pool min/max).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $name = $param->{name};
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8sscale', $name, $authuser, sub {
+            PVE::K8s::Provision::scale_cluster($name);
+        });
+    }});
+
+__PACKAGE__->register_method({
     name => 'get',
     path => '{name}',
     method => 'GET',

@@ -38,4 +38,19 @@ my $api = do { open my $fh, '<', 'PVE/API2/Cluster/K8s.pm' or die $!; local $/; 
 like($api, qr/fork_worker\('k8sroll'/, 'roll endpoint runs as a k8sroll task');
 like($api, qr/fork_worker\('k8supgrade'/, 'upgrade endpoint runs as a k8supgrade task');
 
+# etcd operations must not depend on crictl (absent from
+# current Kubernetes images); they run via ctr instead.
+my $prov = do {
+    open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
+    local $/;
+    <$fh>;
+};
+unlike($prov, qr/crictl (?:ps|exec)/, 'etcd operations do not shell out to crictl');
+like($prov, qr/ctr -n k8s\.io run --rm --net-host/,
+    'etcdctl runs as a one-off ctr container');
+like($prov, qr/assert_all_hosts_online\(\);\n\n    my \$cfg = PVE::K8s::Config->config\(\);\n    my \$scfg = \$cfg->\{ids\}->\{\$name\}\n        or die "cluster .\$name. does not exist\\n";\n\n    my \$version = \$scfg->\{'k8s-version'\}/,
+    'provision refuses to run while a PVE host is offline');
+like($api, qr/fork_worker\('k8sscale'/,
+    'scale endpoint runs as a k8sscale task');
+
 done_testing();
