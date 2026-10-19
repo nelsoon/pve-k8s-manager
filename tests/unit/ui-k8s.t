@@ -57,4 +57,31 @@ like($js, qr|'/nodes/' \+ node|,
 like($js, qr/create token|a\.download = name \+ '\.kubeconfig'/,
     'UI offers the kubeconfig as a download');
 
+
+# T2.6 force-retire and T3.1 backup/restore endpoints
+like($api, qr/fork_worker\('k8snodeforceretire'/,
+    'force-retire endpoint runs as a k8snodeforceretire task');
+like($api, qr/fork_worker\('k8sbackup'/,
+    'backup endpoint runs as a k8sbackup task');
+like($api, qr/fork_worker\('k8srestore'/,
+    'restore endpoint runs as a k8srestore task');
+like($js, qr|'/force-retire'|,
+    'UI node actions include force-retire');
+like($js, qr|'/backup'|,
+    'UI has an etcd backup action');
+like($js, qr|'/restore'|,
+    'UI has an etcd restore action');
+my $provsrc = do {
+    open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
+    local $/;
+    <$fh>;
+};
+like($provsrc, qr/node \$host is Ready; use drain\/replace instead/,
+    'force-retire refuses a healthy node');
+like($provsrc, qr/etcdutl snapshot restore/,
+    'restore uses etcdutl snapshot restore per member');
+
+like($provsrc, qr/if \(!\$destroyed\) \{\n            my \$retired/,
+    'ghost marker only kept when the destroy failed');
+
 done_testing();

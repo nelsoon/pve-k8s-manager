@@ -860,6 +860,8 @@ my sub assert_cluster_hosts_online {
         . "; placement will skip them\n";
 }
 
+sub check_retired_ghosts;
+
 sub provision_cluster {
     my ($name) = @_;
 
@@ -868,6 +870,7 @@ sub provision_cluster {
         or die "cluster '$name' does not exist\n";
 
     assert_cluster_hosts_online($name, $scfg);
+    check_retired_ghosts($name, $scfg);
 
     my $version = $scfg->{'k8s-version'};
     my $cp_count = $scfg->{cp} // 3;
@@ -2021,6 +2024,369 @@ sub replace_node {
     provision_cluster($name);
     print "node $host replaced\n";
     return 1;
+}
+
+# Force-retire a dead worker (T2.6): for a node whose VM or
+# host is gone, drain is impossible. The administrator
+# confirms the VM is powered off/lost (the API requires
+# force=1); we delete the stale Node object, retire the
+# inventory entry, and record a ghost marker so a later
+# reappearing VM (same name+VMID) blocks provisioning
+# instead of silently rejoining. Optionally provisions the
+# replacement (fresh identity comes from the scaler or the
+# provisioner's canonical naming once the ghost is gone).
+sub force_retire_node {
+    my ($name, $host, %opts) = @_;
+
+    die "force-retire requires explicit confirmation "
+        . "(force=1): the VM must be powered off or lost\n"
+        if !$opts{force};
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $node = find_node($nodes, $host);
+    die "force-retire is for worker nodes; control-plane "
+        . "membership goes through roll/upgrade\n"
+        if $node->{role} eq 'cp';
+    my $cp = ops_cp($nodes);
+
+    my $knodes = kubectl_json($cp, 'get nodes')->{items} // [];
+    my ($kn) = grep { $_->{metadata}{name} eq $host } $knodes->@*;
+    if ($kn) {
+        my ($ready) = grep { ($_->{type} // '') eq 'Ready' }
+            ($kn->{status}{conditions} // [])->@*;
+        die "node $host is Ready; use drain/replace instead\n"
+            if $ready && ($ready->{status} // '') eq 'True';
+    }
+
+    # If the VM is still reachable, destroying it here is
+    # the fencing act; if its host is gone this fails and
+    # the ghost marker below covers its return. No marker
+    # when the destroy succeeded: VMIDs get recycled, and a
+    # marker would match the legitimate replacement.
+    eval { qm_on($node->{pvehost}, 'stop', $node->{vmid}) };
+    my $destroyed = eval {
+        qm_on($node->{pvehost}, 'destroy', $node->{vmid},
+            '--purge', '--destroy-unreferenced-disks', 1);
+        1;
+    } // 0;
+    eval { kubectl_on($cp, "delete node $host") };
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg2 = PVE::K8s::Config->config();
+        my $s2 = $cfg2->{ids}->{$name};
+        my $inv = JSON::PP->new->decode($s2->{nodes});
+        $s2->{nodes} = JSON::PP->new->canonical->encode(
+            [grep { $_->{name} ne $host } $inv->@*]);
+        if (!$destroyed) {
+            my $retired = eval {
+                JSON::PP->new->decode($s2->{'retired-nodes'} // '[]')
+            } // [];
+            push $retired->@*, { name => $host,
+                vmid => $node->{vmid},
+                pvehost => $node->{pvehost}, at => time() };
+            $s2->{'retired-nodes'} =
+                JSON::PP->new->canonical->encode($retired);
+        }
+        PVE::K8s::Config::store_config($cfg2);
+    });
+    print "force-retired dead node $host (ghost marker kept "
+        . "for vmid $node->{vmid} on $node->{pvehost})\n";
+
+    if ($opts{replace}) {
+        provision_cluster($name);
+        print "replacement for $host provisioned\n";
+    }
+    return 1;
+}
+
+# A force-retired VM that reappears (its host came back)
+# must never silently rejoin: stop provisioning until an
+# operator wipes it.
+sub check_retired_ghosts {
+    my ($name, $scfg) = @_;
+
+    my $retired = eval {
+        JSON::PP->new->decode($scfg->{'retired-nodes'} // '[]')
+    } // [];
+    return if !$retired->@*;
+    my $out = run(['pvesh', 'get', '/cluster/resources',
+        '--type', 'vm', '--output-format', 'json'], timeout => 60);
+    my $vms = JSON::PP->new->decode($out);
+    for my $ghost ($retired->@*) {
+        my ($vm) = grep {
+            ($_->{name} // '') eq $ghost->{name}
+            && int($_->{vmid} // 0) == int($ghost->{vmid})
+        } $vms->@*;
+        die "force-retired node $ghost->{name} (vmid "
+            . "$ghost->{vmid} on $ghost->{pvehost}) has "
+            . "reappeared; wipe that VM before provisioning "
+            . "(it still holds the old node identity)\n" if $vm;
+    }
+}
+
+# Chunked file transfer through the guest agent (no SSH in
+# the node images). Base64 chunks keep each exec bounded.
+my sub guest_fetch_file {
+    my ($vmid, $guest_path, $host_path) = @_;
+
+    my $size = guest_exec($vmid, "stat -c%s $guest_path");
+    $size =~ s/\D//g;
+    die "cannot stat $guest_path in guest\n" if !$size;
+    my $chunk = 512 * 1024;
+    my $parts = int(($size + $chunk - 1) / $chunk);
+    open my $fh, '>', $host_path or die "open $host_path: $!\n";
+    binmode $fh;
+    for my $i (0 .. $parts - 1) {
+        my $b64 = guest_exec($vmid,
+            "dd if=$guest_path bs=$chunk skip=$i count=1 "
+            . 'status=none | base64 -w0');
+        $b64 =~ s/\s+//g;
+        print $fh MIME::Base64::decode_base64($b64);
+    }
+    close $fh or die "close $host_path: $!\n";
+    return $size;
+}
+
+my sub guest_push_file {
+    my ($vmid, $host_path, $guest_path) = @_;
+
+    open my $fh, '<', $host_path or die "open $host_path: $!\n";
+    binmode $fh;
+    local $/;
+    my $data = <$fh>;
+    close $fh;
+    my $b64 = MIME::Base64::encode_base64($data, '');
+    guest_exec($vmid, "rm -f $guest_path.b64 $guest_path");
+    # 48k chunks: a single argv string is capped near
+    # 128 KiB by the kernel, and the guest agent adds its
+    # own overhead on top.
+    for (my $off = 0; $off < length $b64; $off += 48_000) {
+        my $part = substr($b64, $off, 48_000);
+        guest_exec($vmid, "printf %s '$part' >> $guest_path.b64");
+    }
+    guest_exec($vmid, "base64 -d $guest_path.b64 > $guest_path "
+        . "&& rm -f $guest_path.b64");
+    return length $data;
+}
+
+my sub backup_dir_for {
+    my ($scfg, $name) = @_;
+
+    my $dir = $scfg->{'backup-dir'}
+        or die "cluster '$name' has no backup-dir configured "
+        . "(set one at create time, e.g. a PBS-mounted or "
+        . "shared directory)\n";
+    die "backup-dir '$dir' does not exist on this host\n"
+        if !-d $dir;
+    return $dir;
+}
+
+# Etcd backup (T3.1): snapshot on a control-plane node,
+# fetched off-cluster to backup-dir with a manifest sidecar,
+# retention-pruned. Leader-stamped like the scaler so the
+# timer on every host produces one backup, not N.
+sub backup_cluster {
+    my ($name) = @_;
+
+    return 0 if !claim_scaler_leadership($name);
+    my $done = eval {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name}
+            or die "cluster '$name' does not exist\n";
+        my $dir = backup_dir_for($scfg, $name);
+        my $nodes = load_nodes($name, $scfg);
+        my $cp = ops_cp($nodes);
+        my $guest_file = etcd_snapshot($cp);
+        my $stamp = time();
+        my $file = "$dir/$name-etcd-$stamp.db";
+        my $size = guest_fetch_file($cp->{vmid}, $guest_file, $file);
+        my $sha = do {
+            require Digest::SHA;
+            my $d = Digest::SHA->new(256);
+            $d->addfile($file);
+            $d->hexdigest;
+        };
+        my $manifest = JSON::PP->new->canonical->encode({
+            cluster => $name, file => "$name-etcd-$stamp.db",
+            size => $size + 0, sha256 => $sha, at => $stamp,
+            'k8s-version' => $scfg->{'k8s-version'},
+            from => $cp->{host},
+        });
+        open my $mf, '>', "$file.json" or die "$file.json: $!\n";
+        print $mf "$manifest\n";
+        close $mf;
+        print "etcd backup for '$name': $file "
+            . "($size bytes, sha256 $sha)\n";
+
+        my $keep = $scfg->{'backup-retention'} // 7;
+        my @backups = sort grep { -f }
+            glob("$dir/$name-etcd-*.db");
+        while (@backups > $keep) {
+            my $old = shift @backups;
+            unlink $old, "$old.json";
+            print "pruned old backup $old\n";
+        }
+        1;
+    };
+    my $err = $@;
+    release_scaler_leadership($name, $done // 0);
+    die $err if $err;
+    return $done;
+}
+
+sub list_backups {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    return [] if !$scfg->{'backup-dir'} || !-d $scfg->{'backup-dir'};
+    my $dir = $scfg->{'backup-dir'};
+    my @out;
+    for my $file (sort glob("$dir/$name-etcd-*.db")) {
+        my @st = stat $file;
+        next if !@st;
+        my ($base) = $file =~ m{/([^/]+)$};
+        push @out, { file => $base, size => $st[7],
+            mtime => $st[9] };
+    }
+    return \@out;
+}
+
+# Etcd restore (T3.1): roll every control-plane member back
+# to one snapshot. Certificates are untouched; only the
+# etcd data directories are replaced (old ones kept as
+# /var/lib/etcd.pre-restore-<ts>). Requires force=1 and a
+# healthy VM set - this is a data rollback, not a repair.
+sub restore_cluster {
+    my ($name, $file, %opts) = @_;
+
+    die "restore requires explicit confirmation (force=1)\n"
+        if !$opts{force};
+    die "invalid backup file name '$file'\n"
+        if ($file // '') !~ /^[\w.-]+$/;
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $dir = backup_dir_for($scfg, $name);
+    my $path = "$dir/$file";
+    die "backup '$file' not found in $dir\n" if !-f $path;
+
+    my $nodes = load_nodes($name, $scfg);
+    my @cps = grep { $_->{role} eq 'cp' } $nodes->@*;
+    my $initial = join ',', map {
+        "$_->{host}=https://$_->{ip}:2380" } @cps;
+    my $token = 'pve-k8s-restore-' . time();
+
+    # Fast path: when this host owns the cluster gateway
+    # address, serve the backup over HTTP and let the
+    # guests curl it; otherwise fall back to chunked push.
+    my $gateway = $scfg->{gateway} // '';
+    my $serve_pid;
+    if ($gateway && host_run_on(undef, 'ip', '-o', 'addr', 'show')
+        =~ /inet \Q$gateway\E\//) {
+        $serve_pid = fork();
+        if (!defined $serve_pid) {
+            $serve_pid = undef;
+        } elsif ($serve_pid == 0) {
+            exec('python3', '-m', 'http.server', '18099',
+                '--bind', $gateway, '--directory', $dir);
+            exit 1;
+        } else {
+            sleep 2;
+        }
+    }
+    for my $cp (@cps) {
+        if ($serve_pid) {
+            my ($base) = $path =~ m{/([^/]+)$};
+            guest_exec($cp->{vmid},
+                "curl -fsS http://$gateway:18099/$base "
+                . '-o /var/lib/restore.db');
+        } else {
+            guest_push_file($cp->{vmid}, $path,
+                '/var/lib/restore.db');
+        }
+    }
+    if ($serve_pid) {
+        kill 'TERM', $serve_pid;
+        waitpid $serve_pid, 0;
+    }
+    for my $cp (@cps) {
+        # Stopping kubelet does NOT stop static pods, so:
+        # manifests away first (running kubelet kills the
+        # control plane), wait for etcd to actually close,
+        # only then stop kubelet and swap the data dir.
+        guest_exec($cp->{vmid},
+            'mkdir -p /root/manifests-restore; '
+            . 'mv /etc/kubernetes/manifests/*.yaml '
+            . '/root/manifests-restore/; '
+            . 'for i in $(seq 1 40); do '
+            . 'ss -tln | grep -q :2379 || break; sleep 3; done; '
+            . 'systemctl stop kubelet; '
+            . 'mv /var/lib/etcd /var/lib/etcd.pre-restore-'
+            . time() . ' 2>/dev/null || true; '
+            . 'mkdir -p /var/lib/etcd');
+    }
+    for my $cp (@cps) {
+        my $cmd = 'IMG=$(ctr -n k8s.io containers list '
+            . "| awk '\$2 ~ /etcd/ {print \$2; exit}'); "
+            . 'ctr -n k8s.io run --rm '
+            . '--mount type=bind,src=/var/lib,'
+            . 'dst=/varlib,options=rbind '
+            . '"$IMG" etcdutl-restore etcdutl snapshot restore '
+            . '/varlib/restore.db '
+            . "--name $cp->{host} "
+            . "--initial-cluster $initial "
+            . "--initial-cluster-token $token "
+            . "--initial-advertise-peer-urls "
+            . "https://$cp->{ip}:2380 "
+            . '--data-dir /varlib/etcd';
+        guest_exec($cp->{vmid}, $cmd);
+    }
+    for my $cp (@cps) {
+        guest_exec($cp->{vmid},
+            'mv /root/manifests-restore/*.yaml '
+            . '/etc/kubernetes/manifests/; '
+            . 'systemctl start kubelet');
+    }
+    my $cp1 = $cps[0];
+    my $api_back = 0;
+    for (1 .. 40) {
+        my $ok = eval {
+            my $out = kubectl_on($cp1, 'get nodes --no-headers');
+            ($out =~ tr/\n/\n/) >= 1;
+        } // 0;
+        if ($ok) { $api_back = 1; last }
+        sleep 15;
+    }
+    die "control plane did not come back after restore\n"
+        if !$api_back;
+    # Kubelets that lived through the rollback wedge in
+    # two ways: CP kubelets started while their local
+    # apiserver was down never retry CSINode
+    # initialization, and worker kubelets loop on status
+    # for pods the rollback deleted. Restart every kubelet
+    # once the API is healthy, then wait for Ready.
+    for my $node ($nodes->@*) {
+        eval { guest_exec($node->{vmid},
+            'systemctl restart kubelet') };
+    }
+    for (1 .. 40) {
+        my $out = eval {
+            kubectl_on($cp1, 'get nodes --no-headers') } // '';
+        my $ready = () = $out =~ /^\S+\s+Ready\b/gm;
+        if ($ready >= scalar @cps) {
+            print "etcd restored from $file on "
+                . scalar(@cps) . " control-plane node(s), "
+                . "all Ready\n";
+            return 1;
+        }
+        sleep 15;
+    }
+    die "control-plane nodes did not become Ready "
+        . "after restore\n";
 }
 
 # Recent Kubernetes events, newest last, as flat rows for

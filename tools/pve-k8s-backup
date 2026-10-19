@@ -1,0 +1,25 @@
+#!/usr/bin/perl
+# Copyright (C) 2026 pve-k8s contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Etcd backup driver (T3.1): one backup pass per cluster
+# that has a backup-dir configured. Driven by
+# pve-k8s-backup.timer (daily) on every PVE host; the
+# leader stamp in pmxcfs keeps it to one backup per
+# cluster, not one per host.
+use strict;
+use warnings;
+
+use PVE::K8s::Config;
+use PVE::K8s::Provision;
+
+my $cfg = PVE::K8s::Config->config();
+for my $name (sort keys $cfg->{ids}->%*) {
+    next if !$cfg->{ids}->{$name}->{'backup-dir'};
+    my $done = eval { PVE::K8s::Provision::backup_cluster($name) };
+    if (my $err = $@) {
+        $err =~ s/\s+$//;
+        print "cluster $name: backup failed: $err\n";
+    } elsif ($done) {
+        print "cluster $name: backup done\n";
+    }
+}

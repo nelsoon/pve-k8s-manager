@@ -35,7 +35,9 @@ deb:
 	@cp -r PVE $(STAGE)/usr/share/perl5/
 	@cp www/manager6/*.js $(STAGE)/usr/share/pve-manager/js/
 	@install -m 0755 tools/pve-k8s-scaler $(STAGE)/usr/sbin/pve-k8s-scaler
+	@install -m 0755 tools/pve-k8s-backup $(STAGE)/usr/sbin/pve-k8s-backup
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
+		systemd/pve-k8s-backup.service systemd/pve-k8s-backup.timer \
 		$(STAGE)/lib/systemd/system/
 	@printf 'Package: $(PACKAGE)\nVersion: $(VERSION)\nArchitecture: all\nMaintainer: pve-k8s contributors\nDescription: Kubernetes cluster management for Proxmox VE\n Provisions and manages kubeadm Kubernetes clusters on Proxmox\n VMs from the Proxmox web UI, using Proxmox SDN and storage.\n' > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEB) >/dev/null

@@ -127,6 +127,24 @@ my $defaultData = {
             description => "Scaler leader/action state JSON (T2.4).",
             optional => 1,
         },
+        'retired-nodes' => {
+            type => 'string',
+            description => "Force-retired node ghosts JSON (T2.6).",
+            optional => 1,
+        },
+        'backup-dir' => {
+            type => 'string',
+            description => "Host directory for etcd backups "
+                . "(shared/PBS-mounted path recommended).",
+            optional => 1,
+        },
+        'backup-retention' => {
+            type => 'integer',
+            description => "Etcd backups to keep per cluster.",
+            minimum => 1,
+            maximum => 100,
+            optional => 1,
+        },
         state => {
             type => 'string',
             description => "Lifecycle state recorded by pve-k8sd.",
@@ -163,6 +181,9 @@ sub options {
         'template-rev' => { optional => 1 },
         'maintenance-window' => { optional => 1 },
         'scaler-state' => { optional => 1 },
+        'retired-nodes' => { optional => 1 },
+        'backup-dir' => { optional => 1 },
+        'backup-retention' => { optional => 1 },
         storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },

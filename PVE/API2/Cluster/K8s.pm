@@ -115,6 +115,19 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Rolling window HH:MM-HH:MM (local time).",
             },
+            'backup-dir' => {
+                type => 'string',
+                optional => 1,
+                description => "Host directory for etcd backups "
+                    . "(shared/PBS-mounted path recommended).",
+            },
+            'backup-retention' => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 100,
+                optional => 1,
+                description => "Etcd backups to keep.",
+            },
             description => {
                 type => 'string',
                 maxLength => 4096,
@@ -150,7 +163,8 @@ __PACKAGE__->register_method({
                 created => time(),
                 (map { $param->{$_} ? ($_ => $param->{$_}) : () }
                     qw(node-subnet gateway lb-range pools storage
-                        maintenance-window description)),
+                        maintenance-window backup-dir
+                        backup-retention description)),
             };
 
             PVE::K8s::Config::store_config($cfg);
@@ -467,6 +481,164 @@ __PACKAGE__->register_method({
             $param->{name}, $authuser, sub {
                 PVE::K8s::Provision::replace_node(
                     $param->{name}, $param->{node});
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'node-force-retire',
+    path => '{name}/nodes/{node}/force-retire',
+    method => 'POST',
+    protected => 1,
+    description => "Force-retire a dead worker node (the VM "
+        . "must be powered off or lost; requires force=1). "
+        . "Optionally provisions its replacement.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            node => {
+                type => 'string',
+                description => "The Kubernetes node name.",
+            },
+            force => {
+                type => 'boolean',
+                optional => 1,
+                description => "Confirm the VM is powered off "
+                    . "or permanently lost.",
+            },
+            replace => {
+                type => 'boolean',
+                optional => 1,
+                description => "Provision a replacement node "
+                    . "after retiring the dead one.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8snodeforceretire',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::force_retire_node(
+                    $param->{name}, $param->{node},
+                    force => $param->{force} // 0,
+                    replace => $param->{replace} // 0);
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'backup',
+    path => '{name}/backup',
+    method => 'POST',
+    protected => 1,
+    description => "Take an etcd backup to the cluster's "
+        . "backup-dir (snapshot + off-cluster copy + manifest).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8sbackup',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::backup_cluster($param->{name});
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'backups',
+    path => '{name}/backups',
+    method => 'GET',
+    description => "List etcd backups in the cluster's backup-dir.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::list_backups($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'restore',
+    path => '{name}/restore',
+    method => 'POST',
+    protected => 1,
+    description => "Restore etcd from a backup file on every "
+        . "control-plane node (data rollback; requires force=1).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            backup => {
+                type => 'string',
+                description => "Backup file name (see backups list).",
+            },
+            force => {
+                type => 'boolean',
+                optional => 1,
+                description => "Confirm the etcd data rollback.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8srestore',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::restore_cluster(
+                    $param->{name}, $param->{backup},
+                    force => $param->{force} // 0);
             });
     }});
 

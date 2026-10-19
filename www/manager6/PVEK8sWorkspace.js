@@ -429,6 +429,46 @@ Ext.define('PVE.dc.K8sView', {
                             text: gettext('Replace'),
                             handler: function() { act('Replace'); },
                         },
+                        {
+                            text: gettext('Force Retire'),
+                            handler: function() {
+                                let sel = grid.getSelection();
+                                if (!sel || sel.length < 1) {
+                                    return;
+                                }
+                                let node = sel[0].data.name;
+                                Ext.Msg.confirm(gettext('Confirm'),
+                                    Ext.String.format(gettext(
+                                        'Force-retire DEAD node {0}? Only ' +
+                                        'if its VM is powered off or lost. ' +
+                                        'A replacement will be provisioned.'),
+                                        node),
+                                    function(answer) {
+                                        if (answer !== 'yes') {
+                                            return;
+                                        }
+                                        Proxmox.Utils.API2Request({
+                                            url: '/cluster/k8s/' + name
+                                                + '/nodes/' + node
+                                                + '/force-retire',
+                                            method: 'POST',
+                                            params: { force: 1, replace: 1 },
+                                            failure: function(response) {
+                                                Ext.Msg.alert(gettext('Error'),
+                                                    Proxmox.Utils.extractRequestError(response, true));
+                                            },
+                                            success: function(response) {
+                                                let upid = response.result.data;
+                                                if (upid) {
+                                                    Ext.create('Proxmox.window.TaskViewer', {
+                                                        upid: upid,
+                                                    }).show();
+                                                }
+                                            },
+                                        });
+                                    });
+                            },
+                        },
                     ],
                 }).show();
                 Proxmox.Utils.API2Request({
@@ -529,6 +569,74 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        let backupBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Backup'),
+            iconCls: 'fa fa-fw fa-save',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Proxmox.Utils.API2Request({
+                    url: '/cluster/k8s/' + name + '/backup',
+                    method: 'POST',
+                    failure: function(response) {
+                        Ext.Msg.alert(gettext('Error'),
+                            Proxmox.Utils.extractRequestError(response, true));
+                    },
+                    success: function(response) {
+                        let upid = response.result.data;
+                        if (upid) {
+                            Ext.create('Proxmox.window.TaskViewer', {
+                                upid: upid,
+                            }).show();
+                        }
+                    },
+                });
+            },
+        });
+
+        let restoreBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Restore'),
+            iconCls: 'fa fa-fw fa-undo',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Ext.Msg.prompt(
+                    gettext('Restore etcd'),
+                    gettext('Backup file name (rolls back ALL '
+                        + 'cluster data to that point):'),
+                    function(answer, value) {
+                        if (answer !== 'ok' || !value) {
+                            return;
+                        }
+                        Proxmox.Utils.API2Request({
+                            url: '/cluster/k8s/' + name + '/restore',
+                            method: 'POST',
+                            params: { backup: value, force: 1 },
+                            failure: function(response) {
+                                Ext.Msg.alert(gettext('Error'),
+                                    Proxmox.Utils.extractRequestError(response, true));
+                            },
+                            success: function(response) {
+                                let upid = response.result.data;
+                                if (upid) {
+                                    Ext.create('Proxmox.window.TaskViewer', {
+                                        upid: upid,
+                                    }).show();
+                                }
+                            },
+                        });
+                    });
+            },
+        });
+
         Ext.apply(me, {
             store: store,
             columns: [
@@ -601,6 +709,8 @@ Ext.define('PVE.dc.K8sView', {
                 nodesBtn,
                 kubeconfigBtn,
                 eventsBtn,
+                backupBtn,
+                restoreBtn,
                 removeBtn,
                 '-',
                 {
@@ -621,6 +731,8 @@ Ext.define('PVE.dc.K8sView', {
                     nodesBtn.setDisabled(disabled);
                     kubeconfigBtn.setDisabled(disabled);
                     eventsBtn.setDisabled(disabled);
+                    backupBtn.setDisabled(disabled);
+                    restoreBtn.setDisabled(disabled);
                     removeBtn.setDisabled(disabled);
                 },
                 afterrender: function() {

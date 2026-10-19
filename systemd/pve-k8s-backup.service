@@ -1,0 +1,7 @@
+[Unit]
+Description=pve-k8s daily etcd backup
+After=pvedaemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-k8s-backup
