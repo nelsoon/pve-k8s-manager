@@ -48,8 +48,12 @@ my $prov = do {
 unlike($prov, qr/crictl (?:ps|exec)/, 'etcd operations do not shell out to crictl');
 like($prov, qr/ctr -n k8s\.io run --rm --net-host/,
     'etcdctl runs as a one-off ctr container');
-like($prov, qr/assert_all_hosts_online\(\);\n\n    my \$cfg = PVE::K8s::Config->config\(\);\n    my \$scfg = \$cfg->\{ids\}->\{\$name\}\n        or die "cluster .\$name. does not exist\\n";\n\n    my \$version = \$scfg->\{'k8s-version'\}/,
-    'provision refuses to run while a PVE host is offline');
+like($prov, qr/assert_cluster_hosts_online\(\$name, \$scfg\)/,
+    'provision checks the cluster hosts before running');
+like($prov, qr/they host nodes of cluster/,
+    'only hosts carrying its nodes block provisioning');
+like($prov, qr/placement will skip them/,
+    'other offline hosts are skipped, not fatal');
 like($api, qr/fork_worker\('k8sscale'/,
     'scale endpoint runs as a k8sscale task');
 

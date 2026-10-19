@@ -814,30 +814,60 @@ sub create_node_vm {
 }
 
 # Provisioning (and anything built on it, like the scaler)
-# must never run while a PVE host is offline: that host's
-# VMs vanish from the cluster-wide inventory, and the
-# provisioner would recreate live nodes on other hosts -
-# duplicate names and IPs (seen in the lab, 2026-10-18).
-my sub assert_all_hosts_online {
+# must never run while a host carrying THIS cluster's nodes
+# is offline: that host's VMs vanish from the cluster-wide
+# inventory, and the provisioner would recreate live nodes
+# on other hosts - duplicate names and IPs (seen in the
+# lab, 2026-10-18). Offline hosts with no nodes of this
+# cluster are fine; placement only picks online hosts, so
+# a 19-of-20-hosts cluster still provisions normally and
+# the down host simply receives nothing.
+my sub assert_cluster_hosts_online {
+    my ($name, $scfg) = @_;
+
     my $out = run(['pvesh', 'get', '/cluster/status',
         '--output-format', 'json'], timeout => 60);
     my $status = JSON::PP->new->decode($out);
-    my @offline = map { $_->{name} }
+    my %offline = map { $_->{name} => 1 }
         grep { ($_->{type} // '') eq 'node' && !($_->{online} // 0) }
         $status->@*;
-    die "Proxmox host(s) offline: " . join(', ', @offline)
-        . "; refusing to provision (their VMs would look "
-        . "missing and be recreated elsewhere)\n" if @offline;
+    return if !%offline;
+
+    # Hosts already carrying this cluster's nodes are the
+    # only hard stop; other offline hosts are simply skipped
+    # by placement (it already chooses among online hosts).
+    my %cluster_hosts;
+    if ($scfg->{nodes}) {
+        my $inventory = eval {
+            JSON::PP->new->decode($scfg->{nodes}) } // [];
+        $cluster_hosts{$_->{pvehost}} = 1 for $inventory->@*;
+    } else {
+        my $vms = cluster_vms();
+        for my $vmname (keys $vms->%*) {
+            $cluster_hosts{$vms->{$vmname}{node}} = 1
+                if $vmname =~ /^\Q$name\E-/;
+        }
+    }
+    my @blocking = grep { $cluster_hosts{$_} } sort keys %offline;
+    die "Proxmox host(s) offline: " . join(', ', @blocking)
+        . "; they host nodes of cluster '$name', whose VMs "
+        . "would look missing and be recreated elsewhere. "
+        . "Refusing to provision until they are back\n"
+        if @blocking;
+    my @skipped = sort keys %offline;
+    print "note: Proxmox host(s) offline: "
+        . join(', ', @skipped)
+        . "; placement will skip them\n";
 }
 
 sub provision_cluster {
     my ($name) = @_;
 
-    assert_all_hosts_online();
-
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
+
+    assert_cluster_hosts_online($name, $scfg);
 
     my $version = $scfg->{'k8s-version'};
     my $cp_count = $scfg->{cp} // 3;
