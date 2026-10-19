@@ -332,7 +332,7 @@ Ext.define('PVE.dc.K8sView', {
                 let name = selection[0].data.name;
                 Ext.Msg.prompt(
                     gettext('Upgrade Kubernetes'),
-                    gettext('Target version (one minor up, e.g. 1.32):'),
+                    gettext('Target version (one minor up, e.g. 1.36):'),
                     function(answer, value) {
                         if (answer !== 'ok' || !value) {
                             return;
@@ -356,6 +356,176 @@ Ext.define('PVE.dc.K8sView', {
                             },
                         });
                     });
+            },
+        });
+
+        let nodesBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Nodes'),
+            iconCls: 'fa fa-fw fa-server',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                let nodeStore = Ext.create('Ext.data.Store', {
+                    fields: ['name', 'pool', 'pvehost', 'vmid', 'ip', 'rev'],
+                });
+                let grid = Ext.create('Ext.grid.Panel', {
+                    store: nodeStore,
+                    columns: [
+                        { text: gettext('Node'), dataIndex: 'name', flex: 1 },
+                        { text: gettext('Pool'), dataIndex: 'pool', flex: 1 },
+                        { text: gettext('PVE Host'), dataIndex: 'pvehost', flex: 1 },
+                        { text: 'VMID', dataIndex: 'vmid', width: 70 },
+                        { text: 'IP', dataIndex: 'ip', flex: 1 },
+                        { text: gettext('Image Rev'), dataIndex: 'rev', width: 80 },
+                    ],
+                });
+                let act = function(action) {
+                    let sel = grid.getSelection();
+                    if (!sel || sel.length < 1) {
+                        return;
+                    }
+                    let node = sel[0].data.name;
+                    Ext.Msg.confirm(gettext('Confirm'),
+                        Ext.String.format(gettext('{0} node {1}?'), action, node),
+                        function(answer) {
+                            if (answer !== 'yes') {
+                                return;
+                            }
+                            Proxmox.Utils.API2Request({
+                                url: '/cluster/k8s/' + name + '/nodes/' + node
+                                    + '/' + action.toLowerCase(),
+                                method: 'POST',
+                                failure: function(response) {
+                                    Ext.Msg.alert(gettext('Error'),
+                                        Proxmox.Utils.extractRequestError(response, true));
+                                },
+                                success: function(response) {
+                                    let upid = response.result.data;
+                                    if (upid) {
+                                        Ext.create('Proxmox.window.TaskViewer', {
+                                            upid: upid,
+                                        }).show();
+                                    }
+                                },
+                            });
+                        });
+                };
+                Ext.create('Ext.window.Window', {
+                    title: Ext.String.format(gettext('Nodes of {0}'), name),
+                    width: 640,
+                    height: 360,
+                    layout: 'fit',
+                    items: [grid],
+                    buttons: [
+                        {
+                            text: gettext('Drain'),
+                            handler: function() { act('Drain'); },
+                        },
+                        {
+                            text: gettext('Replace'),
+                            handler: function() { act('Replace'); },
+                        },
+                    ],
+                }).show();
+                Proxmox.Utils.API2Request({
+                    url: '/cluster/k8s/' + name,
+                    method: 'GET',
+                    success: function(response) {
+                        let nodes = Ext.decode(response.result.data.nodes || '[]');
+                        nodeStore.loadData(nodes);
+                    },
+                });
+            },
+        });
+
+        let kubeconfigBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Kubeconfig'),
+            iconCls: 'fa fa-fw fa-key',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Proxmox.Utils.API2Request({
+                    url: '/cluster/k8s/' + name + '/kubeconfig',
+                    method: 'GET',
+                    failure: function(response) {
+                        Ext.Msg.alert(gettext('Error'),
+                            Proxmox.Utils.extractRequestError(response, true));
+                    },
+                    success: function(response) {
+                        let data = response.result.data;
+                        let win = Ext.create('Ext.window.Window', {
+                            title: Ext.String.format(
+                                gettext('Kubeconfig for {0}'), name),
+                            width: 680,
+                            height: 420,
+                            layout: 'fit',
+                            items: [{
+                                xtype: 'textarea',
+                                value: data.kubeconfig,
+                                readOnly: true,
+                            }],
+                            buttons: [{
+                                text: gettext('Download'),
+                                handler: function() {
+                                    let blob = new Blob([data.kubeconfig],
+                                        { type: 'text/yaml' });
+                                    let a = document.createElement('a');
+                                    a.href = URL.createObjectURL(blob);
+                                    a.download = name + '.kubeconfig';
+                                    a.click();
+                                    URL.revokeObjectURL(a.href);
+                                },
+                            }],
+                        });
+                        win.setTitle(win.title + ' (' + data.expires + ')');
+                        win.show();
+                    },
+                });
+            },
+        });
+
+        let eventsBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Events'),
+            iconCls: 'fa fa-fw fa-list',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Ext.create('Ext.window.Window', {
+                    title: Ext.String.format(gettext('Events of {0}'), name),
+                    width: 760,
+                    height: 420,
+                    layout: 'fit',
+                    items: [{
+                        xtype: 'grid',
+                        store: Ext.create('Ext.data.Store', {
+                            fields: ['time', 'type', 'reason', 'object', 'message'],
+                            proxy: {
+                                type: 'proxmox',
+                                url: '/api2/json/cluster/k8s/' + name + '/events',
+                            },
+                            autoLoad: true,
+                        }),
+                        columns: [
+                            { text: gettext('Time'), dataIndex: 'time', width: 170 },
+                            { text: gettext('Type'), dataIndex: 'type', width: 80 },
+                            { text: gettext('Reason'), dataIndex: 'reason', width: 130 },
+                            { text: gettext('Object'), dataIndex: 'object', width: 160 },
+                            { text: gettext('Message'), dataIndex: 'message', flex: 1 },
+                        ],
+                    }],
+                }).show();
             },
         });
 
@@ -428,6 +598,9 @@ Ext.define('PVE.dc.K8sView', {
                 rollBtn,
                 scaleBtn,
                 upgradeBtn,
+                nodesBtn,
+                kubeconfigBtn,
+                eventsBtn,
                 removeBtn,
                 '-',
                 {
@@ -445,6 +618,9 @@ Ext.define('PVE.dc.K8sView', {
                     rollBtn.setDisabled(disabled);
                     scaleBtn.setDisabled(disabled);
                     upgradeBtn.setDisabled(disabled);
+                    nodesBtn.setDisabled(disabled);
+                    kubeconfigBtn.setDisabled(disabled);
+                    eventsBtn.setDisabled(disabled);
                     removeBtn.setDisabled(disabled);
                 },
                 afterrender: function() {

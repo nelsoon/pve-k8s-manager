@@ -40,4 +40,21 @@ like($js, qr/method: 'DELETE'/,
 like($api, qr/fork_worker\('k8sdelete'/,
     'delete endpoint runs as a k8sdelete PVE task (UPID)');
 
+
+# T2.5 day-2 ops: kubeconfig, events, per-node drain/replace
+like($api, qr/fork_worker\('k8snodedrain'/,
+    'node drain endpoint runs as a k8snodedrain task');
+like($api, qr/fork_worker\('k8snodereplace'/,
+    'node replace endpoint runs as a k8snodereplace task');
+like($api, qr/name => 'kubeconfig'/,
+    'kubeconfig endpoint exists');
+like($js, qr|'/kubeconfig'|,
+    'UI fetches the kubeconfig from the REST API');
+like($js, qr|'/events'|,
+    'UI events view reads the events endpoint');
+like($js, qr|'/nodes/' \+ node|,
+    'UI node actions call the per-node endpoints');
+like($js, qr/create token|a\.download = name \+ '\.kubeconfig'/,
+    'UI offers the kubeconfig as a download');
+
 done_testing();

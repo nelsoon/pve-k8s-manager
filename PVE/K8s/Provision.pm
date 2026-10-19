@@ -1873,6 +1873,187 @@ sub roll_cluster {
     return 1;
 }
 
+# --- day-2 operations (T2.5) -------------------------------
+# Shared helpers: inventory-shaped node list and the first
+# answering control-plane node for kubectl operations.
+
+my sub load_nodes {
+    my ($name, $scfg) = @_;
+
+    die "cluster '$name' is not provisioned yet\n"
+        if !$scfg->{nodes};
+    my $pools = PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2);
+    my %pool_by_name = map { $_->{name} => $_ } $pools->@*;
+    my $inventory = JSON::PP->new->decode($scfg->{nodes});
+    my @nodes;
+    for my $item ($inventory->@*) {
+        my ($idx) = $item->{name} =~ /(\d+)$/;
+        my $pool = $item->{pool} // 'default';
+        push @nodes, {
+            host => $item->{name},
+            role => $pool eq 'control-plane' ? 'cp' : 'worker',
+            pool => $pool, idx => $idx // 1, ip => $item->{ip},
+            vmid => $item->{vmid}, pvehost => $item->{pvehost},
+            labels => ($pool_by_name{$pool} // {})->{labels},
+            taints => ($pool_by_name{$pool} // {})->{taints},
+        };
+        $VM_HOST{$item->{vmid}} = $item->{pvehost};
+    }
+    return \@nodes;
+}
+
+my sub ops_cp {
+    my ($nodes) = @_;
+
+    for my $candidate (grep { $_->{role} eq 'cp' } $nodes->@*) {
+        my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
+        return $candidate if $ok;
+    }
+    die "no control-plane node answers\n";
+}
+
+my sub find_node {
+    my ($nodes, $host) = @_;
+
+    my ($node) = grep { $_->{host} eq $host } $nodes->@*;
+    die "node '$host' is not part of this cluster\n" if !$node;
+    return $node;
+}
+
+# Short-lived (1h) admin kubeconfig: a TokenRequest token
+# for a dedicated service account, never a static credential.
+# The PVE API call itself is the audit record (authenticated
+# user, Sys.Modify required).
+sub kubeconfig_cluster {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
+    $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
+    my $vip = "$1.59";
+
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    guest_exec($cp->{vmid},
+        'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+        . 'create serviceaccount pve-k8s-admin -n kube-system '
+        . '--dry-run=client -o yaml | '
+        . 'kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -; '
+        . 'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+        . 'create clusterrolebinding pve-k8s-admin '
+        . '--clusterrole=cluster-admin '
+        . '--serviceaccount=kube-system:pve-k8s-admin '
+        . '--dry-run=client -o yaml | '
+        . 'kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -');
+    my $token = guest_exec($cp->{vmid},
+        'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+        . 'create token pve-k8s-admin -n kube-system '
+        . '--duration=3600s');
+    $token =~ s/\s+//g;
+    my $ca = guest_exec($cp->{vmid},
+        'base64 -w0 /etc/kubernetes/pki/ca.crt');
+    $ca =~ s/\s+//g;
+    die "could not issue a token for cluster '$name'\n"
+        if !$token || !$ca;
+
+    return {
+        kubeconfig => <<EOF,
+apiVersion: v1
+kind: Config
+clusters:
+- name: $name
+  cluster:
+    server: https://$vip:6443
+    certificate-authority-data: $ca
+contexts:
+- name: $name
+  context:
+    cluster: $name
+    user: pve-k8s-admin
+current-context: $name
+users:
+- name: pve-k8s-admin
+  user:
+    token: $token
+EOF
+        expires => '1h (TokenRequest, service account '
+            . 'kube-system/pve-k8s-admin, cluster-admin)',
+        server => "https://$vip:6443",
+    };
+}
+
+sub drain_node {
+    my ($name, $host) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $node = find_node($nodes, $host);
+    my $cp = ops_cp($nodes);
+    kubectl_on($cp, "cordon $host");
+    # time-boxed like scale-in: PDB refusals must not hang
+    guest_exec($cp->{vmid},
+        'timeout 600 kubectl '
+        . '--kubeconfig /etc/kubernetes/admin.conf '
+        . "drain $host --ignore-daemonsets "
+        . '--delete-emptydir-data --timeout=540s');
+    print "node $host drained (pods evicted, node cordoned)\n";
+    return 1;
+}
+
+sub replace_node {
+    my ($name, $host) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $node = find_node($nodes, $host);
+    die "control-plane replacement goes through roll/upgrade, "
+        . "not the node replace action\n" if $node->{role} eq 'cp';
+    my $cp = ops_cp($nodes);
+    print "replacing node $host (drain, destroy, recreate)\n";
+    remove_node($cp, $node, $nodes);
+    provision_cluster($name);
+    print "node $host replaced\n";
+    return 1;
+}
+
+# Recent Kubernetes events, newest last, as flat rows for
+# the UI events view (PVE-side actions are the task log).
+sub cluster_events {
+    my ($name, $limit) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    my $data = kubectl_json($cp,
+        'get events -A --sort-by=.lastTimestamp');
+    my @events;
+    for my $e (($data->{items} // [])->@*) {
+        # core v1 Event and events.k8s.io/v1 Event shapes
+        my $obj = $e->{involvedObject} // $e->{regarding} // {};
+        push @events, {
+            time => $e->{lastTimestamp} // $e->{eventTime}
+                // $e->{metadata}{creationTimestamp} // '',
+            type => $e->{type} // '',
+            reason => $e->{reason} // '',
+            object => ($obj->{kind} // '') . '/'
+                . ($obj->{name} // ''),
+            message => $e->{message} // $e->{note} // '',
+        };
+    }
+    $limit //= 100;
+    @events = @events[-$limit .. -1] if @events > $limit;
+    return \@events;
+}
+
 sub upgrade_cluster {
     my ($name, $target, %opts) = @_;
 

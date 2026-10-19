@@ -339,6 +339,138 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'kubeconfig',
+    path => '{name}/kubeconfig',
+    method => 'GET',
+    protected => 1,
+    description => "Issue a short-lived (1h) admin kubeconfig "
+        . "for the cluster (TokenRequest token; the call is "
+        . "the audit record).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::kubeconfig_cluster($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'events',
+    path => '{name}/events',
+    method => 'GET',
+    description => "Recent Kubernetes events for the cluster.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::cluster_events($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'node-drain',
+    path => '{name}/nodes/{node}/drain',
+    method => 'POST',
+    protected => 1,
+    description => "Cordon and drain one node (PDB-safe, "
+        . "time-boxed).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            node => {
+                type => 'string',
+                description => "The Kubernetes node name.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8snodedrain',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::drain_node(
+                    $param->{name}, $param->{node});
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'node-replace',
+    path => '{name}/nodes/{node}/replace',
+    method => 'POST',
+    protected => 1,
+    description => "Replace one worker node: drain, destroy, "
+        . "recreate from the template (same name/IP).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            node => {
+                type => 'string',
+                description => "The Kubernetes node name.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8snodereplace',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::replace_node(
+                    $param->{name}, $param->{node});
+            });
+    }});
+
+__PACKAGE__->register_method({
     name => 'delete',
     path => '{name}',
     method => 'DELETE',
