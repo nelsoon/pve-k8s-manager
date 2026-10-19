@@ -115,6 +115,30 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Rolling window HH:MM-HH:MM (local time).",
             },
+            'lb-mode' => {
+                type => 'string',
+                pattern => '^(l2|bgp)$',
+                optional => 1,
+                description => "LoadBalancer announcement: l2 "
+                    . "(default, ARP on the node subnet) or bgp "
+                    . "(Cilium BGP to an external router).",
+            },
+            'bgp-peer-address' => {
+                type => 'string',
+                optional => 1,
+                description => "BGP router address (lb-mode bgp).",
+            },
+            'bgp-peer-asn' => {
+                type => 'integer',
+                optional => 1,
+                description => "BGP router ASN (lb-mode bgp).",
+            },
+            'bgp-local-asn' => {
+                type => 'integer',
+                optional => 1,
+                description => "ASN for the cluster's Cilium "
+                    . "BGP speakers (lb-mode bgp).",
+            },
             'backup-dir' => {
                 type => 'string',
                 optional => 1,
@@ -144,6 +168,7 @@ __PACKAGE__->register_method({
         my $cp = PVE::K8s::Config::assert_valid_cp_count($param->{cp} // 3);
         # new clusters only on upstream-supported minors
         PVE::K8s::Config::assert_supported_version($param->{'k8s-version'});
+        PVE::K8s::Config::assert_bgp_config($param);
         # validate pools eagerly so a bad pool spec fails at
         # create time, not halfway through provisioning
         PVE::K8s::Config::parse_pools($param->{pools}, $param->{workers} // 2)
@@ -163,7 +188,8 @@ __PACKAGE__->register_method({
                 created => time(),
                 (map { $param->{$_} ? ($_ => $param->{$_}) : () }
                     qw(node-subnet gateway lb-range pools storage
-                        maintenance-window backup-dir
+                        maintenance-window backup-dir lb-mode
+                        bgp-peer-address bgp-peer-asn bgp-local-asn
                         backup-retention description)),
             };
 

@@ -137,6 +137,30 @@ my $defaultData = {
             description => "Enabled opt-in add-ons JSON (T3.3).",
             optional => 1,
         },
+        'lb-mode' => {
+            type => 'string',
+            description => "How LoadBalancer IPs are announced: "
+                . "l2 (ARP on the node subnet) or bgp (Cilium "
+                . "BGP to an external router, T3.4).",
+            optional => 1,
+        },
+        'bgp-peer-address' => {
+            type => 'string',
+            description => "BGP peer (router) address for "
+                . "lb-mode bgp.",
+            optional => 1,
+        },
+        'bgp-peer-asn' => {
+            type => 'integer',
+            description => "BGP peer (router) ASN for lb-mode bgp.",
+            optional => 1,
+        },
+        'bgp-local-asn' => {
+            type => 'integer',
+            description => "Local ASN the cluster's Cilium "
+                . "agents speak BGP with, for lb-mode bgp.",
+            optional => 1,
+        },
         'backup-dir' => {
             type => 'string',
             description => "Host directory for etcd backups "
@@ -188,6 +212,10 @@ sub options {
         'scaler-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },
         addons => { optional => 1 },
+        'lb-mode' => { optional => 1 },
+        'bgp-peer-address' => { optional => 1 },
+        'bgp-peer-asn' => { optional => 1 },
+        'bgp-local-asn' => { optional => 1 },
         'backup-dir' => { optional => 1 },
         'backup-retention' => { optional => 1 },
         storage => { optional => 1 },
@@ -302,6 +330,27 @@ sub assert_valid_cp_count {
 
     die "cp must be 1, 3 or 5\n" if !grep { $_ == $cp } (1, 3, 5);
     return $cp;
+}
+
+# T3.4: BGP mode is meaningless without a peer to advertise
+# LB /32s to, so fail at create time rather than at provision.
+sub assert_bgp_config {
+    my ($param) = @_;
+
+    my $mode = $param->{'lb-mode'} // 'l2';
+    die "lb-mode must be l2 or bgp\n"
+        if $mode ne 'l2' && $mode ne 'bgp';
+    return $mode if $mode eq 'l2';
+
+    my $peer = $param->{'bgp-peer-address'} // '';
+    die "lb-mode bgp needs a bgp-peer-address (router IP)\n"
+        if $peer !~ /^\d{1,3}(\.\d{1,3}){3}$/;
+    for my $key (qw(bgp-peer-asn bgp-local-asn)) {
+        my $asn = $param->{$key} // 0;
+        die "lb-mode bgp needs a valid $key (1-4294967295)\n"
+            if $asn < 1 || $asn > 4294967295;
+    }
+    return $mode;
 }
 
 1;

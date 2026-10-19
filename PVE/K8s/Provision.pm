@@ -194,6 +194,28 @@ sub exec_pending {
     return defined $res->{pid} || exists $res->{exited};
 }
 
+# In-cluster add-ons (CCM/CSI) call back into the PVE API.
+# They must use a real host address: the node gateway is a
+# host interface in the L2/VXLAN design but only an anycast
+# SVI inside a VRF in the EVPN design, where no pveproxy
+# listens. Resolve this host's own name (its management IP)
+# and fall back to the gateway for exotic setups.
+sub pve_api_url {
+    my ($gateway) = @_;
+
+    require Sys::Hostname;
+    my $name = Sys::Hostname::hostname();
+    my @addr = gethostbyname($name);
+    if (@addr > 4) {
+        for my $packed (@addr[4 .. $#addr]) {
+            my $ip = join('.', unpack('C4', $packed));
+            return "https://$ip:8006/api2/json"
+                if $ip !~ /^127\./;
+        }
+    }
+    return "https://$gateway:8006/api2/json";
+}
+
 my sub guest_exec {
     my ($vmid, $shell_cmd) = @_;
 
@@ -1098,7 +1120,9 @@ sub provision_cluster {
         'kubeadm init phase bootstrap-token '
         . '--kubeconfig /etc/kubernetes/admin.conf');
     guest_exec($cp1->{vmid},
-        PVE::K8s::Addons::cilium_install_cmd('/root/local-super-admin.conf', $vip));
+        PVE::K8s::Addons::cilium_install_cmd(
+            '/root/local-super-admin.conf', $vip,
+            ($scfg->{'lb-mode'} // 'l2') eq 'bgp' ? 1 : 0));
     set_external_cloud_provider($cp1);
     print "control plane initialised on $cp1->{host}\n";
 
@@ -1203,7 +1227,7 @@ sub provision_cluster {
     # --- Proxmox CCM: scoped token in, providerIDs out
     my ($token_id, $token_secret) = ensure_ccm_credentials($name);
     my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
-        "https://$gateway:8006/api2/json",
+        pve_api_url($gateway),
         $token_id, $token_secret, pve_cluster_region());
     # Nodes that predate the external kubelet flag never got the
     # uninitialized taint that makes the CCM initialise them
@@ -1237,7 +1261,7 @@ sub provision_cluster {
     # --- Proxmox CSI: shared-block (default) + local-block classes
     my ($csi_token_id, $csi_secret) = ensure_csi_credentials($name);
     my $csi_values = PVE::K8s::Addons::csi_values_yaml(
-        "https://$gateway:8006/api2/json",
+        pve_api_url($gateway),
         $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::csi_install_cmd(
         '/root/local-super-admin.conf', $csi_values));
@@ -1259,11 +1283,22 @@ sub provision_cluster {
     print "Proxmox CSI installed (shared-block default, local-block)\n";
 
     # --- LoadBalancer pool from the cluster config, if configured
+    my $lb_mode = $scfg->{'lb-mode'} // 'l2';
     if (my $range = $scfg->{'lb-range'}) {
         guest_exec($cp1->{vmid}, PVE::K8s::Addons::lb_apply_cmd(
             '/root/local-super-admin.conf',
-            PVE::K8s::Addons::lb_pool_yaml($range)));
-        print "LoadBalancer pool $range applied (Cilium LB IPAM, L2)\n";
+            PVE::K8s::Addons::lb_pool_yaml($range, $lb_mode)));
+        print "LoadBalancer pool $range applied (Cilium LB IPAM, "
+            . ($lb_mode eq 'bgp' ? 'BGP' : 'L2') . ")\n";
+    }
+    if ($lb_mode eq 'bgp') {
+        guest_exec($cp1->{vmid},
+            PVE::K8s::Addons::cilium_bgp_apply_cmd(
+                '/root/local-super-admin.conf',
+                PVE::K8s::Addons::cilium_bgp_yaml($scfg)));
+        print "Cilium BGP peering with "
+            . "$scfg->{'bgp-peer-address'} (AS"
+            . "$scfg->{'bgp-peer-asn'}) applied\n";
     }
 
     my (undef, $template_rev) = find_template_in_list(qm('list'), $version);

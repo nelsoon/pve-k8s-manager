@@ -91,6 +91,32 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     fieldLabel: gettext('Storage'),
                     emptyText: gettext('Proxmox storage for node disks'),
                 },
+                {
+                    xtype: 'combobox',
+                    name: 'lb-mode',
+                    fieldLabel: gettext('LB Mode'),
+                    store: ['l2', 'bgp'],
+                    value: 'l2',
+                    editable: false,
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'bgp-peer-address',
+                    fieldLabel: gettext('BGP Router Address'),
+                    emptyText: gettext('only for LB Mode bgp'),
+                },
+                {
+                    xtype: 'numberfield',
+                    name: 'bgp-peer-asn',
+                    fieldLabel: gettext('BGP Router ASN'),
+                    emptyText: '65001',
+                },
+                {
+                    xtype: 'numberfield',
+                    name: 'bgp-local-asn',
+                    fieldLabel: gettext('BGP Cluster ASN'),
+                    emptyText: '65002',
+                },
             ],
         });
 
