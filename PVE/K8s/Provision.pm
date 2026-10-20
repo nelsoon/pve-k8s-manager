@@ -104,11 +104,25 @@ my sub host_of {
     return $VM_HOST{$vmid} // local_node_name();
 }
 
+# pvesh can prefix human notices (e.g. "user config -
+# ignore ...") ahead of the JSON payload on stdout; strip
+# everything before the first JSON opener, like guest_exec
+# already does for qm output.
+sub decode_pvesh_json {
+    my ($out) = @_;
+
+    my @starts = grep { $_ >= 0 }
+        map { index($out // '', $_) } ('[', '{');
+    my $start = @starts ? (sort { $a <=> $b } @starts)[0] : undef;
+    $out = substr($out, $start) if defined $start;
+    return JSON::PP->new->decode($out);
+}
+
 # Online PVE node names from cluster status.
 my sub pve_online_nodes {
     my $out = run(['pvesh', 'get', '/cluster/status',
         '--output-format', 'json'], timeout => 60);
-    my $status = JSON::PP->new->decode($out);
+    my $status = decode_pvesh_json($out);
     return [grep { defined }
         map { ($_->{type} // '') eq 'node' && ($_->{online} // 0) ? $_->{name} : undef }
         $status->@*];
@@ -137,7 +151,7 @@ my sub ha_group_by_host {
 my sub cluster_vms {
     my $out = run(['pvesh', 'get', '/cluster/resources',
         '--type', 'vm', '--output-format', 'json'], timeout => 60);
-    my $res = JSON::PP->new->decode($out);
+    my $res = decode_pvesh_json($out);
     my %vms;
     for my $vm ($res->@*) {
         next if !defined $vm->{name};
@@ -797,7 +811,7 @@ sub delete_cluster {
 
 sub pve_cluster_region {
     my $out = run(['pvesh', 'get', '/cluster/status', '--output-format', 'json']);
-    my $status = JSON::PP->new->decode($out);
+    my $status = decode_pvesh_json($out);
     for my $entry (@$status) {
         return $entry->{name} if ($entry->{type} // '') eq 'cluster';
     }
@@ -901,7 +915,12 @@ sub create_node_vm {
         $vmid = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
         $vmid =~ s/\D//g;
         $VM_HOST{$vmid} = $target;
-        my @clone = ('clone', $tpl, $vmid, '--name', $vmname);
+        # Full clone, always: a linked clone's disk stays
+        # chained to the template base on that host's local
+        # storage, and PVE then refuses to migrate the VM
+        # anywhere (found by T3.5 host evacuation).
+        my @clone = ('clone', $tpl, $vmid, '--name', $vmname,
+            '--full', 1);
         push @clone, '--storage', $node->{pool_storage}
             if $node->{pool_storage};
         qm_on($target, @clone);
@@ -957,7 +976,7 @@ my sub assert_cluster_hosts_online {
 
     my $out = run(['pvesh', 'get', '/cluster/status',
         '--output-format', 'json'], timeout => 60);
-    my $status = JSON::PP->new->decode($out);
+    my $status = decode_pvesh_json($out);
     my %offline = map { $_->{name} => 1 }
         grep { ($_->{type} // '') eq 'node' && !($_->{online} // 0) }
         $status->@*;
@@ -2263,7 +2282,7 @@ sub check_retired_ghosts {
     return if !$retired->@*;
     my $out = run(['pvesh', 'get', '/cluster/resources',
         '--type', 'vm', '--output-format', 'json'], timeout => 60);
-    my $vms = JSON::PP->new->decode($out);
+    my $vms = decode_pvesh_json($out);
     for my $ghost ($retired->@*) {
         my ($vm) = grep {
             ($_->{name} // '') eq $ghost->{name}
@@ -2403,6 +2422,275 @@ sub backup_cluster {
     release_scaler_leadership($name, $done // 0);
     die $err if $err;
     return $done;
+}
+
+# --- T3.5 hypervisor maintenance: evacuate every managed
+# cluster VM off a PVE host by live migration (local disks
+# included), so the host can be serviced with the clusters
+# staying up. Workers move first; control-plane members
+# move one at a time with an API health gate between them.
+
+sub evacuation_plan {
+    my ($nodes, $source, $hosts, $group_of) = @_;
+
+    my @targets = grep { $_->{pvehost} eq $source } $nodes->@*;
+    return [] if !@targets;
+
+    my @candidates = grep { $_ ne $source } $hosts->@*;
+    die "no other online PVE host can take VMs from '$source'\n"
+        if !@candidates;
+
+    my (%total, %cps, %pool);
+    for my $node ($nodes->@*) {
+        $total{$node->{pvehost}}++;
+        $cps{"$node->{cluster}:$node->{pvehost}"}++
+            if $node->{role} eq 'cp';
+        $pool{"$node->{cluster}:$node->{pool}:$node->{pvehost}"}++;
+    }
+
+    my @plan;
+    my @ordered = (
+        (grep { $_->{role} ne 'cp' } @targets),
+        (grep { $_->{role} eq 'cp' } @targets),
+    );
+    for my $node (@ordered) {
+        my ($best, $best_key);
+        for my $host (@candidates) {
+            my $group = $group_of->{$host} // $host;
+            my $key = $node->{role} eq 'cp'
+                ? [ $cps{"$node->{cluster}:$host"} // 0,
+                    $total{$host} // 0 ]
+                : [ $pool{"$node->{cluster}:$node->{pool}:$host"} // 0,
+                    $total{$host} // 0 ];
+            my $better = !$best;
+            if ($best) {
+                for my $i (0 .. $key->$#*) {
+                    next if $key->[$i] == $best_key->[$i];
+                    $better = $key->[$i] < $best_key->[$i];
+                    last;
+                }
+            }
+            ($best, $best_key) = ($host, $key) if $better;
+        }
+        push @plan, {
+            cluster => $node->{cluster}, host => $node->{host},
+            vmid => $node->{vmid}, role => $node->{role},
+            pool => $node->{pool},
+            from => $source, to => $best,
+        };
+        $total{$best}++;
+        $cps{"$node->{cluster}:$best"}++ if $node->{role} eq 'cp';
+        $pool{"$node->{cluster}:$node->{pool}:$best"}++;
+        $total{$source}--;
+    }
+    return \@plan;
+}
+
+my sub update_node_pvehost {
+    my ($name, $nodename, $newhost) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $inventory = JSON::PP->new->decode(
+            $cfg->{ids}->{$name}->{nodes});
+        for my $item ($inventory->@*) {
+            $item->{pvehost} = $newhost
+                if $item->{name} eq $nodename;
+        }
+        $cfg->{ids}->{$name}->{nodes} =
+            JSON::PP->new->canonical->encode($inventory);
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+my sub vm_has_local_disks {
+    my ($vmid, $host) = @_;
+
+    my $cfg = qm_on($host, 'config', $vmid);
+    my %storage;
+    while ($cfg =~ /^(?:scsi|virtio|ide|sata)\d+:\s+([^:,]+):/mg) {
+        $storage{$1} = 1;
+    }
+    return 0 if !%storage;
+    my $out = run(['pvesh', 'get', "/nodes/$host/storage",
+        '--output-format', 'json'], timeout => 60);
+    my $entries = decode_pvesh_json($out);
+    my %shared = map {
+        (($_->{storage} // '') =~ /^([a-zA-Z0-9_.-]+)$/)
+            ? ($1 => ($_->{shared} // 0)) : ()
+    } $entries->@*;
+    for my $id (keys %storage) {
+        return 1 if !($shared{$id} // 0);
+    }
+    return 0;
+}
+
+my sub migrate_vm_live {
+    my ($step) = @_;
+
+    my ($vmid, $from, $to) = $step->@{qw(vmid from to)};
+    # Trust live placement, not the plan's snapshot: the
+    # VM may already sit on the target (a previous partial
+    # evacuation, a manual migration) or on a third host
+    # (stale resource view). Migrating from where the VM
+    # is not fails in qm before anything moves.
+    my $live = cluster_vms();
+    my $current = $live->{$step->{host}}->{node} // $from;
+    if ($current eq $to) {
+        print "$step->{host} (vmid $vmid) already on $to\n";
+        return 1;
+    }
+    $from = $current;
+    my $with_local = vm_has_local_disks($vmid, $from);
+    print "migrating $step->{host} (vmid $vmid) $from -> $to"
+        . ($with_local ? ' with local disks' : '') . "\n";
+    my $started = time();
+    # Detached on the source host: pvesh create stays
+    # attached to the migration task, so a client-side
+    # timeout aborts the migration with a broken pipe.
+    my $migrate_cmd = "setsid qm migrate $vmid $to --online"
+        . ($with_local ? ' --with-local-disks' : '')
+        . " >/root/k8s-migrate-$vmid.log 2>&1 </dev/null &"
+        . ' echo launched';
+    host_run_on($from, '/bin/sh', '-c', $migrate_cmd);
+    # Local-disk migrations of large VMs legitimately run
+    # for hours; poll until the VM lands on the target.
+    # Fail fast on a dead migration task (below) or when
+    # the migration log stops advancing for 30 minutes
+    # (a genuinely stuck migration), with a 12-hour hard
+    # cap so a maintenance window can never hang forever.
+    my $deadline = $started + 12 * 3600;
+    my ($last_progress, $last_mtime) = (time(), -1);
+    while (time() < $deadline) {
+        my $vms = cluster_vms();
+        my $vm = $vms->{$step->{host}};
+        if ($vm && $vm->{node} eq $to) {
+            my $status = qm_on($to, 'status', $vmid);
+            return 1 if $status =~ /status:\s*running/;
+        }
+        my $mtime = eval {
+            my $out = host_run_on($from, 'stat', '-c', '%Y',
+                "/root/k8s-migrate-$vmid.log");
+            $out =~ /(\d+)/ ? int $1 : undef;
+        };
+        if (defined $mtime) {
+            if ($mtime != $last_mtime) {
+                ($last_mtime, $last_progress) = ($mtime, time());
+            } elsif (time() - $last_progress > 1800) {
+                die "migration of $step->{host} (vmid $vmid) "
+                    . "stalled: no progress in the migration "
+                    . "log for 30 minutes (see "
+                    . "/root/k8s-migrate-$vmid.log on $from)\n";
+            }
+        }
+        # Fail fast when the migration task itself dies
+        # (e.g. linked-clone disks PVE refuses to move)
+        # instead of polling the full timeout.
+        my $tasks = eval {
+            decode_pvesh_json(run(['pvesh', 'get',
+                "/nodes/$from/tasks", '--vmid', $vmid,
+                '--type', 'qmigrate', '--limit', 1,
+                '--output-format', 'json'], timeout => 60));
+        } // [];
+        if (my ($task) = grep {
+                ($_->{endtime} // 0) >= $started - 120
+            } $tasks->@*) {
+            die "migration of $step->{host} (vmid $vmid) "
+                . "failed: " . ($task->{status} // 'unknown')
+                . " (see qmigrate task on $from)\n";
+        }
+        sleep 15;
+    }
+    die "migration of $step->{host} (vmid $vmid) to $to "
+        . "did not complete\n";
+}
+
+my sub wait_cluster_ready {
+    my ($name, $nodes) = @_;
+
+    my $total = scalar $nodes->@*;
+    for (1 .. 24) {
+        my $ok = eval {
+            my $cp = ops_cp($nodes);
+            my $out = guest_exec($cp->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+                . 'get nodes --no-headers');
+            my @ready = grep { /\sReady\s/ } split /\n/, $out;
+            scalar @ready == $total;
+        } // 0;
+        return 1 if $ok;
+        sleep 15;
+    }
+    die "cluster '$name' did not return to $total Ready "
+        . "nodes after a control-plane migration\n";
+}
+
+sub evacuate_host {
+    my ($host) = @_;
+
+    ($host) = $host =~ /^([a-zA-Z0-9._-]+)$/
+        or die "invalid PVE host name '$host'\n";
+
+    my $hosts = pve_online_nodes();
+    die "PVE host '$host' is not online\n"
+        if !grep { $_ eq $host } $hosts->@*;
+    my $group_of = ha_group_by_host();
+
+    my $cfg = PVE::K8s::Config->config();
+    my $live = cluster_vms();
+    my (@all_nodes, %nodes_by_cluster);
+    for my $name (sort keys $cfg->{ids}->%*) {
+        my $scfg = $cfg->{ids}->{$name};
+        next if !$scfg->{nodes};
+        my $nodes = load_nodes($name, $scfg);
+        $nodes_by_cluster{$name} = $nodes;
+        push @all_nodes, map {
+            { cluster => $name, host => $_->{host},
+              vmid => $_->{vmid},
+              # Live placement wins over the stored
+              # inventory: a previous evacuation (or a
+              # manual migration) may have moved the VM
+              # after the inventory was written.
+              pvehost => ($live->{$_->{host}}->{node}
+                  // $_->{pvehost}),
+              stored_pvehost => $_->{pvehost},
+              pool => $_->{pool}, role => $_->{role} }
+        } $nodes->@*;
+    }
+    # Converge the stored inventory onto live placement
+    # before planning, so re-running an evacuation after
+    # a partial (or manual) move finishes the job instead
+    # of migrating VMs that already left the host.
+    for my $node (@all_nodes) {
+        next if $node->{pvehost} eq $node->{stored_pvehost};
+        update_node_pvehost($node->{cluster}, $node->{host},
+            $node->{pvehost});
+        print "$node->{host} inventory reconciled: "
+            . "$node->{stored_pvehost} -> $node->{pvehost}\n";
+    }
+
+    my $plan = evacuation_plan(\@all_nodes, $host, $hosts,
+        $group_of);
+    if (!$plan->@*) {
+        print "no managed cluster VMs on PVE host '$host'\n";
+        return 0;
+    }
+
+    for my $step ($plan->@*) {
+        migrate_vm_live($step);
+        update_node_pvehost($step->{cluster}, $step->{host},
+            $step->{to});
+        print "$step->{host} now on $step->{to}\n";
+        if ($step->{role} eq 'cp') {
+            wait_cluster_ready($step->{cluster},
+                $nodes_by_cluster{$step->{cluster}});
+            print "cluster '$step->{cluster}' healthy after "
+                . "control-plane move\n";
+        }
+    }
+    print "PVE host '$host' evacuated: " . scalar($plan->@*)
+        . " cluster VM(s) live-migrated\n";
+    return scalar $plan->@*;
 }
 
 # --- T3.3 add-ons: Cilium ingress/Gateway ship with every

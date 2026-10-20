@@ -669,6 +669,50 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'evacuate',
+    path => '{name}/hosts/{host}/evacuate',
+    method => 'POST',
+    protected => 1,
+    description => "Evacuate a PVE host for maintenance: "
+        . "live-migrate every managed cluster VM off it "
+        . "(local disks included), workers first, "
+        . "control-plane members one at a time with a "
+        . "cluster health gate between moves. The cluster "
+        . "in the path is the API context; evacuation "
+        . "covers all managed clusters.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "Context cluster (evacuation "
+                    . "itself covers all managed clusters).",
+            },
+            host => {
+                type => 'string',
+                description => "The PVE host to empty.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8sevacuate',
+            $param->{host}, $authuser, sub {
+                PVE::K8s::Provision::evacuate_host(
+                    $param->{host});
+            });
+    }});
+
+__PACKAGE__->register_method({
     name => 'addons',
     path => '{name}/addons',
     method => 'GET',

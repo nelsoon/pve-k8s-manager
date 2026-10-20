@@ -758,6 +758,45 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        let evacuateBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Evacuate Host'),
+            iconCls: 'fa fa-fw fa-sign-out',
+            disabled: true,
+            handler: function() {
+                let selection = me.getSelection();
+                if (!selection || selection.length < 1) {
+                    return;
+                }
+                let name = selection[0].data.name;
+                Ext.Msg.prompt(
+                    gettext('Evacuate PVE Host'),
+                    gettext('Host to empty by live-migrating all '
+                        + 'managed cluster VMs off it:'),
+                    function(answer, value) {
+                        if (answer !== 'ok' || !value) {
+                            return;
+                        }
+                        Proxmox.Utils.API2Request({
+                            url: '/cluster/k8s/' + name + '/hosts/'
+                                + value + '/evacuate',
+                            method: 'POST',
+                            failure: function(response) {
+                                Ext.Msg.alert(gettext('Error'),
+                                    Proxmox.Utils.extractRequestError(response, true));
+                            },
+                            success: function(response) {
+                                let upid = response.result.data;
+                                if (upid) {
+                                    Ext.create('Proxmox.window.TaskViewer', {
+                                        upid: upid,
+                                    }).show();
+                                }
+                            },
+                        });
+                    });
+            },
+        });
+
         let backupBtn = Ext.create('Ext.button.Button', {
             text: gettext('Backup'),
             iconCls: 'fa fa-fw fa-save',
@@ -899,6 +938,7 @@ Ext.define('PVE.dc.K8sView', {
                 kubeconfigBtn,
                 eventsBtn,
                 addonsBtn,
+                evacuateBtn,
                 backupBtn,
                 restoreBtn,
                 removeBtn,
@@ -922,6 +962,7 @@ Ext.define('PVE.dc.K8sView', {
                     kubeconfigBtn.setDisabled(disabled);
                     eventsBtn.setDisabled(disabled);
                     addonsBtn.setDisabled(disabled);
+                    evacuateBtn.setDisabled(disabled);
                     backupBtn.setDisabled(disabled);
                     restoreBtn.setDisabled(disabled);
                     removeBtn.setDisabled(disabled);
