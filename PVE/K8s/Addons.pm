@@ -19,20 +19,21 @@ our $HELM_VERSION = '3.16.3';
 our $POD_CIDR = '10.244.0.0/16';
 
 sub cilium_values_yaml {
-    my ($vip, $bgp) = @_;
+    my ($vip) = @_;
 
-    my $bgp_yaml = $bgp ? <<'EOF' : '';
-bgpControlPlane:
-  enabled: true
-EOF
-
+    # T3.4 re-spec: no Cilium BGP, ever. External
+    # reachability of LoadBalancer IPs is a Proxmox SDN
+    # property (EVPN fabric or BGP controller + exit
+    # nodes); Cilium only announces the IPs by L2 inside
+    # the cluster VNet. Datapath stays overlay (tunnel):
+    # native routing stays a measured physical-phase
+    # option, not a default.
     return <<EOF;
 ipam:
   mode: cluster-pool
   operator:
     clusterPoolIPv4PodCIDRList: ["$POD_CIDR"]
 kubeProxyReplacement: true
-${bgp_yaml}
 k8sServiceHost: "$vip"
 k8sServicePort: 6443
 l2announcements:
@@ -68,13 +69,13 @@ EOF
 our $GATEWAY_API_VERSION = '1.5.0';
 
 sub cilium_install_cmd {
-    my ($kubeconfig, $vip, $bgp) = @_;
+    my ($kubeconfig, $vip) = @_;
 
     # Single-quoted heredoc + sprintf: an interpolating heredoc
     # strips backslash-newline continuations, which once made
     # helm run without its namespace/values arguments.
     my @args = (helm_ensure_cmd(), $kubeconfig,
-        $GATEWAY_API_VERSION, cilium_values_yaml($vip, $bgp),
+        $GATEWAY_API_VERSION, cilium_values_yaml($vip),
         $CILIUM_VERSION);
     return sprintf(<<'EOF', @args);
 %s
@@ -186,7 +187,7 @@ EOF
 }
 
 sub lb_pool_yaml {
-    my ($range, $mode) = @_;
+    my ($range) = @_;
 
     my ($start, $stop) = split /-/, ($range // '');
     my $ipv4 = qr/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -202,10 +203,9 @@ spec:
   - start: "$start"
     stop: "$stop"
 EOF
-    # In bgp mode the router learns the /32s from Cilium BGP;
-    # an L2 announcement policy on top would double-announce.
-    if (($mode // 'l2') ne 'bgp') {
-        $yaml .= <<'EOF';
+    # LB IPs are always announced by L2 inside the VNet
+    # (T3.4 re-spec); how they leave the VRF is SDN's job.
+    $yaml .= <<'EOF';
 ---
 apiVersion: cilium.io/v2alpha1
 kind: CiliumL2AnnouncementPolicy
@@ -214,71 +214,7 @@ spec:
   interfaces: [eth0]
   loadBalancerIPs: true
 EOF
-    }
     return $yaml;
-}
-
-# T3.4: Cilium BGP Control Plane objects. Every node peers
-# with the external router (multipath from the router's view)
-# and advertises LoadBalancer IPs with itself as next hop;
-# when a node dies its session drops and the router
-# withdraws that path.
-sub cilium_bgp_yaml {
-    my ($scfg) = @_;
-
-    my $peer = $scfg->{'bgp-peer-address'}
-        or die "bgp mode needs bgp-peer-address\n";
-    my $peer_asn = $scfg->{'bgp-peer-asn'}
-        or die "bgp mode needs bgp-peer-asn\n";
-    my $local_asn = $scfg->{'bgp-local-asn'}
-        or die "bgp mode needs bgp-local-asn\n";
-
-    return <<EOF;
-apiVersion: cilium.io/v2
-kind: CiliumBGPClusterConfig
-metadata: {name: pve-k8s}
-spec:
-  nodeSelector: {}
-  bgpInstances:
-  - name: cluster
-    localASN: $local_asn
-    peers:
-    - name: router
-      peerASN: $peer_asn
-      peerAddress: "$peer"
-      peerConfigRef: {name: pve-k8s-peer}
----
-apiVersion: cilium.io/v2
-kind: CiliumBGPPeerConfig
-metadata: {name: pve-k8s-peer}
-spec:
-  families:
-  - afi: ipv4
-    safi: unicast
-    advertisements: {matchLabels: {advertise: lb}}
-  gracefulRestart: {enabled: true, restartTimeSeconds: 15}
----
-apiVersion: cilium.io/v2
-kind: CiliumBGPAdvertisement
-metadata:
-  name: lb-services
-  labels: {advertise: lb}
-spec:
-  advertisements:
-  - advertisementType: Service
-    service: {addresses: [LoadBalancerIP]}
-EOF
-}
-
-sub cilium_bgp_apply_cmd {
-    my ($kubeconfig, $bgp_yaml) = @_;
-
-    return <<"EOF";
-export KUBECONFIG=$kubeconfig
-kubectl apply -f - <<'BGP'
-$bgp_yaml
-BGP
-EOF
 }
 
 sub lb_apply_cmd {

@@ -102,60 +102,54 @@ like($js, qr/value: 'ca'/,
 like($js, qr/inputType: 'password'/,
     'the PowerDNS API key field is a password input');
 
-# --- T3.4: LB BGP mode
+# --- T3.4 re-spec: LB reachability is SDN's job; Cilium
+# only announces by L2 inside the VNet, never BGP.
 use PVE::K8s::Config;
 
-my $bgp_values = PVE::K8s::Addons::cilium_values_yaml('192.168.202.59', 1);
-like($bgp_values, qr/bgpControlPlane:\n  enabled: true/,
-    'BGP mode enables the Cilium BGP control plane');
-my $l2_values = PVE::K8s::Addons::cilium_values_yaml('192.168.202.59', 0);
+my $l2_values = PVE::K8s::Addons::cilium_values_yaml('192.168.202.59');
 unlike($l2_values, qr/bgpControlPlane/,
-    'L2 mode leaves the BGP control plane off');
+    'Cilium BGP control plane is never enabled');
+like($l2_values, qr/l2announcements:\n  enabled: true/,
+    'L2 announcements stay enabled');
+ok(!PVE::K8s::Addons->can('cilium_bgp_yaml'),
+    'Cilium BGP object generation is removed');
 
 my $pool_l2 = PVE::K8s::Addons::lb_pool_yaml(
-    '192.168.202.100-192.168.202.120', 'l2');
+    '192.168.202.100-192.168.202.120');
 like($pool_l2, qr/CiliumL2AnnouncementPolicy/,
-    'L2 mode announces the pool by ARP');
-my $pool_bgp = PVE::K8s::Addons::lb_pool_yaml(
-    '192.168.202.100-192.168.202.120', 'bgp');
-like($pool_bgp, qr/CiliumLoadBalancerIPPool/,
-    'BGP mode still allocates from the LB pool');
-unlike($pool_bgp, qr/CiliumL2AnnouncementPolicy/,
-    'BGP mode does not double-announce by L2');
+    'the pool is always announced by L2/ARP');
 
-my $bgp_yaml = PVE::K8s::Addons::cilium_bgp_yaml({
-    'bgp-peer-address' => '192.168.202.254',
-    'bgp-peer-asn' => 65001,
-    'bgp-local-asn' => 65002,
-});
-like($bgp_yaml, qr/kind: CiliumBGPClusterConfig/,
-    'BGP cluster config is generated');
-like($bgp_yaml, qr/localASN: 65002/, 'local ASN is the cluster ASN');
-like($bgp_yaml, qr/peerAddress: "192\.168\.202\.254"/,
-    'peers point at the router address');
-like($bgp_yaml, qr/peerASN: 65001/, 'peer ASN is the router ASN');
-like($bgp_yaml, qr/addresses: \[LoadBalancerIP\]/,
-    'advertisements cover LoadBalancer IPs');
-ok(!eval { PVE::K8s::Addons::cilium_bgp_yaml({}); 1 },
-    'BGP objects without peer config are rejected');
-
-is(PVE::K8s::Config::assert_bgp_config({}), 'l2',
-    'no lb-mode defaults to l2');
-is(PVE::K8s::Config::assert_bgp_config({
-        'lb-mode' => 'bgp', 'bgp-peer-address' => '192.168.202.254',
-        'bgp-peer-asn' => 65001, 'bgp-local-asn' => 65002 }), 'bgp',
-    'a complete BGP config validates');
-ok(!eval { PVE::K8s::Config::assert_bgp_config(
+is(PVE::K8s::Config::assert_network_config({}), 'shared',
+    'no SDN settings means the shared pre-made VNet');
+is(PVE::K8s::Config::assert_network_config({
+        'sdn-zone' => 'tenant1',
+        'node-subnet' => '192.168.202.0/24',
+        'public-subnet' => '192.168.212.0/24' }), 'dedicated',
+    'a dedicated EVPN VNet config validates');
+ok(!eval { PVE::K8s::Config::assert_network_config(
         { 'lb-mode' => 'bgp' }); 1 },
-    'BGP mode without a peer is rejected at create time');
-ok(!eval { PVE::K8s::Config::assert_bgp_config(
-        { 'lb-mode' => 'bgp', 'bgp-peer-address' => 'router',
-            'bgp-peer-asn' => 65001, 'bgp-local-asn' => 65002 }); 1 },
-    'a non-IP BGP peer address is rejected');
-ok(!eval { PVE::K8s::Config::assert_bgp_config(
-        { 'lb-mode' => 'bgp', 'bgp-peer-address' => '10.0.0.1',
-            'bgp-peer-asn' => 0, 'bgp-local-asn' => 65002 }); 1 },
-    'ASN 0 is rejected');
+    'lb-mode bgp is rejected (removed by the T3.4 re-spec)');
+ok(!eval { PVE::K8s::Config::assert_network_config(
+        { 'sdn-zone' => 'tenant1' }); 1 },
+    'sdn-zone without public-subnet is rejected');
+ok(!eval { PVE::K8s::Config::assert_network_config(
+        { 'public-subnet' => '192.168.212.0/24' }); 1 },
+    'public-subnet without sdn-zone is rejected');
+ok(!eval { PVE::K8s::Config::assert_network_config({
+        'sdn-zone' => 'tenant1',
+        'node-subnet' => '192.168.202.0/24',
+        'public-subnet' => '192.168.202.0/24' }); 1 },
+    'public-subnet equal to node-subnet is rejected');
+
+is(PVE::K8s::Config::vip_for(
+        { 'node-subnet' => '192.168.202.0/24' }),
+    '192.168.202.59', 'legacy VIP sits on the node subnet');
+is(PVE::K8s::Config::vip_for({
+        'node-subnet' => '192.168.202.0/24',
+        'public-subnet' => '192.168.212.0/24' }),
+    '192.168.212.59', 'dedicated VIP sits on the public subnet');
+is(PVE::K8s::Config::cluster_vnet_name('Tenant Lab 6!'),
+    'k8stenantl', 'VNet ids are short and bridge-safe');
 
 my $prov = do {
     open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
@@ -168,10 +162,13 @@ is(scalar(() = $prov =~ /pve_api_url\(\$gateway\)/g), 2,
 unlike($prov, qr/"https:\/\/\$gateway:8006\/api2\/json",\n\s+\$token_id/,
     'the gateway IP is no longer the API endpoint for add-ons');
 
-like($js, qr/name: 'lb-mode'/, 'wizard has the LB mode field');
-like($js, qr/name: 'bgp-peer-address'/,
-    'wizard has the BGP router address field');
-like($api, qr/assert_bgp_config/,
-    'create validates the BGP config eagerly');
+like($js, qr/name: 'sdn-zone'/,
+    'wizard has the SDN EVPN zone field');
+like($js, qr/name: 'public-subnet'/,
+    'wizard has the public subnet field');
+unlike($js, qr/name: 'bgp-peer-address'/,
+    'wizard no longer offers Cilium BGP settings');
+like($api, qr/assert_network_config/,
+    'create validates the network config eagerly');
 
 done_testing();

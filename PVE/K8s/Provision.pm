@@ -759,6 +759,120 @@ my sub pve_user_exists {
 # matters: VMs and their owned disks first (CSI volumes live
 # and die with the node VMs), scoped CCM/CSI users next, the
 # pmxcfs entry last, so a failed delete can simply be retried.
+# --- T3.4 re-spec: dedicated per-cluster SDN VNet -------
+# With sdn-zone + public-subnet set, a cluster gets its own
+# VNet inside the tenant's EVPN zone: the node subnet is
+# internal (never meant to be advertised), the public
+# subnet carries LB IPs and the apiserver VIP and is the
+# only range that leaves the VRF (whole-subnet via exit
+# nodes, or per-address in an EVPN fabric). The zone is
+# the tenant boundary and is created by the SDN admin,
+# once; the plugin owns the per-cluster VNet lifecycle.
+# EXPERIMENTAL until the delayed nested-lab SDN proof
+# runs (pvesh SDN shapes are written against the PVE API
+# but not yet exercised end to end).
+
+my sub sdn_get {
+    my ($path) = @_;
+
+    return decode_pvesh_json(run(
+        ['pvesh', 'get', $path, '--output-format', 'json'],
+        timeout => 60));
+}
+
+my sub record_sdn_identity {
+    my ($name, $vnet, $vni) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        $cfg->{ids}->{$name}->{'sdn-vnet'} = $vnet;
+        $cfg->{ids}->{$name}->{'sdn-vni'} = $vni;
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+my sub ensure_cluster_vnet {
+    my ($name, $scfg) = @_;
+
+    my $zone = $scfg->{'sdn-zone'} or return undef;
+    my $vnet = PVE::K8s::Config::cluster_vnet_name($name);
+
+    my $zones = sdn_get('/cluster/sdn/zones');
+    my ($z) = grep { ($_->{zone} // '') eq $zone } $zones->@*;
+    die "SDN zone '$zone' does not exist; create the tenant "
+        . "EVPN zone once (SDN admin task) before provisioning\n"
+        if !$z;
+    die "SDN zone '$zone' is type '$z->{type}', not evpn: "
+        . "dedicated cluster VNets need an EVPN zone "
+        . "(T3.4 re-spec)\n"
+        if ($z->{type} // '') ne 'evpn';
+
+    my $vnets = sdn_get('/cluster/sdn/vnets');
+    my ($existing) = grep { ($_->{vnet} // '') eq $vnet }
+        $vnets->@*;
+    my $vni = $scfg->{'sdn-vni'};
+    if (!$existing) {
+        if (!$vni) {
+            my %used = map { ($_->{tag} // 0) => 1 } $vnets->@*;
+            $vni = 10000;
+            $vni++ while $used{$vni};
+        }
+        run(['pvesh', 'create', '/cluster/sdn/vnets',
+            '--vnet', $vnet, '--zone', $zone,
+            '--tag', $vni, '--alias', $name], timeout => 60);
+        print "created SDN VNet $vnet (zone $zone, VNI $vni) "
+            . "for cluster '$name'\n";
+    }
+    $vni //= $existing->{tag};
+    record_sdn_identity($name, $vnet, $vni)
+        if ($scfg->{'sdn-vnet'} // '') ne $vnet
+            || ($scfg->{'sdn-vni'} // 0) != ($vni // 0);
+
+    my $subnets = sdn_get("/cluster/sdn/vnets/$vnet/subnets");
+    my %have = map { ($_->{subnet} // '') => 1 } $subnets->@*;
+    for my $cidr ($scfg->{'node-subnet'},
+                  $scfg->{'public-subnet'}) {
+        next if $have{$cidr};
+        my ($gw) = $cidr =~ m|^(\d+\.\d+\.\d+\.)0/24$|;
+        run(['pvesh', 'create', "/cluster/sdn/vnets/$vnet/subnets",
+            '--type', 'subnet', '--subnet', $cidr,
+            '--gateway', "${gw}1", '--snat', 0], timeout => 60);
+        print "created subnet $cidr in VNet $vnet\n";
+    }
+    run(['pvesh', 'set', '/cluster/sdn'], timeout => 120);
+    return $vnet;
+}
+
+my sub remove_cluster_vnet {
+    my ($name, $scfg) = @_;
+
+    my $vnet = $scfg->{'sdn-vnet'} or return;
+    my $ok = eval {
+        my $subnets = sdn_get("/cluster/sdn/vnets/$vnet/subnets");
+        for my $sn ($subnets->@*) {
+            run(['pvesh', 'delete',
+                "/cluster/sdn/vnets/$vnet/subnets/$sn->{id}"],
+                timeout => 60);
+        }
+        run(['pvesh', 'delete', "/cluster/sdn/vnets/$vnet"],
+            timeout => 60);
+        run(['pvesh', 'set', '/cluster/sdn'], timeout => 120);
+        1;
+    };
+    print $ok
+        ? "removed SDN VNet $vnet of cluster '$name'\n"
+        : "WARNING: SDN VNet $vnet of cluster '$name' could "
+            . "not be removed; delete it by hand in SDN\n";
+}
+
+# Bridge node VMs attach to: the dedicated VNet when the
+# cluster has one recorded, else undef (template default).
+my sub cluster_bridge {
+    my ($scfg) = @_;
+
+    return $scfg->{'sdn-vnet'};
+}
+
 sub delete_cluster {
     my ($name) = @_;
 
@@ -795,6 +909,8 @@ sub delete_cluster {
             if pve_user_exists($user);
         print "removed scoped PVE user $user (tokens included)\n";
     }
+
+    remove_cluster_vnet($name, $scfg);
 
     PVE::K8s::Config::lock_config(sub {
         my $locked = PVE::K8s::Config->config();
@@ -924,6 +1040,14 @@ sub create_node_vm {
         push @clone, '--storage', $node->{pool_storage}
             if $node->{pool_storage};
         qm_on($target, @clone);
+        # Dedicated-VNet clusters (T3.4 re-spec) attach to
+        # their own VNet, not the template's shared bridge.
+        if (my $bridge = $ctx->{bridge}) {
+            my $pre = qm_on($target, 'config', $vmid);
+            my ($mac) = $pre =~ /net0: virtio=([0-9A-Fa-f:]+)/;
+            qm_on($target, 'set', $vmid, '--net0',
+                "virtio=$mac,bridge=$bridge") if $mac;
+        }
         # match the guest MTU to the bridge (VXLAN SDN
         # bridges run below 1500; larger packets blackhole)
         my $vmcfg = qm_on($target, 'config', $vmid);
@@ -1032,18 +1156,23 @@ sub provision_cluster {
         or die "node-subnet must be a /24, got '$subnet'\n";
     my $prefix = $1;
 
-    # Lab/lab-like addressing inside the /24: VIP at .59, control
-    # plane from .60, workers from .70. (Real IPAM arrives with
-    # the SDN integration in T1.5/T2.)
-    my $vip = "$prefix.59";
+    # Addressing inside the /24: node IPs from .60 (CP) and
+    # .70 (workers); the apiserver VIP at .59 of the public
+    # subnet in dedicated-VNet mode, else of the node subnet.
+    my $vip = PVE::K8s::Config::vip_for($scfg);
     my $gateway = $scfg->{gateway} // "$prefix.1";
 
     set_state($name, 'provisioning');
 
+    # Dedicated per-cluster VNet first (T3.4 re-spec), so
+    # node VMs can attach to it. No-op in shared-VNet mode.
+    my $bridge = ensure_cluster_vnet($name, $scfg);
+
     my $template = find_template($version);
     print "using template vmid $template for Kubernetes $version\n";
     my $ctx = { version => $version, template => $template,
-        gateway => $gateway, storage => $storage };
+        gateway => $gateway, storage => $storage,
+        bridge => $bridge };
 
     my @nodes = cluster_nodes($name, $scfg, $prefix)->@*;
     my $total = scalar @nodes;
@@ -1140,8 +1269,7 @@ sub provision_cluster {
         . '--kubeconfig /etc/kubernetes/admin.conf');
     guest_exec($cp1->{vmid},
         PVE::K8s::Addons::cilium_install_cmd(
-            '/root/local-super-admin.conf', $vip,
-            ($scfg->{'lb-mode'} // 'l2') eq 'bgp' ? 1 : 0));
+            '/root/local-super-admin.conf', $vip));
     set_external_cloud_provider($cp1);
     print "control plane initialised on $cp1->{host}\n";
 
@@ -1301,23 +1429,20 @@ sub provision_cluster {
         if !$csi_ok;
     print "Proxmox CSI installed (shared-block default, local-block)\n";
 
-    # --- LoadBalancer pool from the cluster config, if configured
-    my $lb_mode = $scfg->{'lb-mode'} // 'l2';
-    if (my $range = $scfg->{'lb-range'}) {
+    # --- LoadBalancer pool: explicit lb-range, else the
+    # public subnet's .100-.120 in dedicated-VNet mode.
+    my $range = $scfg->{'lb-range'};
+    if (!$range && $scfg->{'public-subnet'}) {
+        my ($pp) = $scfg->{'public-subnet'}
+            =~ m|^(\d+\.\d+\.\d+)\.0/24$|;
+        $range = "$pp.100-$pp.120" if $pp;
+    }
+    if ($range) {
         guest_exec($cp1->{vmid}, PVE::K8s::Addons::lb_apply_cmd(
             '/root/local-super-admin.conf',
-            PVE::K8s::Addons::lb_pool_yaml($range, $lb_mode)));
-        print "LoadBalancer pool $range applied (Cilium LB IPAM, "
-            . ($lb_mode eq 'bgp' ? 'BGP' : 'L2') . ")\n";
-    }
-    if ($lb_mode eq 'bgp') {
-        guest_exec($cp1->{vmid},
-            PVE::K8s::Addons::cilium_bgp_apply_cmd(
-                '/root/local-super-admin.conf',
-                PVE::K8s::Addons::cilium_bgp_yaml($scfg)));
-        print "Cilium BGP peering with "
-            . "$scfg->{'bgp-peer-address'} (AS"
-            . "$scfg->{'bgp-peer-asn'}) applied\n";
+            PVE::K8s::Addons::lb_pool_yaml($range)));
+        print "LoadBalancer pool $range applied "
+            . "(Cilium LB IPAM, L2 announcement)\n";
     }
 
     my (undef, $template_rev) = find_template_in_list(qm('list'), $version);
@@ -1781,7 +1906,7 @@ sub roll_cluster {
         or die "cluster '$name' has no node-subnet configured\n";
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
     my $prefix = $1;
-    my $vip = "$prefix.59";
+    my $vip = PVE::K8s::Config::vip_for($scfg);
     my $gateway = $scfg->{gateway} // "$prefix.1";
     my $version = $opts{target_version} // $scfg->{'k8s-version'};
 
@@ -1845,7 +1970,8 @@ sub roll_cluster {
 
     set_state($name, 'rolling');
     my $ctx = { version => $version, template => $template,
-        gateway => $gateway, storage => $scfg->{storage} // 'local-zfs' };
+        gateway => $gateway, storage => $scfg->{storage} // 'local-zfs',
+        bridge => cluster_bridge($scfg) };
     my $hosts = pve_online_nodes();
     # Operations (snapshot, join material, upgrade apply,
     # kubectl) run from the first control-plane node whose
@@ -2105,7 +2231,7 @@ sub kubeconfig_cluster {
         or die "cluster '$name' does not exist\n";
     my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
-    my $vip = "$1.59";
+    my $vip = PVE::K8s::Config::vip_for($scfg);
 
     my $nodes = load_nodes($name, $scfg);
     my $cp = ops_cp($nodes);
@@ -2857,7 +2983,7 @@ sub restore_cluster {
     my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$|
         or die "bad node-subnet\n";
-    my $vip = "$1.59";
+    my $vip = PVE::K8s::Config::vip_for($scfg);
 
     my $nodes = load_nodes($name, $scfg);
     my @cps = grep { $_->{role} eq 'cp' } $nodes->@*;
@@ -2912,9 +3038,12 @@ sub restore_cluster {
             . "trust a new CA)\n" if !-f "$path.pki.tgz";
         my $ctx = { version => $scfg->{'k8s-version'},
             template => find_template($scfg->{'k8s-version'}),
+            # node gateway always derives from the NODE
+            # subnet (the VIP may live on the public one)
             gateway => $scfg->{gateway}
-                // do { my $g = $vip; $g =~ s/\.59$/.1/; $g },
-            storage => $scfg->{storage} // 'local-zfs' };
+                // do { my $g = $subnet; $g =~ s|\.0/24$|.1|; $g },
+            storage => $scfg->{storage} // 'local-zfs',
+            bridge => cluster_bridge($scfg) };
         my $hosts = pve_online_nodes();
         my $group_of = ha_group_by_host();
         for my $cp (@fresh) {

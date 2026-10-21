@@ -101,6 +101,36 @@ my $defaultData = {
             description => "LoadBalancer address range, e.g. '192.168.200.100-192.168.200.120'.",
             optional => 1,
         },
+        'sdn-zone' => {
+            type => 'string',
+            description => "Proxmox SDN EVPN zone for a dedicated "
+                . "per-cluster VNet (T3.4 re-spec). With "
+                . "public-subnet, provisioning creates the VNet "
+                . "and its internal/public subnets and removes "
+                . "them on delete. Without it, the template's "
+                . "pre-made shared VNet is used (legacy mode).",
+            optional => 1,
+        },
+        'public-subnet' => {
+            type => 'string',
+            description => "Public /24 of a dedicated VNet: "
+                . "LoadBalancer IPs and the external apiserver "
+                . "VIP live here; only this subnet is meant to "
+                . "be advertised upstream (T3.4 re-spec).",
+            optional => 1,
+        },
+        'sdn-vnet' => {
+            type => 'string',
+            description => "Dedicated SDN VNet recorded by the "
+                . "provisioner (T3.4 re-spec).",
+            optional => 1,
+        },
+        'sdn-vni' => {
+            type => 'integer',
+            description => "VXLAN VNI allocated for the dedicated "
+                . "VNet, recorded by the provisioner.",
+            optional => 1,
+        },
         storage => {
             type => 'string',
             format => 'pve-storage-id',
@@ -135,30 +165,6 @@ my $defaultData = {
         addons => {
             type => 'string',
             description => "Enabled opt-in add-ons JSON (T3.3).",
-            optional => 1,
-        },
-        'lb-mode' => {
-            type => 'string',
-            description => "How LoadBalancer IPs are announced: "
-                . "l2 (ARP on the node subnet) or bgp (Cilium "
-                . "BGP to an external router, T3.4).",
-            optional => 1,
-        },
-        'bgp-peer-address' => {
-            type => 'string',
-            description => "BGP peer (router) address for "
-                . "lb-mode bgp.",
-            optional => 1,
-        },
-        'bgp-peer-asn' => {
-            type => 'integer',
-            description => "BGP peer (router) ASN for lb-mode bgp.",
-            optional => 1,
-        },
-        'bgp-local-asn' => {
-            type => 'integer',
-            description => "Local ASN the cluster's Cilium "
-                . "agents speak BGP with, for lb-mode bgp.",
             optional => 1,
         },
         'backup-dir' => {
@@ -212,10 +218,10 @@ sub options {
         'scaler-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },
         addons => { optional => 1 },
-        'lb-mode' => { optional => 1 },
-        'bgp-peer-address' => { optional => 1 },
-        'bgp-peer-asn' => { optional => 1 },
-        'bgp-local-asn' => { optional => 1 },
+        'sdn-zone' => { optional => 1 },
+        'public-subnet' => { optional => 1 },
+        'sdn-vnet' => { optional => 1 },
+        'sdn-vni' => { optional => 1 },
         'backup-dir' => { optional => 1 },
         'backup-retention' => { optional => 1 },
         storage => { optional => 1 },
@@ -332,25 +338,71 @@ sub assert_valid_cp_count {
     return $cp;
 }
 
-# T3.4: BGP mode is meaningless without a peer to advertise
-# LB /32s to, so fail at create time rather than at provision.
-sub assert_bgp_config {
+# T3.4 re-spec (2026-10-20): LoadBalancer reachability is a
+# Proxmox SDN concern, never Cilium BGP. Two topologies are
+# supported: (1) the EVPN fabric itself carries per-address
+# routes, (2) a BGP controller + exit nodes advertise the
+# cluster's public subnet in plain unicast. In both, Cilium
+# only announces LB IPs by L2 inside the cluster VNet.
+# A cluster either stays on the template's pre-made shared
+# VNet (legacy: lb-range inside the node subnet) or, with
+# sdn-zone + public-subnet, gets a dedicated VNet in that
+# EVPN zone holding an internal subnet (node-subnet, never
+# advertised) and the public subnet (LB IPs + apiserver
+# VIP, the only range meant to leave the VRF).
+sub assert_network_config {
     my ($param) = @_;
 
-    my $mode = $param->{'lb-mode'} // 'l2';
-    die "lb-mode must be l2 or bgp\n"
-        if $mode ne 'l2' && $mode ne 'bgp';
-    return $mode if $mode eq 'l2';
+    die "lb-mode bgp was removed by the T3.4 re-spec: "
+        . "LoadBalancer routes come from Proxmox SDN (EVPN "
+        . "fabric or BGP controller + exit nodes), not Cilium\n"
+        if ($param->{'lb-mode'} // 'l2') eq 'bgp';
+    die "lb-mode must be l2\n"
+        if ($param->{'lb-mode'} // 'l2') ne 'l2';
 
-    my $peer = $param->{'bgp-peer-address'} // '';
-    die "lb-mode bgp needs a bgp-peer-address (router IP)\n"
-        if $peer !~ /^\d{1,3}(\.\d{1,3}){3}$/;
-    for my $key (qw(bgp-peer-asn bgp-local-asn)) {
-        my $asn = $param->{$key} // 0;
-        die "lb-mode bgp needs a valid $key (1-4294967295)\n"
-            if $asn < 1 || $asn > 4294967295;
+    my ($zone, $public) = $param->@{qw(sdn-zone public-subnet)};
+    die "sdn-zone and public-subnet must be set together "
+        . "(dedicated per-cluster VNet, T3.4 re-spec)\n"
+        if defined $zone xor defined $public;
+    return 'shared' if !defined $zone;
+
+    die "sdn-zone '$zone' is not a valid SDN zone name\n"
+        if $zone !~ /^[a-zA-Z0-9]+[a-zA-Z0-9_-]*$/;
+    my $node_subnet = $param->{'node-subnet'}
+        or die "dedicated-VNet mode needs a node-subnet "
+            . "(internal /24)\n";
+    for my $pair (['node-subnet', $node_subnet],
+                  ['public-subnet', $public]) {
+        my ($key, $cidr) = @$pair;
+        die "$key must be a /24 (e.g. 192.168.202.0/24), "
+            . "got '$cidr'\n"
+            if $cidr !~ m|^\d+\.\d+\.\d+\.0/24$|;
     }
-    return $mode;
+    die "public-subnet must differ from node-subnet\n"
+        if $public eq $node_subnet;
+    return 'dedicated';
+}
+
+# Deterministic short VNet id for a dedicated cluster VNet
+# (bridge-name length limits apply on the hosts).
+sub cluster_vnet_name {
+    my ($name) = @_;
+
+    my $clean = lc $name;
+    $clean =~ s/[^a-z0-9]//g;
+    return 'k8s' . substr($clean, 0, 7);
+}
+
+# The apiserver VIP: on the public subnet in dedicated
+# mode (reachable from outside through the advertised
+# route), on the node subnet in legacy shared mode. The
+# .59 convention matches node addressing (CPs from .60).
+sub vip_for {
+    my ($scfg) = @_;
+
+    my $subnet = $scfg->{'public-subnet'}
+        // $scfg->{'node-subnet'} // '';
+    return $subnet =~ m|^(\d+\.\d+\.\d+)\.| ? "$1.59" : undef;
 }
 
 1;
