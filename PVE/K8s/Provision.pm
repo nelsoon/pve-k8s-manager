@@ -209,13 +209,23 @@ sub exec_pending {
 }
 
 # In-cluster add-ons (CCM/CSI) call back into the PVE API.
-# They must use a real host address: the node gateway is a
-# host interface in the L2/VXLAN design but only an anycast
-# SVI inside a VRF in the EVPN design, where no pveproxy
-# listens. Resolve this host's own name (its management IP)
-# and fall back to the gateway for exotic setups.
+# Shared-VNet mode: use this host's management address -
+# the node gateway there is a single host's interface,
+# and the management net is reachable from the VNet.
+# Dedicated-VNet mode (T3.4 re-spec): the node subnet
+# lives inside a tenant VRF that deliberately has no
+# route to the management net (CCM got connection
+# refused there in the lab), so use the internal gateway
+# instead: it is the anycast SVI present on every host,
+# pveproxy binds *:8006, and whichever host owns the
+# SVI answers with the full cluster API. The old belief
+# that no pveproxy listens on the SVI did not survive
+# contact with ss -ltn; the T3.4-era failure was the
+# wedged-daemon period, not the bind.
 sub pve_api_url {
-    my ($gateway) = @_;
+    my ($gateway, $dedicated) = @_;
+
+    return "https://$gateway:8006/api2/json" if $dedicated;
 
     require Sys::Hostname;
     my $name = Sys::Hostname::hostname();
@@ -814,6 +824,15 @@ my sub ensure_cluster_vnet {
     if (!$existing) {
         if (!$vni) {
             my %used = map { ($_->{tag} // 0) => 1 } $vnets->@*;
+            # The zone's VRF VXLAN tag shares the VNI space:
+            # an L2 VNI equal to it makes the VNet's VXLAN
+            # device collide with the VRF's, and inter-host
+            # MAC/IP learning in the new VNet silently dies
+            # (T3.4 lab proof: nodes could reach gateways but
+            # not each other). 10000 is the PVE default VRF
+            # tag, so this is the common case, not an edge.
+            $used{$z->{'vrf-vxlan'}} = 1
+                if $z->{'vrf-vxlan'};
             $vni = 10000;
             $vni++ while $used{$vni};
         }
@@ -829,17 +848,50 @@ my sub ensure_cluster_vnet {
             || ($scfg->{'sdn-vni'} // 0) != ($vni // 0);
 
     my $subnets = sdn_get("/cluster/sdn/vnets/$vnet/subnets");
-    my %have = map { ($_->{subnet} // '') => 1 } $subnets->@*;
-    for my $cidr ($scfg->{'node-subnet'},
-                  $scfg->{'public-subnet'}) {
+    # SDN subnet objects carry the CIDR in 'cidr'; their
+    # 'subnet' field is the object ID (zone-cidr mangled).
+    # Keying existence on the ID made every provision
+    # resume die with "already defined" (T3.4 lab proof).
+    my %have = map { ($_->{cidr} // '') => 1 } $subnets->@*;
+    # Egress NAT belongs on the INTERNAL subnet only: node
+    # traffic leaves the VRF via the zone exit nodes and
+    # needs SNAT to come back, while SNAT on the public
+    # subnet would rewrite LoadBalancer return traffic to
+    # the host IP and break external LB access (T3.4 lab
+    # finding). Found by the T3.4 lab proof: with snat=0
+    # everywhere, nodes had no egress at all - DNS timed
+    # out, the CRI sandbox image never pulled, and the
+    # control plane never initialised.
+    for my $spec ([$scfg->{'node-subnet'}, 1],
+                  [$scfg->{'public-subnet'}, 0]) {
+        my ($cidr, $snat) = @$spec;
         next if $have{$cidr};
         my ($gw) = $cidr =~ m|^(\d+\.\d+\.\d+\.)0/24$|;
         run(['pvesh', 'create', "/cluster/sdn/vnets/$vnet/subnets",
             '--type', 'subnet', '--subnet', $cidr,
-            '--gateway', "${gw}1", '--snat', 0], timeout => 60);
-        print "created subnet $cidr in VNet $vnet\n";
+            '--gateway', "${gw}1", '--snat', $snat],
+            timeout => 60);
+        print "created subnet $cidr in VNet $vnet (snat $snat)\n";
     }
     run(['pvesh', 'set', '/cluster/sdn'], timeout => 120);
+
+    # CCM/CSI reach the PVE API through the tenant VRF's
+    # anycast gateway SVI; pveproxy listens in the default
+    # VRF, so hosts need tcp_l3mdev_accept or those
+    # connections silently die (T3.4 lab proof run 4). The
+    # .deb ships /etc/sysctl.d/99-pve-k8s-vrf.conf for
+    # persistence; set it live here too so upgraded hosts
+    # work without waiting for a reboot.
+    for my $host (pve_online_nodes()->@*) {
+        my $ok = eval {
+            host_run_on($host, 'sysctl', '-w',
+                'net.ipv4.tcp_l3mdev_accept=1');
+            1;
+        };
+        print "WARNING: could not set tcp_l3mdev_accept "
+            . "on $host; CCM/CSI API access via the VRF "
+            . "gateway will fail there\n" if !$ok;
+    }
     return $vnet;
 }
 
@@ -1374,7 +1426,7 @@ sub provision_cluster {
     # --- Proxmox CCM: scoped token in, providerIDs out
     my ($token_id, $token_secret) = ensure_ccm_credentials($name);
     my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
-        pve_api_url($gateway),
+        pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
         $token_id, $token_secret, pve_cluster_region());
     # Nodes that predate the external kubelet flag never got the
     # uninitialized taint that makes the CCM initialise them
@@ -1408,7 +1460,7 @@ sub provision_cluster {
     # --- Proxmox CSI: shared-block (default) + local-block classes
     my ($csi_token_id, $csi_secret) = ensure_csi_credentials($name);
     my $csi_values = PVE::K8s::Addons::csi_values_yaml(
-        pve_api_url($gateway),
+        pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
         $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::csi_install_cmd(
         '/root/local-super-admin.conf', $csi_values));

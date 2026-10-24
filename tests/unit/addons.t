@@ -157,8 +157,10 @@ my $prov = do {
     <$fh>;
 };
 like($prov, qr/sub pve_api_url/, 'PVE API URL helper exists');
-is(scalar(() = $prov =~ /pve_api_url\(\$gateway\)/g), 2,
-    'CCM and CSI both use the host API address, not the gateway');
+is(scalar(() = $prov =~ /pve_api_url\(\$gateway, \$scfg->\{'sdn-zone'\}/g), 2,
+    'CCM and CSI both pass the dedicated-mode flag to the API URL helper');
+like($prov, qr/return "https:\/\/\$gateway:8006\/api2\/json" if \$dedicated/,
+    'dedicated mode reaches the API via the anycast gateway SVI');
 unlike($prov, qr/"https:\/\/\$gateway:8006\/api2\/json",\n\s+\$token_id/,
     'the gateway IP is no longer the API endpoint for add-ons');
 

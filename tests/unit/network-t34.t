@@ -23,6 +23,12 @@ like($prov, qr/'create', '\/cluster\/sdn\/vnets'/,
     'the VNet is created through the SDN API');
 like($prov, qr/vnets\/\$vnet\/subnets/,
     'internal and public subnets are created in the VNet');
+like($prov, qr/\[\$scfg->\{'node-subnet'\}, 1\]/,
+    'the internal subnet gets egress SNAT via the exit nodes');
+like($prov, qr/\[\$scfg->\{'public-subnet'\}, 0\]/,
+    'the public subnet gets no SNAT (LB return traffic stays clean)');
+like($prov, qr/\$used\{\$z->\{'vrf-vxlan'\}\} = 1/,
+    'VNI allocation skips the zone VRF VXLAN tag (device collision)');
 like($prov, qr/'set', '\/cluster\/sdn'/,
     'SDN changes are applied');
 like($prov, qr/sub remove_cluster_vnet/,
@@ -37,6 +43,17 @@ like($prov, qr/virtio=\$mac,bridge=\$bridge/,
     'cloned VMs are re-attached from the template bridge to the dedicated VNet');
 like($prov, qr/PVE::K8s::Config::vip_for\(\$scfg\)/,
     'apiserver VIP comes from the shared subnet helper');
+like($prov, qr/tcp_l3mdev_accept=1/,
+    'VNet setup enables VRF-to-pveproxy TCP acceptance on hosts');
+like($prov, qr/\$_->\{cidr\} \/\/ ''/,
+    'subnet existence is keyed on cidr, so provision resumes are idempotent');
+my $mk = do {
+    open my $fh, '<', 'Makefile' or die $!;
+    local $/;
+    <$fh>;
+};
+like($mk, qr/99-pve-k8s-vrf\.conf/,
+    'the package ships the l3mdev sysctl for persistence');
 unlike($prov, qr/cilium_bgp|lb-mode/,
     'no Cilium BGP or lb-mode remains in provisioning');
 

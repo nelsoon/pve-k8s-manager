@@ -42,6 +42,12 @@ deb:
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
 		systemd/pve-k8s-backup.service systemd/pve-k8s-backup.timer \
 		$(STAGE)/lib/systemd/system/
+	@mkdir -p $(STAGE)/etc/sysctl.d
+	@install -m 0644 systemd/99-pve-k8s-vrf.conf \
+		$(STAGE)/etc/sysctl.d/99-pve-k8s-vrf.conf
+	@printf '#!/bin/sh\nset -e\nif [ "$$1" = configure ]; then\n  sysctl -q -p /etc/sysctl.d/99-pve-k8s-vrf.conf || true\nfi\nexit 0\n' \
+		> $(STAGE)/DEBIAN/postinst
+	@chmod 0755 $(STAGE)/DEBIAN/postinst
 	@printf 'Package: $(PACKAGE)\nVersion: $(VERSION)\nArchitecture: all\nMaintainer: pve-k8s contributors\nDescription: Kubernetes cluster management for Proxmox VE\n Provisions and manages kubeadm Kubernetes clusters on Proxmox\n VMs from the Proxmox web UI, using Proxmox SDN and storage.\n' > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEB) >/dev/null
 	@echo "built $(DEB)"
