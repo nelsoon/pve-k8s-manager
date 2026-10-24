@@ -1481,6 +1481,50 @@ sub provision_cluster {
         if !$csi_ok;
     print "Proxmox CSI installed (shared-block default, local-block)\n";
 
+    # Record whether the cluster storage is shared across
+    # hosts: on node-local storage, shared-block volumes
+    # effectively pin pods to nodes on one fabric host
+    # (T3.6a steering). Surfaced in the cluster config so
+    # API/UI consumers can warn without re-deriving it.
+    my $storages = eval {
+        decode_pvesh_json(run(['pvesh', 'get', '/storage',
+            '--output-format', 'json'], timeout => 60));
+    } // [];
+    my ($stor) = grep { ($_->{storage} // '') eq $storage }
+        $storages->@*;
+    if ($stor) {
+        my $shared = $stor->{shared} // 0;
+        PVE::K8s::Config::lock_config(sub {
+            my $locked = PVE::K8s::Config->config();
+            $locked->{ids}->{$name}->{'storage-shared'} =
+                $shared ? 1 : 0;
+            PVE::K8s::Config::store_config($locked);
+        });
+        print "WARNING: storage '$storage' is node-local: "
+            . "shared-block volumes will pin pods to nodes "
+            . "on a single fabric host\n" if !$shared;
+    }
+
+    # --- T3.6a: shared-file (RWX) tier, when configured.
+    if (my $backend = $scfg->{'file-backend'}) {
+        my $server = $scfg->{'file-server'};
+        my $ok = eval {
+            guest_exec($cp1->{vmid},
+                "timeout 6 bash -c '</dev/tcp/$server/2049' "
+                . "&& echo nfs-reachable");
+            1;
+        };
+        die "NFS server $server:2049 is not reachable from "
+            . "cluster nodes; create the export (restricted "
+            . "to the node subnet) and re-run provision\n"
+            if !$ok;
+        guest_exec($cp1->{vmid},
+            PVE::K8s::Addons::nfs_csi_install_cmd(
+                '/root/local-super-admin.conf', $scfg));
+        print "Shared-file tier installed (backend $backend, "
+            . "class shared-file)\n";
+    }
+
     # --- LoadBalancer pool: explicit lb-range, else the
     # public subnet's .100-.120 in dedicated-VNet mode.
     my $range = $scfg->{'lb-range'};

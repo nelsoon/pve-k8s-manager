@@ -103,6 +103,26 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     fieldLabel: gettext('Public Subnet (LB/VIP)'),
                     emptyText: '192.168.212.0/24',
                 },
+                {
+                    xtype: 'combobox',
+                    name: 'file-backend',
+                    fieldLabel: gettext('Shared-File (RWX) Backend'),
+                    store: ['', 'nfs'],
+                    value: '',
+                    editable: false,
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'file-server',
+                    fieldLabel: gettext('NFS Server'),
+                    emptyText: gettext('only for Shared-File nfs'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'file-share',
+                    fieldLabel: gettext('NFS Export Path'),
+                    emptyText: '/srv/k8s',
+                },
             ],
         });
 

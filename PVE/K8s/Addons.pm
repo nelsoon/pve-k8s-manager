@@ -162,6 +162,58 @@ storageClass:
 EOF
 }
 
+# --- T3.6a: shared-file (RWX) tier over NFS -------------
+# The driver mounts from each node straight to the NFS
+# server; Proxmox is not in the data path. Per-PVC
+# subdirectories under the export are created by the
+# driver - nobody creates directories by hand. The export
+# itself (and its no_root_squash tradeoff) stays a
+# one-time admin task on the server.
+our $NFS_CSI_VERSION = '4.11.0';
+
+sub shared_file_class_yaml {
+    my ($scfg) = @_;
+
+    my ($server, $share) = $scfg->@{qw(file-server file-share)};
+    die "shared-file class needs file-server and file-share\n"
+        if !$server || !$share;
+    return <<EOF;
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: shared-file
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: $server
+  share: $share
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1
+EOF
+}
+
+sub nfs_csi_install_cmd {
+    my ($kubeconfig, $scfg) = @_;
+
+    my $class_yaml = shared_file_class_yaml($scfg);
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $NFS_CSI_VERSION, $class_yaml);
+%s
+export KUBECONFIG=%s
+helm repo add csi-driver-nfs \
+    https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts \
+    >/dev/null 2>&1 || true
+helm repo update csi-driver-nfs >/dev/null
+helm upgrade -i -n kube-system csi-driver-nfs \
+    csi-driver-nfs/csi-driver-nfs --version %s \
+    --set storageClass.create=false
+kubectl apply -f - <<'CLASS'
+%sCLASS
+kubectl -n kube-system rollout status \
+    deploy/csi-nfs-controller --timeout=600s
+EOF
+}
+
 sub csi_install_cmd {
     my ($kubeconfig, $values_yaml) = @_;
 

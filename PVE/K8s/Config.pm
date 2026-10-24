@@ -101,6 +101,33 @@ my $defaultData = {
             description => "LoadBalancer address range, e.g. '192.168.200.100-192.168.200.120'.",
             optional => 1,
         },
+        'file-backend' => {
+            type => 'string',
+            description => "Shared-file (RWX) tier backend "
+                . "(T3.6a): nfs against an admin-registered "
+                . "NFS server/share. cephfs is reserved for "
+                . "a later step and rejected at create.",
+            optional => 1,
+        },
+        'file-server' => {
+            type => 'string',
+            description => "NFS server (IP or host) for "
+                . "file-backend nfs.",
+            optional => 1,
+        },
+        'file-share' => {
+            type => 'string',
+            description => "NFS export path for file-backend "
+                . "nfs, e.g. /srv/k8s.",
+            optional => 1,
+        },
+        'storage-shared' => {
+            type => 'integer',
+            description => "Recorded by the provisioner: "
+                . "whether the cluster storage is shared "
+                . "across PVE hosts (drives pinning warnings).",
+            optional => 1,
+        },
         'sdn-zone' => {
             type => 'string',
             description => "Proxmox SDN EVPN zone for a dedicated "
@@ -218,6 +245,10 @@ sub options {
         'scaler-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },
         addons => { optional => 1 },
+        'file-backend' => { optional => 1 },
+        'file-server' => { optional => 1 },
+        'file-share' => { optional => 1 },
+        'storage-shared' => { optional => 1 },
         'sdn-zone' => { optional => 1 },
         'public-subnet' => { optional => 1 },
         'sdn-vnet' => { optional => 1 },
@@ -381,6 +412,30 @@ sub assert_network_config {
     die "public-subnet must differ from node-subnet\n"
         if $public eq $node_subnet;
     return 'dedicated';
+}
+
+# T3.6a: the shared-file (RWX) tier. NFS first: any admin
+# NFS server/share, validated for reachability at
+# provision time; per-PVC subdirectories are created by
+# the CSI driver, nobody creates directories by hand.
+# CephFS (auto-managed when hyper-converged through the
+# PVE Ceph API) is the recorded second backend and is
+# rejected until it lands, rather than half-created.
+sub assert_file_config {
+    my ($param) = @_;
+
+    my $backend = $param->{'file-backend'} or return undef;
+    die "file-backend must be nfs (cephfs lands in a later "
+        . "step of T3.6a)\n"
+        if $backend ne 'nfs';
+    my ($server, $share) = $param->@{qw(file-server file-share)};
+    die "file-backend nfs needs file-server and file-share\n"
+        if !$server || !$share;
+    die "file-server '$server' is not an IPv4 address\n"
+        if $server !~ /^\d+\.\d+\.\d+\.\d+$/;
+    die "file-share '$share' is not an absolute export path\n"
+        if $share !~ m|^/[A-Za-z0-9._/-]*$|;
+    return $backend;
 }
 
 # Deterministic short VNet id for a dedicated cluster VNet

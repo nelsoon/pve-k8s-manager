@@ -130,6 +130,23 @@ __PACKAGE__->register_method({
                     . "IPs and the apiserver VIP, e.g. "
                     . "'192.168.212.0/24' (dedicated mode).",
             },
+            'file-backend' => {
+                type => 'string',
+                pattern => '^(nfs)$',
+                optional => 1,
+                description => "Shared-file (RWX) tier "
+                    . "backend (T3.6a): nfs.",
+            },
+            'file-server' => {
+                type => 'string',
+                optional => 1,
+                description => "NFS server IPv4 (file-backend nfs).",
+            },
+            'file-share' => {
+                type => 'string',
+                optional => 1,
+                description => "NFS export path, e.g. /srv/k8s.",
+            },
             'backup-dir' => {
                 type => 'string',
                 optional => 1,
@@ -160,6 +177,7 @@ __PACKAGE__->register_method({
         # new clusters only on upstream-supported minors
         PVE::K8s::Config::assert_supported_version($param->{'k8s-version'});
         PVE::K8s::Config::assert_network_config($param);
+        PVE::K8s::Config::assert_file_config($param);
         # validate pools eagerly so a bad pool spec fails at
         # create time, not halfway through provisioning
         PVE::K8s::Config::parse_pools($param->{pools}, $param->{workers} // 2)
@@ -180,7 +198,8 @@ __PACKAGE__->register_method({
                 (map { $param->{$_} ? ($_ => $param->{$_}) : () }
                     qw(node-subnet gateway lb-range pools storage
                         maintenance-window backup-dir sdn-zone
-                        public-subnet
+                        public-subnet file-backend file-server
+                        file-share
                         backup-retention description)),
             };
 
