@@ -236,7 +236,7 @@ provisioner: cephfs.csi.ceph.com
 parameters:
   clusterID: $fsid
   fsName: $fs
-  pool: ${fs}_data
+  pool: cephfs.${fs}.data
   csi.storage.k8s.io/provisioner-secret-name: csi-cephfs-secret
   csi.storage.k8s.io/provisioner-secret-namespace: kube-system
   csi.storage.k8s.io/controller-expand-secret-name: csi-cephfs-secret
@@ -264,6 +264,12 @@ csiConfig:
   - clusterID: "%s"
     monitors: [%s]
     cephFS: {}
+# The chart default of 3 provisioner replicas with pod
+# anti-affinity cannot schedule on small clusters (the
+# common 1-2 worker case); the provisioner is
+# leader-elected, so one replica is correct at v1 scale.
+provisioner:
+  replicaCount: 1
 storageClass:
   create: false
 VALUES

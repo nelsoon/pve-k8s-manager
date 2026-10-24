@@ -977,12 +977,21 @@ sub delete_cluster {
     if (($scfg->{'file-backend'} // '') eq 'cephfs'
         && $scfg->{'file-share'}) {
         my $fs = $scfg->{'file-share'};
-        my $gone = eval {
-            ceph_cli('auth', 'del', "client.k8s-$name");
-            ceph_cli('fs', 'volume', 'rm', $fs,
-                '--yes-i-really-mean-it');
-            1;
-        } // 0;
+        # ceph_cli swallows command errors by design (it
+        # probes hosts), so success is verified, not
+        # assumed. Pool deletion is disabled by default
+        # (mon_allow_pool_delete); toggle it around the
+        # removal and always restore it.
+        ceph_cli('auth', 'del', "client.k8s-$name");
+        ceph_cli('config', 'set', 'mon',
+            'mon_allow_pool_delete', 'true');
+        ceph_cli('fs', 'volume', 'rm', $fs,
+            '--yes-i-really-mean-it');
+        ceph_cli('config', 'set', 'mon',
+            'mon_allow_pool_delete', 'false');
+        my $left = ceph_cli_json('fs', 'ls') // [];
+        my $gone = !grep { ($_->{name} // '') eq $fs }
+            $left->@*;
         print $gone
             ? "removed CephFS filesystem $fs and its CSI user\n"
             : "WARNING: CephFS filesystem $fs cleanup did "
@@ -1271,15 +1280,29 @@ sub ceph_cli {
     return undef;
 }
 
+# Ceph answers with an object or an array depending on
+# the command; start at whichever opener comes first
+# (preferring '{' silently corrupts array answers), and
+# parse incrementally: several commands print human text
+# after the JSON ("dumped monmap epoch 3"), which a
+# strict decode rejects as trailing garbage.
+sub parse_ceph_json {
+    my ($out) = @_;
+
+    return undef if !defined $out;
+    my @starts = grep { $_ >= 0 }
+        map { index($out // '', $_) } ('[', '{');
+    return undef if !@starts;
+    my $start = $starts[0];
+    $start = $starts[1] if @starts > 1 && $starts[1] < $start;
+    return eval {
+        JSON::PP->new->incr_parse(substr($out, $start)) };
+}
+
 sub ceph_cli_json {
     my (@args) = @_;
 
-    my $out = ceph_cli(@args, '-f', 'json');
-    return undef if !defined $out;
-    my $start = index($out, '{');
-    $start = index($out, '[') if $start < 0;
-    return undef if $start < 0;
-    return eval { JSON::PP->new->decode(substr($out, $start)) };
+    return parse_ceph_json(ceph_cli(@args, '-f', 'json'));
 }
 
 sub install_file_tier {
@@ -1351,12 +1374,48 @@ sub install_file_tier {
         }
         print "created CephFS filesystem $fs\n";
     }
+    # ceph-csi provisions into the 'csi' subvolume group
+    # but does not create it (CreateVolume dies with
+    # "subvolume group 'csi' does not exist"); create it
+    # here, where we run with admin rights anyway.
+    my $groups = ceph_cli_json('fs', 'subvolumegroup', 'ls',
+        $fs) // [];
+    if (!grep { ($_->{name} // '') eq 'csi' } $groups->@*) {
+        ceph_cli('fs', 'subvolumegroup', 'create', $fs, 'csi');
+        print "created CephFS subvolume group csi in $fs\n";
+    }
+
+    # A filesystem without an active MDS is offline, and
+    # creating the fs does not create the daemon. Ensure
+    # one on this host and wait for it to become active.
+    my $mds_ok = 0;
+    for (1 .. 60) {
+        my $stat = ceph_cli('mds', 'stat') // '';
+        if ($stat =~ /up:active/) { $mds_ok = 1; last }
+        if ($_ == 1) {
+            eval { host_run_on(local_node_name(),
+                'pveceph', 'mds', 'create') };
+        }
+        sleep 5;
+    }
+    die "no active Ceph MDS for filesystem $fs; create "
+        . "one (pveceph mds create) and re-run provision\n"
+        if !$mds_ok;
+
     my $user = "k8s-$name";
-    my $auth = ceph_cli_json('auth', 'get-or-create',
-        "client.$user",
-        'mon', 'allow r', 'mgr', 'allow rw',
+    # ceph-csi stores subvolume metadata in the meta
+    # pool and volume data in the data pool; both belong
+    # in the osd cap or CreateVolume dies with rados
+    # EPERM (seen in the lab).
+    my @caps = ('mon', 'allow r', 'mgr', 'allow rw',
         'mds', 'allow rwp',
-        'osd', "allow rw pool=${fs}_data");
+        'osd', "allow rw pool=cephfs.${fs}.data, "
+            . "allow rw pool=cephfs.${fs}.meta");
+    ceph_cli_json('auth', 'get-or-create', "client.$user", @caps);
+    # get-or-create does not repair caps of a user left by
+    # an earlier attempt; enforce them, then read the key.
+    ceph_cli('auth', 'caps', "client.$user", @caps);
+    my $auth = ceph_cli_json('auth', 'get', "client.$user");
     my $key = ($auth->[0] // {})->{key};
     die "could not create CephX user client.$user\n" if !$key;
     my $mons = [];
@@ -1376,7 +1435,7 @@ sub install_file_tier {
             '/root/local-super-admin.conf', $fsid, $fs,
             $mons, $user, $key));
     my $df = ceph_cli_json('df') // {};
-    my ($pool) = grep { ($_->{name} // '') eq "${fs}_data" }
+    my ($pool) = grep { ($_->{name} // '') eq "cephfs.${fs}.data" }
         ($df->{pools} // [])->@*;
     record_file_state($name, { backend => 'cephfs', ok => 1,
         fs => $fs,

@@ -11,6 +11,7 @@ use Test::More;
 
 use PVE::K8s::Config;
 use PVE::K8s::Addons;
+use PVE::K8s::Provision;
 
 is(PVE::K8s::Config::assert_file_config({}), undef,
     'no file backend is allowed (tier is opt-in)');
@@ -46,8 +47,9 @@ like($ceph_class, qr/provisioner: cephfs\.csi\.ceph\.com/,
     'cephfs class uses the ceph-csi driver');
 like($ceph_class, qr/fsName: k8s-lab11/,
     'cephfs class points at the cluster filesystem');
-like($ceph_class, qr/pool: k8s-lab11_data/,
-    'cephfs class uses the filesystem data pool');
+like($ceph_class, qr/pool: cephfs\.k8s-lab11\.data/,
+    'cephfs class uses the PVE data pool name '
+    . '(cephfs.<fs>.data, not <fs>_data)');
 my $ceph_install = PVE::K8s::Addons::cephfs_csi_install_cmd(
     '/root/kc', 'fsid-123', 'k8s-lab11',
     ['192.168.200.11:6789'], 'k8s-lab11', 'KEY==');
@@ -55,6 +57,26 @@ like($ceph_install, qr/ceph-csi-cephfs --version \Q$PVE::K8s::Addons::CEPH_CSI_V
     'ceph-csi chart version is pinned');
 like($ceph_install, qr/userID=k8s-lab11/,
     'cephfs secret carries the scoped CephX user');
+like($ceph_install, qr/provisioner:\n  replicaCount: 1/,
+    'cephfs provisioner runs 1 replica (chart default 3 '
+    . 'cannot schedule on small clusters)');
+my $auth = PVE::K8s::Provision::parse_ceph_json(
+    '[{"entity":"client.k8s-x","key":"KEY==","caps":{}}]');
+is(($auth->[0] // {})->{key}, 'KEY==',
+    'ceph array JSON (auth get) parses from the [ opener');
+my $fslist = PVE::K8s::Provision::parse_ceph_json(
+    '[{"name":"k8s-lab11"}]');
+is($fslist->[0]{name}, 'k8s-lab11',
+    'ceph fs ls array JSON parses');
+ok(PVE::K8s::Provision::parse_ceph_json('{"a":1}'),
+    'ceph object JSON parses');
+my $dump = PVE::K8s::Provision::parse_ceph_json(
+    '{"mons":[{"addr":"10.0.0.1:6789/0"}]}'
+    . "\ndumped monmap epoch 3");
+is($dump->{mons}[0]{addr}, '10.0.0.1:6789/0',
+    'ceph JSON with trailing human text still parses '
+    . '(mon dump appends "dumped monmap...")');
+
 my $probe = PVE::K8s::Addons::nfs_probe_cmd({
     'file-server' => '192.168.200.11',
     'file-share' => '/srv/k8s' });
@@ -96,6 +118,18 @@ like($prov, qr/storage-shared/,
     'provision records the block storage shared flag');
 like($prov, qr/shared-block volumes will pin pods/,
     'node-local storage raises the pinning warning');
+like($prov, qr/allow rw pool=cephfs\.\$\{fs\}\.data, /,
+    'CSI CephX osd cap covers the data pool');
+like($prov, qr/allow rw pool=cephfs\.\$\{fs\}\.meta/,
+    'CSI CephX osd cap covers the metadata pool '
+    . '(CreateVolume EPERMs without it)');
+like($prov, qr/subvolumegroup.*create.*csi/s,
+    'provision creates the csi subvolume group ceph-csi '
+    . 'expects to exist');
+like($prov, qr/mon_allow_pool_delete/,
+    'delete toggles mon_allow_pool_delete around the '
+    . 'filesystem removal (Ceph refuses pool deletion '
+    . 'otherwise)');
 
 my $api = do {
     open my $fh, '<', 'PVE/API2/Cluster/K8s.pm' or die $!;
