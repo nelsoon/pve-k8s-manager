@@ -26,6 +26,27 @@ unlike($runcmd, qr/^\s*timeouts:/m,
     'kubeadm config carries no invalid timeouts field (strict decoding rejects it)');
 unlike($runcmd, qr/flannel/,
     'CNI is not applied from cloud-init (VIP may not be up yet)');
+my $runcmd_ip = PVE::K8s::Provision::kubeadm_init_runcmd(
+    '192.168.200.59', '192.168.200.60');
+like($runcmd_ip, qr/kind: InitConfiguration\n    nodeRegistration:\n      kubeletExtraArgs:\n      - \{name: node-ip, value: "192\.168\.200\.60"\}/,
+    'init pins kubelet --node-ip so the CCM can publish InternalIP');
+my $prov_src = do {
+    open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
+    local $/;
+    <$fh>;
+};
+like($prov_src, qr/sub ensure_kubelet_node_ip/,
+    'joined/rolled nodes get their node-ip pinned too');
+is((() = $prov_src =~ /ensure_kubelet_node_ip\(\$/g), 3,
+    'node-ip is ensured for cp1, joined nodes, and rolled nodes');
+my $flags_cmd = PVE::K8s::Provision::node_ip_flags_cmd(
+    '192.168.200.70');
+like($flags_cmd, qr/s\/"\$\/ --node-ip=192\.168\.200\.70"\//,
+    'flags edit appends --node-ip before the closing quote '
+    . '(a literal \$ anchor here silently no-ops in the lab)');
+like($flags_cmd, qr/s\/--node-ip=\[0-9\.\]\+\/--node-ip=/,
+    'flags edit rewrites a stale node-ip in place');
+
 like($runcmd, qr/heartbeat-interval, value: "500"/,
     'etcd heartbeat is tuned for slower (e.g. nested/shared) storage');
 like($runcmd, qr/election-timeout, value: "5000"/,

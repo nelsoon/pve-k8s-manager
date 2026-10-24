@@ -105,8 +105,18 @@ my $defaultData = {
             type => 'string',
             description => "Shared-file (RWX) tier backend "
                 . "(T3.6a): nfs against an admin-registered "
-                . "NFS server/share. cephfs is reserved for "
-                . "a later step and rejected at create.",
+                . "NFS server/share, or cephfs auto-managed "
+                . "on a hyper-converged PVE Ceph cluster "
+                . "(filesystem + scoped CephX user created "
+                . "for the cluster; Ceph itself is never "
+                . "deployed by the plugin).",
+            optional => 1,
+        },
+        'file-state' => {
+            type => 'string',
+            description => "Shared-file tier probe result "
+                . "recorded by the provisioner (JSON: "
+                . "backend, ok, capacity/free bytes, time).",
             optional => 1,
         },
         'file-server' => {
@@ -246,6 +256,7 @@ sub options {
         'retired-nodes' => { optional => 1 },
         addons => { optional => 1 },
         'file-backend' => { optional => 1 },
+        'file-state' => { optional => 1 },
         'file-server' => { optional => 1 },
         'file-share' => { optional => 1 },
         'storage-shared' => { optional => 1 },
@@ -414,20 +425,22 @@ sub assert_network_config {
     return 'dedicated';
 }
 
-# T3.6a: the shared-file (RWX) tier. NFS first: any admin
-# NFS server/share, validated for reachability at
-# provision time; per-PVC subdirectories are created by
-# the CSI driver, nobody creates directories by hand.
-# CephFS (auto-managed when hyper-converged through the
-# PVE Ceph API) is the recorded second backend and is
-# rejected until it lands, rather than half-created.
+# T3.6a: the shared-file (RWX) tier. NFS: any admin NFS
+# server/share, validated for reachability at provision
+# time; per-PVC subdirectories are created by the CSI
+# driver, nobody creates directories by hand. CephFS:
+# auto-managed when a hyper-converged PVE Ceph cluster
+# exists (the provisioner creates the filesystem and a
+# scoped CephX CSI user through the PVE/Ceph APIs); the
+# plugin never deploys Ceph itself, and provisioning a
+# cephfs cluster without a Ceph cluster fails cleanly.
 sub assert_file_config {
     my ($param) = @_;
 
     my $backend = $param->{'file-backend'} or return undef;
-    die "file-backend must be nfs (cephfs lands in a later "
-        . "step of T3.6a)\n"
-        if $backend ne 'nfs';
+    die "file-backend must be nfs or cephfs\n"
+        if $backend ne 'nfs' && $backend ne 'cephfs';
+    return $backend if $backend eq 'cephfs';
     my ($server, $share) = $param->@{qw(file-server file-share)};
     die "file-backend nfs needs file-server and file-share\n"
         if !$server || !$share;
@@ -436,6 +449,16 @@ sub assert_file_config {
     die "file-share '$share' is not an absolute export path\n"
         if $share !~ m|^/[A-Za-z0-9._/-]*$|;
     return $backend;
+}
+
+# CephFS filesystem name owned by one cluster; recorded
+# back into file-share so delete knows what it may remove.
+sub cephfs_name {
+    my ($name) = @_;
+
+    my $clean = lc $name;
+    $clean =~ s/[^a-z0-9]/-/g;
+    return "k8s-$clean";
 }
 
 # Deterministic short VNet id for a dedicated cluster VNet

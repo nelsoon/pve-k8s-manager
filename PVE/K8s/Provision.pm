@@ -549,12 +549,18 @@ EOF
 }
 
 sub kubeadm_init_runcmd {
-    my ($vip) = @_;
+    my ($vip, $ip) = @_;
 
-    return sprintf(<<'EOF', $vip);
+    return sprintf(<<'EOF', $vip, $ip // '');
   - |
     KVER=$(kubeadm version -o short)
     cat > /root/kubeadm-config.yaml <<YAML
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+      - {name: node-ip, value: "%2$s"}
+    ---
     apiVersion: kubeadm.k8s.io/v1beta4
     kind: ClusterConfiguration
     kubernetesVersion: $KVER
@@ -964,6 +970,25 @@ sub delete_cluster {
 
     remove_cluster_vnet($name, $scfg);
 
+    # A cephfs cluster owns its filesystem + CephX user;
+    # remove both (best effort with a warning: the PVE
+    # Ceph cluster must survive a failed cleanup here,
+    # and an operator can remove a leftover fs by hand).
+    if (($scfg->{'file-backend'} // '') eq 'cephfs'
+        && $scfg->{'file-share'}) {
+        my $fs = $scfg->{'file-share'};
+        my $gone = eval {
+            ceph_cli('auth', 'del', "client.k8s-$name");
+            ceph_cli('fs', 'volume', 'rm', $fs,
+                '--yes-i-really-mean-it');
+            1;
+        } // 0;
+        print $gone
+            ? "removed CephFS filesystem $fs and its CSI user\n"
+            : "WARNING: CephFS filesystem $fs cleanup did "
+                . "not complete; remove it manually\n";
+    }
+
     PVE::K8s::Config::lock_config(sub {
         my $locked = PVE::K8s::Config->config();
         delete $locked->{ids}->{$name};
@@ -995,6 +1020,31 @@ sub set_external_cloud_provider {
         'grep -q cloud-provider=external /var/lib/kubelet/kubeadm-flags.env '
         . '|| sed -i \'s/"$/ --cloud-provider=external"/\' '
         . '/var/lib/kubelet/kubeadm-flags.env; systemctl restart kubelet');
+}
+
+# The Proxmox CCM publishes the node InternalIP from
+# kubelet's provided-node-ip annotation, which only exists
+# when kubelet is told its IP: without --node-ip, nodes
+# register with a hostname only and the apiserver cannot
+# reach kubelets (kubectl exec/logs fail on DNS). Pin the
+# provisioned IP into the kubeadm kubelet flags; a restart
+# re-registers the node addresses. Idempotent, and a
+# changed IP is rewritten.
+sub node_ip_flags_cmd {
+    my ($ip) = @_;
+
+    return "F=/var/lib/kubelet/kubeadm-flags.env; "
+        . "if grep -q -- '--node-ip=' \$F; then "
+        . "sed -i -E 's/--node-ip=[0-9.]+/--node-ip=$ip/' \$F; "
+        . "else sed -i 's/\"\$/ --node-ip=$ip\"/' \$F; fi; "
+        . 'systemctl restart kubelet';
+}
+
+sub ensure_kubelet_node_ip {
+    my ($node) = @_;
+
+    my $ip = $node->{ip} or return;
+    guest_exec($node->{vmid}, node_ip_flags_cmd($ip));
 }
 
 # Node list for a cluster from its config: control plane
@@ -1187,6 +1237,157 @@ my sub assert_cluster_hosts_online {
 
 sub check_retired_ghosts;
 
+# --- T3.6a shared-file tier -------------------------------
+# Both backends end at the same place: a shared-file
+# StorageClass plus a recorded probe (file-state) that the
+# add-ons view renders. NFS is validated from inside a
+# node (mount + write + df). CephFS is auto-managed on a
+# hyper-converged PVE Ceph cluster - filesystem and
+# scoped CephX user created here; Ceph itself is never
+# deployed by the plugin.
+sub record_file_state {
+    my ($name, $state) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        $locked->{ids}->{$name}->{'file-state'} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($locked);
+    });
+}
+
+# Run a ceph CLI command on the first PVE host that has a
+# working Ceph CLI/config; returns stdout or undef.
+sub ceph_cli {
+    my (@args) = @_;
+
+    my $hosts = eval { pve_online_nodes() } // [];
+    $hosts = [local_node_name()] if !$hosts->@*;
+    for my $host ($hosts->@*) {
+        my $out = eval {
+            host_run_on($host, 'ceph', @args) } // '';
+        return $out if $out ne '' && !$@;
+    }
+    return undef;
+}
+
+sub ceph_cli_json {
+    my (@args) = @_;
+
+    my $out = ceph_cli(@args, '-f', 'json');
+    return undef if !defined $out;
+    my $start = index($out, '{');
+    $start = index($out, '[') if $start < 0;
+    return undef if $start < 0;
+    return eval { JSON::PP->new->decode(substr($out, $start)) };
+}
+
+sub install_file_tier {
+    my ($name, $scfg, $cp1, $nodes) = @_;
+
+    my $backend = $scfg->{'file-backend'};
+    if ($backend eq 'nfs') {
+        my $server = $scfg->{'file-server'};
+        my $ok = eval {
+            guest_exec($cp1->{vmid},
+                "timeout 6 bash -c '</dev/tcp/$server/2049' "
+                . "&& echo nfs-reachable");
+            1;
+        };
+        die "NFS server $server:2049 is not reachable from "
+            . "cluster nodes; create the export (restricted "
+            . "to the node subnet) and re-run provision\n"
+            if !$ok;
+        guest_exec($cp1->{vmid},
+            PVE::K8s::Addons::nfs_csi_install_cmd(
+                '/root/local-super-admin.conf', $scfg));
+        # Probe from a worker (the data path pods use):
+        # real mount, write/read, capacity from df.
+        my ($worker) = grep { $_->{role} ne 'cp' } $nodes->@*;
+        $worker //= $cp1;
+        my $probe = guest_exec($worker->{vmid},
+            PVE::K8s::Addons::nfs_probe_cmd($scfg));
+        my ($cap, $free) = $probe
+            =~ /PROBE capacity=(\d+) free=(\d+)/;
+        die "NFS probe on $worker->{host} did not report "
+            . "capacity (mount/write failed?): $probe\n"
+            if !defined $cap;
+        record_file_state($name, { backend => 'nfs', ok => 1,
+            capacity => $cap + 0, free => $free + 0,
+            at => time() });
+        print "Shared-file tier installed (backend nfs, "
+            . "class shared-file)\n";
+        print "Shared-file probe OK on $worker->{host}: "
+            . "capacity $cap bytes, free $free bytes\n";
+        return;
+    }
+    die "unknown file-backend '$backend'\n" if $backend ne 'cephfs';
+
+    my $fsid = ceph_cli('fsid');
+    $fsid =~ s/\s+//g if $fsid;
+    die "file-backend cephfs needs a PVE Ceph cluster, "
+        . "and none answered (no ceph CLI/config on any "
+        . "online host). Deploy Ceph first (pveceph); the "
+        . "plugin creates the filesystem and CSI user on "
+        . "an existing Ceph cluster, it never deploys Ceph\n"
+        if !$fsid;
+    my $fs = PVE::K8s::Config::cephfs_name($name);
+    my $filesystems = ceph_cli_json('fs', 'ls') // [];
+    if (!grep { ($_->{name} // '') eq $fs } $filesystems->@*) {
+        # An MDS must exist for the filesystem to serve;
+        # create one on this host if the cluster has none.
+        my $mds = ceph_cli_json('mds', 'stat');
+        if (!$mds || !($mds->{fsmap}{filesystems} || $mds->{up})) {
+            my $me = local_node_name();
+            eval { host_run_on($me, 'pveceph', 'mds', 'create') };
+        }
+        my $created = eval {
+            run(['pvesh', 'create', '/cluster/ceph/fs',
+                '--name', $fs], timeout => 300); 1 } // 0;
+        if (!$created) {
+            my $out = ceph_cli('fs', 'volume', 'create', $fs);
+            die "could not create CephFS filesystem $fs\n"
+                if !defined $out;
+        }
+        print "created CephFS filesystem $fs\n";
+    }
+    my $user = "k8s-$name";
+    my $auth = ceph_cli_json('auth', 'get-or-create',
+        "client.$user",
+        'mon', 'allow r', 'mgr', 'allow rw',
+        'mds', 'allow rwp',
+        'osd', "allow rw pool=${fs}_data");
+    my $key = ($auth->[0] // {})->{key};
+    die "could not create CephX user client.$user\n" if !$key;
+    my $mons = [];
+    my $dump = ceph_cli_json('mon', 'dump');
+    for my $mon (($dump->{mons} // [])->@*) {
+        my ($addr) = split m{/}, ($mon->{addr} // '');
+        push $mons->@*, $addr if $addr;
+    }
+    die "no Ceph monitors found\n" if !$mons->@*;
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        $locked->{ids}->{$name}->{'file-share'} = $fs;
+        PVE::K8s::Config::store_config($locked);
+    });
+    guest_exec($cp1->{vmid},
+        PVE::K8s::Addons::cephfs_csi_install_cmd(
+            '/root/local-super-admin.conf', $fsid, $fs,
+            $mons, $user, $key));
+    my $df = ceph_cli_json('df') // {};
+    my ($pool) = grep { ($_->{name} // '') eq "${fs}_data" }
+        ($df->{pools} // [])->@*;
+    record_file_state($name, { backend => 'cephfs', ok => 1,
+        fs => $fs,
+        capacity => ($pool->{stats}{max_avail} // 0)
+            + ($pool->{stats}{bytes_used} // 0),
+        free => $pool->{stats}{max_avail} // 0,
+        at => time() });
+    print "Shared-file tier installed (backend cephfs, "
+        . "class shared-file, fs $fs)\n";
+}
+
 sub provision_cluster {
     my ($name) = @_;
 
@@ -1277,7 +1478,7 @@ sub provision_cluster {
     create_node_vm($ctx, $cp1, node_userdata(
         hostname => $cp1->{host}, role => 'cp', vip => $vip,
         enc_key => $enc_key,
-        extra_runcmd => kubeadm_init_runcmd($vip),
+        extra_runcmd => kubeadm_init_runcmd($vip, $cp1->{ip}),
     ));
     # kubeadm init runs inside cloud-init, which may still be
     # running (or retrying) when the guest agent first answers:
@@ -1323,6 +1524,7 @@ sub provision_cluster {
         PVE::K8s::Addons::cilium_install_cmd(
             '/root/local-super-admin.conf', $vip));
     set_external_cloud_provider($cp1);
+    ensure_kubelet_node_ip($cp1);
     print "control plane initialised on $cp1->{host}\n";
 
     # --- join material from cp1 (discovery via the VIP, so
@@ -1375,6 +1577,7 @@ sub provision_cluster {
         }
         die "$node->{host} joined but never registered with the API\n" if !$seen;
         set_external_cloud_provider($node);
+        ensure_kubelet_node_ip($node);
         print "$node->{host} joined\n";
     }
 
@@ -1507,22 +1710,7 @@ sub provision_cluster {
 
     # --- T3.6a: shared-file (RWX) tier, when configured.
     if (my $backend = $scfg->{'file-backend'}) {
-        my $server = $scfg->{'file-server'};
-        my $ok = eval {
-            guest_exec($cp1->{vmid},
-                "timeout 6 bash -c '</dev/tcp/$server/2049' "
-                . "&& echo nfs-reachable");
-            1;
-        };
-        die "NFS server $server:2049 is not reachable from "
-            . "cluster nodes; create the export (restricted "
-            . "to the node subnet) and re-run provision\n"
-            if !$ok;
-        guest_exec($cp1->{vmid},
-            PVE::K8s::Addons::nfs_csi_install_cmd(
-                '/root/local-super-admin.conf', $scfg));
-        print "Shared-file tier installed (backend $backend, "
-            . "class shared-file)\n";
+        install_file_tier($name, $scfg, $cp1, \@nodes);
     }
 
     # --- LoadBalancer pool: explicit lb-range, else the
@@ -2298,6 +2486,7 @@ sub roll_cluster {
         die "replacement $new->{host} failed to join\n" if !$joined;
       ADOPTED:
         set_external_cloud_provider($new);
+        ensure_kubelet_node_ip($new);
         wait_node_ready($cp1, $new->{host});
         label_node($cp1, $new);
 
@@ -3273,6 +3462,27 @@ sub list_addons {
         summary => 'Cilium ingress controller + Gateway API '
             . '(part of the Cilium install)',
     });
+    if (my $backend = $scfg->{'file-backend'}) {
+        my $fstate = eval {
+            JSON::PP->new->decode($scfg->{'file-state'} // '')
+        } // {};
+        my $where = $backend eq 'nfs'
+            ? "$scfg->{'file-server'}:$scfg->{'file-share'}"
+            : "CephFS " . ($scfg->{'file-share'} // '?');
+        my $cap = $fstate->{capacity}
+            ? sprintf('%.1f GiB total, %.1f GiB free',
+                $fstate->{capacity} / 1024**3,
+                ($fstate->{free} // 0) / 1024**3)
+            : 'capacity not probed';
+        push @addons, {
+            name => 'shared-file',
+            status => $fstate->{ok} ? 'installed' : 'unconfigured',
+            mustdeploy => 0,
+            summary => "RWX file storage (class shared-file) "
+                . "via $backend on $where; probe: $cap",
+            ($fstate->{ok} ? (config => $fstate) : ()),
+        };
+    }
     for my $addon (
         ['cert-manager', 'TLS certificates (internal CA by '
             . 'default, ACME optional)'],

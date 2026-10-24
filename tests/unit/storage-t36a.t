@@ -30,9 +30,38 @@ ok(!eval { PVE::K8s::Config::assert_file_config({
         'file-backend' => 'nfs', 'file-server' => '10.0.0.9',
         'file-share' => 'relative/path' }); 1 },
     'a relative export path is rejected');
+is(PVE::K8s::Config::assert_file_config(
+        { 'file-backend' => 'cephfs' }), 'cephfs',
+    'cephfs validates at create (Ceph presence is a '
+    . 'provision-time check)');
 ok(!eval { PVE::K8s::Config::assert_file_config(
-        { 'file-backend' => 'cephfs' }); 1 },
-    'cephfs is rejected until its T3.6a step lands');
+        { 'file-backend' => 'gluster' }); 1 },
+    'an unknown file backend is rejected');
+is(PVE::K8s::Config::cephfs_name('Lab_11'), 'k8s-lab-11',
+    'cephfs filesystem name derives from the cluster');
+
+my $ceph_class = PVE::K8s::Addons::cephfs_class_yaml(
+    'fsid-123', 'k8s-lab11');
+like($ceph_class, qr/provisioner: cephfs\.csi\.ceph\.com/,
+    'cephfs class uses the ceph-csi driver');
+like($ceph_class, qr/fsName: k8s-lab11/,
+    'cephfs class points at the cluster filesystem');
+like($ceph_class, qr/pool: k8s-lab11_data/,
+    'cephfs class uses the filesystem data pool');
+my $ceph_install = PVE::K8s::Addons::cephfs_csi_install_cmd(
+    '/root/kc', 'fsid-123', 'k8s-lab11',
+    ['192.168.200.11:6789'], 'k8s-lab11', 'KEY==');
+like($ceph_install, qr/ceph-csi-cephfs --version \Q$PVE::K8s::Addons::CEPH_CSI_VERSION\E/,
+    'ceph-csi chart version is pinned');
+like($ceph_install, qr/userID=k8s-lab11/,
+    'cephfs secret carries the scoped CephX user');
+my $probe = PVE::K8s::Addons::nfs_probe_cmd({
+    'file-server' => '192.168.200.11',
+    'file-share' => '/srv/k8s' });
+like($probe, qr/mount -t nfs -o nfsvers=4\.1 192\.168\.200\.11:\/srv\/k8s/,
+    'NFS probe really mounts the export');
+like($probe, qr/PROBE capacity=/,
+    'NFS probe reports capacity for the add-ons view');
 
 my $class = PVE::K8s::Addons::shared_file_class_yaml({
     'file-server' => '192.168.200.11',

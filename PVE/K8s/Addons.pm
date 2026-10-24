@@ -214,6 +214,101 @@ kubectl -n kube-system rollout status \
 EOF
 }
 
+# CephFS backend (T3.6a second step): hyper-converged
+# only. The provisioner has already created the
+# filesystem and a scoped CephX user through the
+# PVE/Ceph APIs; here we only install ceph-csi and our
+# own class. The CephX key lives solely in the
+# in-cluster Secret, like every other add-on credential.
+our $CEPH_CSI_VERSION = '3.18.1';
+
+sub cephfs_class_yaml {
+    my ($fsid, $fs) = @_;
+
+    die "cephfs class needs a cluster fsid and fs name\n"
+        if !$fsid || !$fs;
+    return <<EOF;
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: shared-file
+provisioner: cephfs.csi.ceph.com
+parameters:
+  clusterID: $fsid
+  fsName: $fs
+  pool: ${fs}_data
+  csi.storage.k8s.io/provisioner-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: kube-system
+  csi.storage.k8s.io/controller-expand-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: kube-system
+  csi.storage.k8s.io/node-stage-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: kube-system
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+EOF
+}
+
+sub cephfs_csi_install_cmd {
+    my ($kubeconfig, $fsid, $fs, $mons, $user, $key) = @_;
+
+    my $class_yaml = cephfs_class_yaml($fsid, $fs);
+    my $mon_list = join ', ', map { "\"$_\"" } $mons->@*;
+    my @args = (helm_ensure_cmd(), $kubeconfig, $fsid,
+        $mon_list, $CEPH_CSI_VERSION, $user, $key, $class_yaml);
+    return sprintf(<<'EOF', @args);
+%s
+export KUBECONFIG=%s
+cat > /root/ceph-csi-cephfs-values.yaml <<'VALUES'
+csiConfig:
+  - clusterID: "%s"
+    monitors: [%s]
+    cephFS: {}
+storageClass:
+  create: false
+VALUES
+chmod 600 /root/ceph-csi-cephfs-values.yaml
+helm repo add ceph-csi https://ceph.github.io/csi-charts \
+    >/dev/null 2>&1 || true
+helm repo update ceph-csi >/dev/null
+helm upgrade -i -n kube-system ceph-csi-cephfs \
+    ceph-csi/ceph-csi-cephfs --version %s \
+    -f /root/ceph-csi-cephfs-values.yaml
+kubectl -n kube-system create secret generic \
+    csi-cephfs-secret \
+    --from-literal=userID=%s --from-literal=userKey=%s \
+    --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f - <<'CLASS'
+%sCLASS
+kubectl -n kube-system rollout status \
+    deploy/ceph-csi-cephfs-provisioner --timeout=600s
+EOF
+}
+
+# Mount + write + capacity probe for the NFS backend,
+# run inside a node: the tier is only "installed" when a
+# node can actually use the export (TCP reachability was
+# already checked separately). Prints PROBE lines the
+# provisioner parses: capacity and free bytes from df.
+sub nfs_probe_cmd {
+    my ($scfg) = @_;
+
+    my ($server, $share) = $scfg->@{qw(file-server file-share)};
+    return <<"EOF";
+set -e
+D=/mnt/pve-k8s-probe
+mkdir -p \$D
+mount -t nfs -o nfsvers=4.1 $server:$share \$D
+echo pve-k8s-probe > \$D/.pve-k8s-probe
+grep -q pve-k8s-probe \$D/.pve-k8s-probe
+rm -f \$D/.pve-k8s-probe
+df -B1 --output=size,avail \$D | tail -1 | \
+    awk '{print "PROBE capacity=" \$1 " free=" \$2}'
+umount \$D
+rmdir \$D
+EOF
+}
+
 sub csi_install_cmd {
     my ($kubeconfig, $values_yaml) = @_;
 

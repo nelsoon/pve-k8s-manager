@@ -132,10 +132,10 @@ __PACKAGE__->register_method({
             },
             'file-backend' => {
                 type => 'string',
-                pattern => '^(nfs)$',
+                pattern => '^(nfs|cephfs)$',
                 optional => 1,
                 description => "Shared-file (RWX) tier "
-                    . "backend (T3.6a): nfs.",
+                    . "backend (T3.6a): nfs or cephfs.",
             },
             'file-server' => {
                 type => 'string',
