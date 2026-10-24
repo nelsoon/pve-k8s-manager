@@ -574,6 +574,57 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'volume-move',
+    path => '{name}/volumes/move',
+    method => 'POST',
+    protected => 1,
+    description => "Move a local-block PVC's disk to another "
+        . "Proxmox host (T3.6b): the image is copied, the "
+        . "PV/PVC pair is recreated with the same names and "
+        . "disk identity, and the source image is deleted "
+        . "once the claim rebinds. The PVC must not be in "
+        . "use by a running pod.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            namespace => {
+                type => 'string',
+                description => "Namespace of the PVC.",
+            },
+            pvc => {
+                type => 'string',
+                description => "Name of the PVC to move.",
+            },
+            'target-host' => {
+                type => 'string',
+                description => "Destination Proxmox host name.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8svolumemove',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::move_local_pvc(
+                    $param->{name}, $param->{namespace},
+                    $param->{pvc}, $param->{'target-host'});
+            });
+    }});
+
+__PACKAGE__->register_method({
     name => 'backup',
     path => '{name}/backup',
     method => 'POST',

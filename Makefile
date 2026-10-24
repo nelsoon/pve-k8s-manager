@@ -29,6 +29,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/evacuate.t
 	@perl -I. -Itests/stubs tests/unit/network-t34.t
 	@perl -I. -Itests/stubs tests/unit/storage-t36a.t
+	@perl -I. -Itests/stubs tests/unit/volumes-t36b.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Skeleton packaging: stage the payload and build with dpkg-deb.

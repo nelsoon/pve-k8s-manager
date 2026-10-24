@@ -262,6 +262,65 @@ sub scale_in_candidates {
     return \@out;
 }
 
+# --- T3.6b: local-volume mobility -----------------------
+# A Proxmox CSI volume handle is region/zone/storage/disk;
+# zone is the Proxmox host holding the disk. Shared volumes
+# carry an empty zone (region//storage/disk) and never need
+# a move. Local volumes pin their pods to nodes on that one
+# host: when every node there is gone or unschedulable, a
+# recreated pod waits Pending forever unless the disk moves.
+sub csi_volume_handle {
+    my ($handle) = @_;
+
+    my @parts = split m{/}, ($handle // ''), -1;
+    return undef if @parts != 4 || !$parts[0] || !$parts[2]
+        || !$parts[3];
+    return { region => $parts[0], zone => $parts[1],
+        storage => $parts[2], disk => $parts[3] };
+}
+
+# Pure decision for the reconcile loop: which Pending pods
+# are stuck solely because their local PV's host has no
+# schedulable node left. Inputs: pending pods, PVs by name
+# ({zone, claim => "ns/pvc"}), and worker nodes as
+# {name, pvehost, ready, schedulable}. Returns one record
+# per stuck volume with the Ready nodes elsewhere that
+# could receive the disk.
+sub stuck_local_volumes {
+    my ($pods, $pv_by_name, $nodes) = @_;
+
+    my %schedulable_on;
+    my @targets;
+    for my $node ($nodes->@*) {
+        next if !$node->{ready} || !$node->{schedulable};
+        $schedulable_on{$node->{pvehost}} = 1;
+        push @targets, $node;
+    }
+    my @out;
+    for my $pod ($pods->@*) {
+        next if ($pod->{status}{phase} // '') ne 'Pending';
+        next if $pod->{spec}{nodeName};
+        my $ns = $pod->{metadata}{namespace} // 'default';
+        for my $vol (($pod->{spec}{volumes} // [])->@*) {
+            my $claim = $vol->{persistentVolumeClaim}{claimName}
+                or next;
+            my ($pvname, $pv) = map { $_ => $pv_by_name->{$_} }
+                grep { ($pv_by_name->{$_}{claim} // '')
+                    eq "$ns/$claim" } keys $pv_by_name->%*;
+            next if !$pv || !$pv->{zone};
+            next if $schedulable_on{$pv->{zone}};
+            push @out, {
+                pod => "$ns/$pod->{metadata}{name}",
+                pvc => "$ns/$claim", pv => $pvname,
+                zone => $pv->{zone},
+                targets => [grep {
+                    $_->{pvehost} ne $pv->{zone} } @targets],
+            };
+        }
+    }
+    return \@out;
+}
+
 # Pending and unschedulable for a scheduling reason (not
 # image pull / quota / admission, which nodes cannot fix).
 sub schedulable_pending {

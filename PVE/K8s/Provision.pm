@@ -1891,14 +1891,70 @@ sub scale_reconcile {
         : { cpu => 2000, mem => 4 * 1024**3 };
 
     my $now = time();
+    # Age gate: ignore pods created in the last 2 minutes.
+    # A negative age means the cluster clock runs ahead of
+    # this host (seen in the nested lab, where guest clocks
+    # drift days forward); age is then unmeasurable, and
+    # the Unschedulable condition schedulable_pending
+    # already requires is debounce enough.
     my @pending = grep {
-        $now - iso_epoch($_->{metadata}{creationTimestamp}) > 120
+        my $age = $now - iso_epoch(
+            $_->{metadata}{creationTimestamp});
+        $age < 0 || $age > 120;
     } PVE::K8s::Scaler::schedulable_pending($kpods)->@*;
+
+    # T3.6b: a Pending pod pinned by a local PV to a fabric
+    # host with no schedulable node can never be fixed by
+    # adding nodes elsewhere. Move its disk to a Ready
+    # node's host instead (one move per pass). With no
+    # target at all, fall through to scale-out and say so:
+    # placement there is spread-based, not host-targeted.
+    if (@pending) {
+        my %pv_by_name = map {
+            $_->{pv} => { zone => $_->{zone},
+                          claim => $_->{pvc} }
+        } @{ local_pvs($cp) };
+        my @decision_nodes;
+        for my $node (grep { $_->{role} eq 'worker' } @nodes) {
+            my $kn = $k8s_node{$node->{host}} or next;
+            my ($ready) = grep { ($_->{type} // '') eq 'Ready' }
+                ($kn->{status}{conditions} // [])->@*;
+            push @decision_nodes, {
+                name => $node->{host},
+                pvehost => $node->{pvehost},
+                ready => ($ready
+                    && ($ready->{status} // '') eq 'True') ? 1 : 0,
+                schedulable => ($kn->{spec}{unschedulable} // 0)
+                    ? 0 : 1,
+            };
+        }
+        my $stuck = PVE::K8s::Scaler::stuck_local_volumes(
+            \@pending, \%pv_by_name, \@decision_nodes);
+        for my $vol ($stuck->@*) {
+            if ($vol->{targets}->@*) {
+                my ($vns, $vpvc) = split m{/}, $vol->{pvc};
+                print "volume: pod $vol->{pod} is pinned by "
+                    . "local volume $vol->{pv} to "
+                    . "$vol->{zone}, which has no schedulable "
+                    . "node; moving disk to "
+                    . $vol->{targets}[0]{pvehost} . "\n";
+                move_local_pvc($name, $vns, $vpvc,
+                    $vol->{targets}[0]{pvehost});
+                return 1;
+            }
+            print "volume: pod $vol->{pod} is pinned by "
+                . "local volume $vol->{pv} to $vol->{zone} "
+                . "and no Ready node exists elsewhere; only "
+                . "a new node on $vol->{zone} can unblock "
+                . "it without a disk move target\n";
+        }
+    }
 
     # Scale out, one pool per pass.
     if (@pending) {
         for my $pool ($pools->@*) {
-            my $room = $pool->{max} - $pool->{size};
+            my $room = ($pool->{max} // $pool->{size})
+                - $pool->{size};
             next if $room <= 0;
             my $needed = PVE::K8s::Scaler::nodes_needed(
                 \@sim_nodes, \@pending, $pool, $room, $tmpl);
@@ -1939,7 +1995,7 @@ sub scale_reconcile {
         my ($node) = grep { $_->{host} eq $host } @nodes;
         next if !$node || $node->{role} ne 'worker';
         my $pool = $pool_by_name{$node->{pool}} or next;
-        next if $pool->{size} <= $pool->{min};
+        next if $pool->{size} <= ($pool->{min} // $pool->{size});
         my @pool_nodes = grep { $_->{pool} eq $node->{pool} } @nodes;
         my $last = (sort { $b->{idx} <=> $a->{idx} } @pool_nodes)[0];
         next if $last->{host} ne $host;
@@ -2410,10 +2466,34 @@ sub replace_node {
     die "control-plane replacement goes through roll/upgrade, "
         . "not the node replace action\n" if $node->{role} eq 'cp';
     my $cp = ops_cp($nodes);
+    # T3.6b: local volumes pinned to this node's fabric
+    # host follow the replacement if it lands elsewhere.
+    my $stranded = [grep {
+        $_->{zone} eq ($node->{pvehost} // '')
+    } @{ local_pvs($cp) }];
     print "replacing node $host (drain, destroy, recreate)\n";
     remove_node($cp, $node, $nodes);
     provision_cluster($name);
     print "node $host replaced\n";
+    if ($stranded->@*) {
+        my $nodes2 = load_nodes($name,
+            PVE::K8s::Config->config()->{ids}->{$name});
+        my $new = find_node($nodes2, $host);
+        if (($new->{pvehost} // '') ne ($node->{pvehost} // '')) {
+            for my $vol ($stranded->@*) {
+                next if !$vol->{pvc};
+                my ($vns, $vpvc) = split m{/}, $vol->{pvc};
+                print "moving stranded local volume "
+                    . "$vol->{pvc} to replacement host "
+                    . "$new->{pvehost}\n";
+                move_local_pvc($name, $vns, $vpvc,
+                    $new->{pvehost});
+            }
+        } else {
+            print "replacement stayed on $node->{pvehost}; "
+                . "local volumes need no move\n";
+        }
+    }
     return 1;
 }
 
@@ -2517,6 +2597,254 @@ sub check_retired_ghosts {
     }
 }
 
+# --- T3.6b: cross-host local-volume move -----------------
+# The CSI driver's volumes are storage-side images named
+# vm-9999-pvc-<uuid>; a local volume lives on exactly one
+# Proxmox host (its topology zone). Moving it means: copy
+# the image to the target host with the storage content
+# API, then recreate the PV/PVC pair (their spec is
+# immutable) with the same names and disk name but the new
+# zone in the volume handle and node affinity - the same
+# operation upstream's pvecsictl performs, done natively
+# here so no root password or extra binary is needed.
+# The source image is deleted only after the recreated
+# PVC binds, so a failed move leaves the original intact.
+sub moved_pv {
+    my ($pv, $handle, $target, $ns, $pvc) = @_;
+
+    my $new = JSON::PP->new->decode(JSON::PP->new->encode($pv));
+    delete $new->{status};
+    delete $new->{metadata}{$_} for qw(uid resourceVersion
+        creationTimestamp managedFields generation);
+    delete $new->{metadata}{annotations}
+        {'csi.proxmox.sinextra.dev/migrate'};
+    delete $new->{metadata}{annotations}
+        {'csi.proxmox.sinextra.dev/migrate-node'};
+    $new->{spec}{csi}{volumeHandle} = join '/',
+        $handle->{region}, $target, $handle->{storage},
+        $handle->{disk};
+    $new->{spec}{nodeAffinity}{required} = {
+        nodeSelectorTerms => [{
+            matchExpressions => [
+                { key => 'topology.kubernetes.io/region',
+                  operator => 'In',
+                  values => [$handle->{region}] },
+                { key => 'topology.kubernetes.io/zone',
+                  operator => 'In', values => [$target] },
+            ],
+        }],
+    };
+    $new->{spec}{claimRef} = {
+        kind => 'PersistentVolumeClaim', apiVersion => 'v1',
+        namespace => $ns, name => $pvc,
+    };
+    delete $new->{spec}{claimRef}{$_} for qw(uid resourceVersion);
+    return $new;
+}
+
+sub moved_pvc {
+    my ($pvc) = @_;
+
+    my $new = JSON::PP->new->decode(JSON::PP->new->encode($pvc));
+    my $capacity = $new->{status}{capacity}{storage};
+    delete $new->{status};
+    delete $new->{metadata}{$_} for qw(uid resourceVersion
+        creationTimestamp managedFields generation);
+    delete $new->{metadata}{annotations}
+        {'pv.kubernetes.io/bind-completed'};
+    $new->{spec}{resources}{requests}{storage} = $capacity
+        if $capacity;
+    return $new;
+}
+
+# A UPID printed by a proxied storage task can be glued
+# to the endpoint's own DEBUG chatter (no newline between
+# the fork_worker return and "DEBUG: starting worker"), so
+# a naive UPID:\S+ capture swallows a bogus suffix and the
+# status poll then fails forever. Rebuild the canonical
+# 9-field form instead.
+sub extract_task_upid {
+    my ($out) = @_;
+
+    return undef if ($out // '') !~ /(UPID:\S+)/;
+    my @fields = split /:/, $1, -1;
+    return undef if @fields < 8;
+    return join(':', @fields[0 .. 7]) . ':';
+}
+
+sub kubectl_apply_json {
+    my ($cp, $obj, $tag) = @_;
+
+    my $tmp = "/tmp/pve-k8s-move-$tag.json";
+    open my $fh, '>', $tmp or die "open $tmp: $!\n";
+    print $fh JSON::PP->new->canonical->encode($obj);
+    close $fh or die "close $tmp: $!\n";
+    guest_push_file($cp->{vmid}, $tmp, '/tmp/move.json');
+    unlink $tmp;
+    kubectl_on($cp, 'apply -f /tmp/move.json');
+}
+
+sub move_local_pvc {
+    my ($name, $ns, $pvcname, $target) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+
+    my $pvc = kubectl_json($cp, "get pvc -n $ns $pvcname");
+    my $pvname = $pvc->{spec}{volumeName}
+        or die "PVC $ns/$pvcname is not bound to a PV\n";
+    my $pv = kubectl_json($cp, "get pv $pvname");
+    die "PV $pvname is not a Proxmox CSI volume\n"
+        if ($pv->{spec}{csi}{driver} // '')
+            ne 'csi.proxmox.sinextra.dev';
+    my $handle = PVE::K8s::Scaler::csi_volume_handle(
+        $pv->{spec}{csi}{volumeHandle})
+        or die "PV $pvname has an unparsable volume handle\n";
+    my $src = $handle->{zone};
+    die "PV $pvname is on shared storage (no zone); "
+        . "pods move freely, no disk move needed\n" if !$src;
+    die "PV $pvname is already on Proxmox host $target\n"
+        if $src eq $target;
+
+    my $res = run(['pvesh', 'get', '/cluster/resources',
+        '--type', 'node', '--output-format', 'json'], timeout => 60);
+    my %hosts = map { $_->{node} => 1 }
+        (decode_pvesh_json($res) // [])->@*;
+    die "target '$target' is not a Proxmox cluster node\n"
+        if !$hosts{$target};
+
+    # Safety: never move a disk that might still be in use.
+    # A Pending pod holds no attachment; anything else must
+    # be drained/deleted by the caller first.
+    my $pods = kubectl_json($cp, "get pods -n $ns")->{items} // [];
+    for my $pod ($pods->@*) {
+        my $uses = grep {
+            ($_->{persistentVolumeClaim}{claimName} // '')
+                eq $pvcname
+        } ($pod->{spec}{volumes} // [])->@*;
+        next if !$uses;
+        die "PVC $ns/$pvcname is in use by pod "
+            . "$pod->{metadata}{name} (phase "
+            . ($pod->{status}{phase} // '?') . "); drain or "
+            . "delete that pod before moving its disk\n"
+            if ($pod->{status}{phase} // '') ne 'Pending';
+    }
+    my $vas = kubectl_json($cp, 'get volumeattachments')
+        ->{items} // [];
+    die "PV $pvname still has a VolumeAttachment; the disk "
+        . "is attached somewhere - refusing to move it\n"
+        if grep { ($_->{spec}{source}{persistentVolumeName} // '')
+            eq $pvname } $vas->@*;
+    my $vms = decode_pvesh_json(run(['pvesh', 'get',
+        "/nodes/$src/qemu", '--output-format', 'json'],
+        timeout => 60)) // [];
+    for my $vm ($vms->@*) {
+        my $conf = run(['pvesh', 'get',
+            "/nodes/$src/qemu/$vm->{vmid}/config",
+            '--output-format', 'json'], timeout => 60);
+        die "disk $handle->{disk} is still attached to VM "
+            . "$vm->{vmid} on $src; refusing to move it\n"
+            if index($conf, $handle->{disk}) >= 0;
+    }
+
+    print "moving disk $handle->{disk} ($pvname) from "
+        . "$src to $target\n";
+    my $volid = "$handle->{storage}:$handle->{disk}";
+    my $dst_content = run(['pvesh', 'get',
+        "/nodes/$target/storage/$handle->{storage}/content",
+        '--output-format', 'json'], timeout => 60);
+    if (index($dst_content, $handle->{disk}) >= 0) {
+        print "target $target already holds a copy of "
+            . "$handle->{disk} (earlier attempt); "
+            . "skipping the copy\n";
+        $dst_content = undef;
+    }
+    # The storage content copy endpoint (present since
+    # PVE 8.4 as experimental) takes the target volume
+    # name and target_node; it copies, never deletes.
+    my $out = defined $dst_content ? run(['pvesh', 'create',
+        "/nodes/$src/storage/$handle->{storage}/content/$volid",
+        '--target', $handle->{disk},
+        '--target_node', $target], timeout => 3600) : '';
+    if (my $upid = extract_task_upid($out)) {
+        my ($task_node) = $upid =~ /^UPID:([^:]+):/;
+        my $done;
+        for (1 .. 720) {
+            my $st = eval { decode_pvesh_json(run(['pvesh',
+                'get', "/nodes/$task_node/tasks/$upid/status",
+                '--output-format', 'json'], timeout => 60)) } // {};
+            if (($st->{status} // '') eq 'stopped') {
+                die "disk copy task failed: "
+                    . ($st->{exitstatus} // 'unknown') . "\n"
+                    if ($st->{exitstatus} // '') ne 'OK';
+                $done = 1;
+                last;
+            }
+            sleep 5;
+        }
+        die "disk copy task $upid never finished\n" if !$done;
+    }
+
+    # Recreate the PV/PVC pair pointing at the new zone.
+    # Deleting the PVC can take the PV with it (controller
+    # timing around the Retain patch), so every step here
+    # tolerates the object already being gone: the saved
+    # $pv/$pvc hashes are what get recreated either way.
+    eval { kubectl_on($cp, "patch pv $pvname --type merge -p "
+        . '\'{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}\'') };
+    kubectl_on($cp, "delete pvc -n $ns $pvcname "
+        . "--ignore-not-found --wait=true");
+    eval { kubectl_on($cp, "delete pv $pvname "
+        . "--ignore-not-found --wait=true") };
+    kubectl_apply_json($cp,
+        moved_pv($pv, $handle, $target, $ns, $pvcname), 'pv');
+    kubectl_apply_json($cp, moved_pvc($pvc), 'pvc');
+    for (1 .. 60) {
+        my $now = kubectl_json($cp, "get pvc -n $ns $pvcname");
+        if (($now->{status}{phase} // '') eq 'Bound') {
+            print "PVC $ns/$pvcname rebound on $target "
+                . "(same PV/PVC/disk identity)\n";
+            my $del = eval { run(['pvesh', 'delete',
+                "/nodes/$src/storage/$handle->{storage}"
+                . "/content/$volid"], timeout => 600); 1 } // 0;
+            print $del
+                ? "source disk on $src deleted\n"
+                : "WARNING: could not delete source disk "
+                    . "on $src; it is now an unused copy\n";
+            return 1;
+        }
+        sleep 5;
+    }
+    die "PVC $ns/$pvcname did not rebind on $target; the "
+        . "original disk copy still exists on $src and the "
+        . "new copy on $target - check the PV/PVC state\n";
+}
+
+# Local PVs whose disk sits on one Proxmox host, as
+# {pv, pvc => "ns/name", zone} records.
+sub local_pvs {
+    my ($cp) = @_;
+
+    my $pvs = kubectl_json($cp, 'get pv')->{items} // [];
+    my @out;
+    for my $pv ($pvs->@*) {
+        next if ($pv->{spec}{csi}{driver} // '')
+            ne 'csi.proxmox.sinextra.dev';
+        my $handle = PVE::K8s::Scaler::csi_volume_handle(
+            $pv->{spec}{csi}{volumeHandle}) or next;
+        next if !$handle->{zone};
+        my $claim = $pv->{spec}{claimRef};
+        push @out, { pv => $pv->{metadata}{name},
+            zone => $handle->{zone},
+            pvc => $claim
+                ? "$claim->{namespace}/$claim->{name}" : undef };
+    }
+    return \@out;
+}
+
 # Chunked file transfer through the guest agent (no SSH in
 # the node images). Base64 chunks keep each exec bounded.
 my sub guest_fetch_file {
@@ -2540,7 +2868,7 @@ my sub guest_fetch_file {
     return $size;
 }
 
-my sub guest_push_file {
+sub guest_push_file {
     my ($vmid, $host_path, $guest_path) = @_;
 
     open my $fh, '<', $host_path or die "open $host_path: $!\n";
