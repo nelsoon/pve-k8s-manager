@@ -1,0 +1,8 @@
+PVE_K8S_INTEGRATE_EOF
+    if [ -d /run/systemd/system ]; then
+        systemctl try-restart pvedaemon.service \
+            pveproxy.service >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

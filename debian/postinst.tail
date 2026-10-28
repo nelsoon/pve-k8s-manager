@@ -1,0 +1,11 @@
+PVE_K8S_INTEGRATE_EOF
+    # pmxcfs needs the directory before the first config
+    # write; harmless when the fs is not mounted yet.
+    mkdir -p /etc/pve/k8s 2>/dev/null || true
+    if [ -d /run/systemd/system ]; then
+        systemctl try-restart pvedaemon.service \
+            pveproxy.service >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

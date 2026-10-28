@@ -389,6 +389,46 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'update',
+    path => '{name}',
+    method => 'PUT',
+    description => "Update mutable rollout options of a managed "
+        . "Kubernetes cluster (used by the S3 scenario to narrow "
+        . "and open the maintenance window around a roll).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            'maintenance-window' => {
+                type => 'string',
+                pattern => '^\d{2}:\d{2}-\d{2}:\d{2}$',
+                optional => 1,
+                description => "Rolling window HH:MM-HH:MM (local time).",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        die "nothing to update: pass maintenance-window\n"
+            if !defined $param->{'maintenance-window'};
+
+        PVE::K8s::Provision::set_cluster_options($param->{name}, {
+            'maintenance-window' => $param->{'maintenance-window'},
+        });
+
+        return undef;
+    }});
+
+__PACKAGE__->register_method({
     name => 'kubeconfig',
     path => '{name}/kubeconfig',
     method => 'GET',

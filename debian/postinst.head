@@ -1,0 +1,13 @@
+#!/bin/sh
+# pve-k8s-manager postinst. The integration patcher between
+# the heredoc markers is embedded by the Makefile from
+# debian/integrate.pl (edit that file, not the built .deb).
+# It applies the INTEGRATION.md points to stock pve-manager
+# files, idempotently; failures warn but never fail install.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if [ -f /etc/sysctl.d/99-pve-k8s-vrf.conf ]; then
+        sysctl -q -p /etc/sysctl.d/99-pve-k8s-vrf.conf || true
+    fi
+    perl - apply <<'PVE_K8S_INTEGRATE_EOF' || true

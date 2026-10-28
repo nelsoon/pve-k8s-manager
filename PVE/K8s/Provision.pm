@@ -305,6 +305,198 @@ my sub find_template {
     return $best_id;
 }
 
+# Roll/provision target revision. The cluster record's
+# template-rev is the floor: a host that has not received
+# the newest template copy yet must never roll nodes
+# BACKWARDS to its older local copy (seen in the lab,
+# where a resume on a stale host started destroying r2
+# nodes to rebuild r1). A newer local template raises
+# the target; a version upgrade ignores the floor (the
+# record rev belongs to the old version line). Pure and
+# unit-tested.
+sub wanted_roll_rev {
+    my ($record_rev, $local_rev, $upgrading) = @_;
+
+    $record_rev = -1 if !defined $record_rev;
+    $local_rev = -1 if !defined $local_rev;
+    return $local_rev if $upgrading;
+    return $record_rev > $local_rev ? $record_rev : $local_rev;
+}
+
+# Names taken by record nodes plus joined cluster members
+# (surge leftovers a previous run created AND joined but
+# never recorded). Unjoined leftover VMs are intentionally
+# NOT taken: they are reusable material that create_node_vm
+# converges and joins under the same name instead of
+# orphaning. Built in two steps: nesting the maps makes
+# the inner map's output part of the outer map's input.
+# Pure and unit-tested.
+sub taken_names {
+    my ($nodes, $joined) = @_;
+
+    my %taken = map { $_->{host} => 1 } $nodes->@*;
+    $taken{$_} = 1 for keys %$joined;
+    return \%taken;
+}
+
+# Names of nodes currently joined to the cluster. Falls
+# back to all live VM names when the API is unreachable:
+# conservative (may strand an unjoined leftover as an
+# orphan) but never collides with a joined member.
+my sub joined_names {
+    my ($cp) = @_;
+
+    my $out = eval { kubectl_on($cp, 'get nodes --no-headers') } // '';
+    my %joined;
+    for my $line (split /\n/, $out) {
+        my ($node) = split /\s+/, $line;
+        $joined{$node} = 1 if defined $node && length $node;
+    }
+    if (!%joined) {
+        print "roll: API unreachable, falling back to live-VM names\n";
+        %joined = map { $_ => 1 } keys cluster_vms()->%*;
+    }
+    return \%joined;
+}
+
+# Next free numeric suffix for a node-name stem, skipping
+# names already taken by live VMs. A resumed roll must
+# not reuse a surge leftover's name (the leftover is not
+# in the record but does exist). Pure and unit-tested.
+sub next_free_index {
+    my ($stem, $taken, $start) = @_;
+
+    my $next = $start;
+    $next++ while $taken->{"$stem$next"};
+    return $next;
+}
+
+# Whether kubeadm upgrade apply is still needed: exact
+# target match means a previous run already applied it, so
+# a resume must skip the disruptive re-apply (lab,
+# 2026-10-27). Anything else, including an unreadable live
+# version, proceeds. Pure and unit-tested.
+sub upgrade_apply_needed {
+    my ($live, $kver) = @_;
+    return 1 if !defined $live || $live eq '';
+    return $live eq $kver ? 0 : 1;
+}
+
+# Server git version out of `kubectl version -o json`.
+# Garbage in yields '', which fails open to apply. Pure
+# and unit-tested.
+sub server_git_version {
+    my ($ver_json) = @_;
+    my $v = eval {
+        JSON::PP->new->decode($ver_json)
+            ->{serverVersion}{gitVersion} } // '';
+    return defined $v ? $v : '';
+}
+
+# Surge control-plane IP: the canonical 59+idx slot, but
+# never at or below an address the record already uses.
+# Repeated surges walk idx into the worker range (lab,
+# 2026-10-27: cp11 took w1's .70 and ARP-flapped them
+# both). Pure and unit-tested.
+sub surge_cp_ip {
+    my ($prefix, $next, $nodes) = @_;
+    my $max = (sort { $b <=> $a }
+        map { /(\d+)$/ ? int $1 : 59 }
+        map { $_->{ip} // '' } $nodes->@*)[0] // 59;
+    my $octet = 59 + $next;
+    $octet = $max + 1 if $max + 1 > $octet;
+    return "$prefix.$octet";
+}
+
+# Plan one roll pass over a pool-grouped node list: nodes
+# flagged `current` already satisfy the target; every other
+# node is either surged (a replacement joins first) or, when
+# its pool already holds the desired number of current
+# members, retired with no surge at all. An interrupted run
+# leaves joined replacements behind; without this rule the
+# next run surges yet another one instead of retiring the
+# node the leftover already covers (lab, 2026-10-27: 8
+# control-plane nodes against a spec of 3). Pool totals
+# therefore never exceed desired+1 and converge downwards
+# when already over. Pure and unit-tested.
+sub roll_plan {
+    my ($nodes, $desired, ) = @_;
+
+    my (%current, %plan);
+    $current{$_->{pool} // 'default'}++
+        for grep { $_->{current} } $nodes->@*;
+    for my $node (grep { !$_->{current} } $nodes->@*) {
+        my $pool = $node->{pool} // 'default';
+        if (($current{$pool} // 0) >= ($desired->{$pool} // 0)) {
+            $plan{$node->{host}} = 'retire-only';
+        } else {
+            $plan{$node->{host}} = 'surge';
+            $current{$pool}++;
+        }
+    }
+    # Current members beyond spec (leftovers of interrupted
+    # runs) retire last, highest index first: an even or
+    # oversized etcd is never the resting state.
+    my %by_pool;
+    push $by_pool{$_->{pool} // 'default'}->@*,
+        $_ for grep { $_->{current} } $nodes->@*;
+    for my $pool (keys %by_pool) {
+        my $excess = ($current{$pool} // 0)
+            - ($desired->{$pool} // 0);
+        for my $node (reverse $by_pool{$pool}->@*) {
+            last if $excess-- <= 0;
+            $plan{$node->{host}} = 'retire-only';
+        }
+    }
+    return \%plan;
+}
+
+# Ensure the exact template revision exists on a host,
+# distributing a full-copy from wherever it lives when
+# needed (same clone-migrate-mark pattern as
+# ensure_template_on, but pinned to a revision instead of
+# the local best). Dies when the revision exists nowhere:
+# failing closed beats rolling to the wrong revision.
+my sub ensure_template_rev_on {
+    my ($host, $k8s_version, $rev) = @_;
+
+    die "no template k8s-node-$k8s_version-r* found; build one first (images/)\n"
+        if !defined $rev || $rev < 0;
+    my $tpl_name = "k8s-node-$k8s_version-r$rev";
+    my $on = sub {
+        my ($h) = @_;
+        my $list = $h eq local_node_name()
+            ? qm('list') : eval { qm_on($h, 'list') } // '';
+        return $1 if $list =~ /^\s*(\d+)\s+\Q$tpl_name\E\s/m;
+        return undef;
+    };
+    if (my $id = $on->($host)) {
+        return $id;
+    }
+    my ($src_host, $src_id);
+    for my $h (local_node_name(), pve_online_nodes()->@*) {
+        next if $h eq $host;
+        if (my $id = $on->($h)) {
+            ($src_host, $src_id) = ($h, $id);
+            last;
+        }
+    }
+    die "no template $tpl_name on any online host; build it first (images/)\n"
+        if !defined $src_id;
+    my $copy_id = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
+    $copy_id =~ s/\D//g;
+    print "distributing template $tpl_name to $host (vmid $copy_id)\n";
+    # clone where the source lives, then migrate with local
+    # disks: a linked clone cannot leave its host, and qm
+    # migrate runs on the source side
+    qm_on($src_host, 'clone', $src_id, $copy_id,
+        '--full', 1, '--name', $tpl_name);
+    qm_on($src_host, 'migrate', $copy_id, $host,
+        '--with-local-disks', 1);
+    qm_on($host, 'template', $copy_id);
+    return $copy_id;
+}
+
 # Template distribution (T2.1): on nothing-shared storage a
 # copy is made lazily, once per revision, only on hosts where
 # a node is placed (clone locally, migrate the copy, mark it
@@ -419,6 +611,13 @@ spec:
     - {name: address, value: "$vip"}
     - {name: cp_enable, value: "true"}
     - {name: cp_namespace, value: "kube-system"}
+    # Relaxed leader-election timing: on loaded or slow
+    # hosts the API can stall past the kube-vip defaults
+    # (15/10/2), the holder fails to renew, and the VIP
+    # flaps in a crash loop (seen in the lab, 2026-10-27).
+    - {name: vip_leaseduration, value: "30"}
+    - {name: vip_renewdeadline, value: "20"}
+    - {name: vip_retryperiod, value: "4"}
     securityContext:
       capabilities: {add: [NET_ADMIN, NET_RAW]}
     volumeMounts:
@@ -594,10 +793,16 @@ EOF
 # exists. CNI is applied here too, not from cloud-init, because at
 # cloud-init time the VIP may not be up yet.
 my sub local_kubeconfig_cmd {
+    # super-admin.conf exists only on the init node; joined
+    # nodes carry admin.conf instead (same cluster-admin
+    # rights once the binding exists), so converge on an
+    # existing cluster falls back to it.
     return <<'EOF';
+SRC=/etc/kubernetes/super-admin.conf; [ -f "$SRC" ] \
+|| SRC=/etc/kubernetes/admin.conf; \
 IP=$(ip -o -4 route get 1.1.1.1 | sed -n 's/.*src \([0-9.]*\).*/\1/p') \
 && sed -E "s|server: https://[^ ]+:6443|server: https://$IP:6443|" \
-    /etc/kubernetes/super-admin.conf > /root/local-super-admin.conf \
+    "$SRC" > /root/local-super-admin.conf \
 && chmod 600 /root/local-super-admin.conf
 EOF
 }
@@ -748,6 +953,31 @@ sub cluster_vm_names {
     );
 }
 
+# Parse `qm list` output into name -> vmid. Pure and
+# unit-tested (delete-orphan-audit.t).
+sub parse_qm_list {
+    my ($out) = @_;
+
+    my %vms;
+    for my $line (split /\n/, $out // '') {
+        next if $line !~ /^\s*(\d+)\s+(\S+)\s+\S+/;
+        $vms{$2} = $1;
+    }
+    return \%vms;
+}
+
+# Every PVE node name in the cluster, online or not.
+my sub pve_all_nodes {
+    my $out = run(['pvesh', 'get', '/cluster/status',
+        '--output-format', 'json'], timeout => 60);
+    my $status = decode_pvesh_json($out);
+    return [grep { defined }
+        map { ($_->{type} // '') eq 'node'
+            && ($_->{name} // '') =~ /^([a-zA-Z0-9._-]+)$/
+            ? $1 : undef }
+        $status->@*];
+}
+
 # Every VM that belongs to the cluster, cluster-wide by name
 # pattern (<cluster>-<node>). This also catches VMs from an
 # earlier, larger layout and from any pool naming.
@@ -759,6 +989,25 @@ my sub find_cluster_vmids {
     for my $vmname (keys $vms->%*) {
         next if $vmname !~ /^\Q$name\E-/;
         $found{$vmname} = $vms->{$vmname};
+    }
+    # /cluster/resources silently omits VMs on hosts whose
+    # status view is stale (e.g. just rebooted), which once
+    # let delete report "no orphan VMs" while a node VM was
+    # still present. Cross-check every host's own `qm list`;
+    # a host that cannot be scanned aborts the delete
+    # instead of passing the audit blind.
+    for my $host (pve_all_nodes()->@*) {
+        my $out = eval { qm_on($host, 'list') };
+        die "cannot scan VMs on host '$host' while deleting "
+            . "cluster '$name'; refusing to continue\n" if $@;
+        my $by_name = parse_qm_list($out);
+        for my $vmname (keys $by_name->%*) {
+            next if $vmname !~ /^\Q$name\E-/;
+            next if $vmname !~ /^([a-zA-Z0-9._-]+)$/;
+            $found{$1} //= { vmid => $by_name->{$vmname},
+                node => $host };
+            $VM_HOST{$by_name->{$vmname}} = $host;
+        }
     }
     return \%found;
 }
@@ -1089,6 +1338,78 @@ sub cluster_nodes {
     return \@nodes;
 }
 
+# Converge a stored inventory with the desired canonical
+# layout. Provision, repair and scale-out/in all funnel
+# through provision_cluster, so the record is authoritative
+# here: canonical names are only used for a fresh cluster.
+# Without this, any provision on a rolled cluster recreates
+# the rolled-away control-plane names as fresh VMs, and the
+# first one runs kubeadm init with a brand-new CA (seen in
+# the lab: a zombie t41-cp1 stole the VIP with a foreign
+# certificate). Returns (keep, retire): keep holds at most
+# pool-size record nodes per pool (lowest index wins, so
+# scale-in retires the highest index) refreshed from the
+# current pool defs, plus canonical names appended for
+# shortfalls; retire holds record nodes beyond pool size or
+# in removed pools. Pure and unit-tested.
+sub converge_nodes {
+    my ($record, $desired, $pools, $cp_count) = @_;
+
+    my %def_of = map { $_->{name} => $_ } $pools->@*;
+    my %rec_by_pool;
+    push $rec_by_pool{$_->{pool} // 'default'}->@*, $_ for $record->@*;
+    my %taken = map { $_->{name} => 1 } $record->@*;
+
+    my @merged;
+    my @retire;
+    my @order = ('control-plane', map { $_->{name} } $pools->@*);
+    for my $pname (@order) {
+        my $size = $pname eq 'control-plane'
+            ? $cp_count : ($def_of{$pname}->{size} // 0);
+        my $pdef = $def_of{$pname} // {};
+        my @rec = sort {
+            (($a->{name} =~ /(\d+)$/)[0] // 1)
+                <=> (($b->{name} =~ /(\d+)$/)[0] // 1)
+        } @{ $rec_by_pool{$pname} // [] };
+        my @keep = splice(@rec, 0, $size);
+        push @retire, map { {
+            host => $_->{name}, vmid => $_->{vmid},
+            pvehost => $_->{pvehost},
+            role => $pname eq 'control-plane' ? 'cp' : 'worker',
+        } } @rec;
+        for my $item (@keep) {
+            my ($idx) = $item->{name} =~ /(\d+)$/;
+            push @merged, {
+                host => $item->{name},
+                role => $pname eq 'control-plane' ? 'cp' : 'worker',
+                pool => $pname, idx => $idx // 1, ip => $item->{ip},
+                vmid => $item->{vmid}, pvehost => $item->{pvehost},
+                rev => $item->{rev},
+                labels => $pdef->{labels}, taints => $pdef->{taints},
+                pool_hosts => $pdef->{hosts},
+                pool_storage => $pdef->{storage},
+            };
+        }
+        my $have = scalar @keep;
+        for my $cand (sort { $a->{idx} <=> $b->{idx} }
+            grep { $_->{pool} eq $pname } $desired->@*) {
+            last if $have >= $size;
+            next if $taken{$cand->{host}};
+            push @merged, { $cand->%* };
+            $taken{$cand->{host}} = 1;
+            $have++;
+        }
+    }
+    for my $pname (keys %rec_by_pool) {
+        next if $pname eq 'control-plane' || exists $def_of{$pname};
+        push @retire, map { {
+            host => $_->{name}, vmid => $_->{vmid},
+            pvehost => $_->{pvehost}, role => 'worker',
+        } } $rec_by_pool{$pname}->@*;
+    }
+    return (\@merged, \@retire);
+}
+
 # Record the node inventory in the cluster config so rolls,
 # upgrades and the UI know what is running where.
 my sub store_inventory {
@@ -1105,6 +1426,16 @@ my sub store_inventory {
         $cfg->{ids}->{$name}->{'template-rev'} = $rev;
         PVE::K8s::Config::store_config($cfg);
     });
+}
+
+# A qm config belongs to a template when it carries the
+# template flag. A template VM is never a reuse candidate,
+# even when its name matches: repurposing one destroys the
+# host's template cache (seen in the lab, 2026-10-27: the
+# r1 template became a worker). Pure and unit-tested.
+sub config_is_template {
+    my ($cfg) = @_;
+    return $cfg =~ /^template:\s*1/m ? 1 : 0;
 }
 
 # Clone (or reuse) one node VM on its placed host and wait
@@ -1132,6 +1463,15 @@ sub create_node_vm {
             }
         }
     }
+    if ($vm) {
+        my $cfg = eval {
+            qm_on($vm->{node}, 'config', $vm->{vmid}) } // '';
+        if (config_is_template($cfg)) {
+            print "not reusing $vmname (vmid $vm->{vmid} "
+                . "on $vm->{node} is a template)\n";
+            $vm = undef;
+        }
+    }
     my $vmid = $vm ? $vm->{vmid} : undef;
     if ($vm) {
         $target = $vm->{node};
@@ -1151,49 +1491,72 @@ sub create_node_vm {
         push @clone, '--storage', $node->{pool_storage}
             if $node->{pool_storage};
         qm_on($target, @clone);
-        # Dedicated-VNet clusters (T3.4 re-spec) attach to
-        # their own VNet, not the template's shared bridge.
-        if (my $bridge = $ctx->{bridge}) {
-            my $pre = qm_on($target, 'config', $vmid);
-            my ($mac) = $pre =~ /net0: virtio=([0-9A-Fa-f:]+)/;
-            qm_on($target, 'set', $vmid, '--net0',
-                "virtio=$mac,bridge=$bridge") if $mac;
-        }
-        # match the guest MTU to the bridge (VXLAN SDN
-        # bridges run below 1500; larger packets blackhole)
-        my $vmcfg = qm_on($target, 'config', $vmid);
-        if ($vmcfg =~ /net0: virtio=([0-9A-Fa-f:]+),bridge=([^\s,]+)/) {
-            my ($mac, $bridge) = ($1, $2);
-            my $mtu = bridge_mtu_on($target, $bridge);
-            qm_on($target, 'set', $vmid, '--net0',
-                "virtio=$mac,bridge=$bridge,mtu=$mtu") if $mtu < 1500;
-        }
-        # A migrated template copy can lose or mangle its
-        # cloud-init drive; without it the guest finds no
-        # datasource and never configures network or userdata.
-        my $storage = $node->{pool_storage} // $ctx->{storage}
-            // 'local-zfs';
-        if ($vmcfg !~ /^ide2: .*cloudinit/m) {
-            qm_on($target, 'set', $vmid, '--ide2', "$storage:cloudinit");
-        }
-        my $snippet = write_snippet_on($target,
-            "k8s-$vmname.yaml", $userdata);
-        qm_on($target, 'set', $vmid,
-            '--cicustom', "user=$snippet",
-            '--ipconfig0', "ip=$node->{ip}/24,gw=$gateway",
-            '--nameserver', '1.1.1.1',
-            '--memory', $node->{role} eq 'cp' ? 3072 : 4096,
-            '--cores', $node->{role} eq 'cp' ? 4 : 2,
-        );
-        qm_on($target, 'start', $vmid);
         print "created $vmname (vmid $vmid on $target, $node->{ip})\n";
     } else {
         $VM_HOST{$vmid} = $target;
-        eval { qm_on($target, 'start', $vmid) };
+        # A reused VM is unjoined by construction (joined ones
+        # are adopted upstream, never rebuilt here), so stop
+        # it first: the converge step below rewrites network
+        # attachments that only apply cleanly stopped.
+        eval { qm_on($target, 'stop', $vmid) };
         print "reusing $vmname (vmid $vmid on $target)\n";
     }
+    # Converge the VM to the desired shape on every path, not
+    # just fresh clones: a reused VM may predate the cluster
+    # VNet or carry no cloud-init identity at all (seen in
+    # the lab: a resumed roll reused a surge VM stuck on the
+    # default bridge with no address, and every join failed).
+    configure_node_vm($ctx, $target, $vmid, $node, $userdata);
+    qm_on($target, 'start', $vmid);
     $node->{vmid} = $vmid;
     wait_agent($vmid);
+    return $vmid;
+}
+
+# Bring an existing (freshly cloned or reused) node VM to the
+# desired network/cloud-init shape. Idempotent: re-running it
+# over an already-correct VM changes nothing. A plain package
+# sub (not lexical): it is called from create_node_vm above,
+# and a lexical defined below its caller is invisible there.
+sub configure_node_vm {
+    my ($ctx, $target, $vmid, $node, $userdata) = @_;
+
+    my $vmname = $node->{host};
+    # Dedicated-VNet clusters (T3.4 re-spec) attach to
+    # their own VNet, not the template's shared bridge.
+    if (my $bridge = $ctx->{bridge}) {
+        my $pre = qm_on($target, 'config', $vmid);
+        my ($mac) = $pre =~ /net0: virtio=([0-9A-Fa-f:]+)/;
+        qm_on($target, 'set', $vmid, '--net0',
+            "virtio=$mac,bridge=$bridge") if $mac;
+    }
+    # match the guest MTU to the bridge (VXLAN SDN
+    # bridges run below 1500; larger packets blackhole)
+    my $vmcfg = qm_on($target, 'config', $vmid);
+    if ($vmcfg =~ /net0: virtio=([0-9A-Fa-f:]+),bridge=([^\s,]+)/) {
+        my ($mac, $bridge) = ($1, $2);
+        my $mtu = bridge_mtu_on($target, $bridge);
+        qm_on($target, 'set', $vmid, '--net0',
+            "virtio=$mac,bridge=$bridge,mtu=$mtu") if $mtu < 1500;
+    }
+    # A migrated template copy can lose or mangle its
+    # cloud-init drive; without it the guest finds no
+    # datasource and never configures network or userdata.
+    my $storage = $node->{pool_storage} // $ctx->{storage}
+        // 'local-zfs';
+    if ($vmcfg !~ /^ide2: .*cloudinit/m) {
+        qm_on($target, 'set', $vmid, '--ide2', "$storage:cloudinit");
+    }
+    my $gateway = ($ctx->{gateway} // die "no gateway in ctx\n");
+    my $snippet = write_snippet_on($target,
+        "k8s-$vmname.yaml", $userdata);
+    qm_on($target, 'set', $vmid,
+        '--cicustom', "user=$snippet",
+        '--ipconfig0', "ip=$node->{ip}/24,gw=$gateway",
+        '--nameserver', '1.1.1.1',
+        '--memory', $node->{role} eq 'cp' ? 3072 : 4096,
+        '--cores', $node->{role} eq 'cp' ? 4 : 2,
+    );
     return $vmid;
 }
 
@@ -1480,13 +1843,39 @@ sub provision_cluster {
     # node VMs can attach to it. No-op in shared-VNet mode.
     my $bridge = ensure_cluster_vnet($name, $scfg);
 
-    my $template = find_template($version);
+    # Pin the template to the record revision (same floor
+    # as the roll engine): a repair running on a host that
+    # missed the newest template copy must distribute it,
+    # never clone its stale local copy while recording the
+    # newer revision.
+    my (undef, $local_tpl_rev) = find_template_in_list(qm('list'), $version);
+    my $want_tpl_rev = wanted_roll_rev(
+        $scfg->{'template-rev'}, $local_tpl_rev, 0);
+    my $template = ensure_template_rev_on(
+        local_node_name(), $version, $want_tpl_rev);
     print "using template vmid $template for Kubernetes $version\n";
     my $ctx = { version => $version, template => $template,
         gateway => $gateway, storage => $storage,
         bridge => $bridge };
 
-    my @nodes = cluster_nodes($name, $scfg, $prefix)->@*;
+    # Converge with the stored inventory when the cluster
+    # already exists: canonical names are only for a fresh
+    # cluster (converge_nodes explains why).
+    my $desired = cluster_nodes($name, $scfg, $prefix);
+    my $fresh = !$scfg->{nodes};
+    my @retire;
+    my @nodes;
+    if ($fresh) {
+        @nodes = $desired->@*;
+    } else {
+        my $record = JSON::PP->new->decode($scfg->{nodes});
+        my $pools = PVE::K8s::Config::parse_pools(
+            $scfg->{pools}, $scfg->{workers} // 2);
+        my ($keep, $ret) = converge_nodes(
+            $record, $desired, $pools, $scfg->{cp} // 3);
+        @nodes = $keep->@*;
+        @retire = $ret->@*;
+    }
     my $total = scalar @nodes;
 
     # --- placement (T2.1): spread CP across HA groups, then
@@ -1531,23 +1920,31 @@ sub provision_cluster {
         print "placement: $node->{host} -> $host (site $node->{site})\n";
     }
 
-    # --- first control-plane node: kubeadm init
+    # --- first control-plane node: kubeadm init, but only
+    # for a truly fresh cluster. On converge the cluster CA
+    # already exists, and initialising again would fork a
+    # second CA (zombie-cluster class bug); fresh clones
+    # join the existing control plane through the loop
+    # below instead.
     my $cp1 = $nodes[0];
     my $enc_key = cluster_encryption_key($name);
     create_node_vm($ctx, $cp1, node_userdata(
         hostname => $cp1->{host}, role => 'cp', vip => $vip,
         enc_key => $enc_key,
-        extra_runcmd => kubeadm_init_runcmd($vip, $cp1->{ip}),
+        extra_runcmd => $fresh
+            ? kubeadm_init_runcmd($vip, $cp1->{ip}) : '',
     ));
     # kubeadm init runs inside cloud-init, which may still be
     # running (or retrying) when the guest agent first answers:
-    # poll instead of failing on the first attempt.
+    # poll instead of failing on the first attempt. admin.conf
+    # (not super-admin.conf, which only the init node has)
+    # so the same gate passes on a converged existing node.
     my $cp_ready = 0;
     for (1 .. 40) {
         $cp_ready = eval {
             guest_exec($cp1->{vmid},
-                'test -f /etc/kubernetes/super-admin.conf && kubectl '
-                . '--kubeconfig /etc/kubernetes/super-admin.conf '
+                'test -f /etc/kubernetes/admin.conf && kubectl '
+                . '--kubeconfig /etc/kubernetes/admin.conf '
                 . "--server https://$cp1->{ip}:6443 get nodes >/dev/null");
             1;
         } // 0;
@@ -1555,7 +1952,13 @@ sub provision_cluster {
         sleep 15;
     }
     die "control plane on $cp1->{host} did not initialise\n" if !$cp_ready;
-    guest_exec($cp1->{vmid}, init_upload_config_cmd());
+    # Init completion phases only for a fresh cluster: they
+    # need /root/kubeadm-config.yaml and super-admin.conf,
+    # which only the init node's first boot has. On converge
+    # the cluster is already configured (binding, uploads,
+    # addons); re-running them would die on the missing
+    # files, so skip straight to join material.
+    guest_exec($cp1->{vmid}, init_upload_config_cmd()) if $fresh;
     # With the admin binding in place kube-vip can elect a leader
     # and bring up the VIP, which cp1's kubelet needs to register
     # its node object; later kubeadm phases require that object.
@@ -1563,7 +1966,7 @@ sub provision_cluster {
     for (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/super-admin.conf '
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
                 . "--server https://$cp1->{ip}:6443 get nodes --no-headers");
         } // '';
         $node_seen = 1 if $out =~ /^\Q$cp1->{host}\E\s/m;
@@ -1571,7 +1974,7 @@ sub provision_cluster {
         sleep 15;
     }
     die "node $cp1->{host} never registered via the VIP\n" if !$node_seen;
-    guest_exec($cp1->{vmid}, init_completion_cmd());
+    guest_exec($cp1->{vmid}, init_completion_cmd()) if $fresh;
     # The VIP answers now, so point join discovery at it before
     # any node joins: kubeadm writes the discovery endpoint
     # into each node's kubelet.conf, and a node address there
@@ -1623,11 +2026,12 @@ sub provision_cluster {
                 if !$joined;
         }
         # verify the node registered before joining the next one
+        # (admin.conf: joined nodes have no super-admin.conf)
         my $seen = 0;
         for (1 .. 40) {
             my $out = eval {
                 guest_exec($cp1->{vmid},
-                    'kubectl --kubeconfig /etc/kubernetes/super-admin.conf '
+                    'kubectl --kubeconfig /etc/kubernetes/admin.conf '
                     . "--server https://$cp1->{ip}:6443 get nodes --no-headers");
             } // '';
             $seen = 1 if $out =~ /^\Q$node->{host}\E\s/m;
@@ -1638,6 +2042,17 @@ sub provision_cluster {
         set_external_cloud_provider($node);
         ensure_kubelet_node_ip($node);
         print "$node->{host} joined\n";
+    }
+
+    # --- retire converged-away nodes (stale scale-in record
+    # entries, removed pools). The cluster is healthy here,
+    # so drains are safe; remove_node tolerates VMs that are
+    # already gone. Scale-in's own destroy path already
+    # PDB-drained live nodes before calling in.
+    for my $gone (@retire) {
+        print "converge: retiring $gone->{host} "
+            . "(beyond pool size or pool removed)\n";
+        remove_node($cp1, $gone, \@nodes);
     }
 
     # --- Ready gate: all nodes Ready according to kubectl
@@ -1788,8 +2203,7 @@ sub provision_cluster {
             . "(Cilium LB IPAM, L2 announcement)\n";
     }
 
-    my (undef, $template_rev) = find_template_in_list(qm('list'), $version);
-    store_inventory($name, \@nodes, $template_rev);
+    store_inventory($name, \@nodes, $want_tpl_rev);
     set_state($name, 'ready');
     print "cluster '$name' ready: $ready/$total nodes\n";
     return $total;
@@ -1801,6 +2215,43 @@ sub provision_cluster {
 # surging a replacement in before draining the old node out.
 # Control plane goes first, at most one at a time (maxSurge=1),
 # and only after an etcd snapshot exists.
+
+# Validate a maintenance window value (create and PUT
+# share the HH:MM-HH:MM shape). Pure and unit-tested.
+sub assert_maintenance_window {
+    my ($window) = @_;
+
+    $window =~ /^(\d\d):(\d\d)-(\d\d):(\d\d)$/
+        or die "maintenance-window must be HH:MM-HH:MM, "
+        . "got '$window'\n";
+    for my $h ($1, $3) {
+        die "maintenance-window hour out of range in '$window'\n"
+            if $h > 23;
+    }
+    for my $m ($2, $4) {
+        die "maintenance-window minute out of range in '$window'\n"
+            if $m > 59;
+    }
+    return $window;
+}
+
+# Update the mutable rollout options of a cluster (the S3
+# scenario narrows and opens the window around a roll).
+sub set_cluster_options {
+    my ($name, $opts) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name}
+            or die "cluster '$name' does not exist\n";
+        if (defined $opts->{'maintenance-window'}) {
+            $scfg->{'maintenance-window'} = assert_maintenance_window(
+                $opts->{'maintenance-window'});
+        }
+        PVE::K8s::Config::store_config($cfg);
+    });
+    return undef;
+}
 
 sub in_maintenance_window {
     my ($window, $now) = @_;
@@ -1885,7 +2336,10 @@ my sub etcd_member_remove {
     print "etcd member $old_host ($id) removed\n";
 }
 
-my sub kubectl_on {
+# Plain package sub (not lexical): joined_names calls it
+# from above this declaration, and a lexical defined
+# below its caller is invisible there.
+sub kubectl_on {
     my ($cp, $args) = @_;
     # admin.conf exists on every control-plane node;
     # local-super-admin.conf only ever existed on the init node
@@ -1923,7 +2377,11 @@ my sub label_node {
     }
 }
 
-my sub remove_node {
+# Plain package sub (not lexical): provision_cluster
+# calls it from above this declaration, and a lexical
+# defined below its caller is invisible there (same trap
+# as configure_node_vm).
+sub remove_node {
     my ($cp, $old, $all) = @_;
 
     eval { kubectl_on($cp, "cordon $old->{host}") };
@@ -1934,13 +2392,58 @@ my sub remove_node {
             $_->{role} eq 'cp' && $_->{host} ne $old->{host} } $all->@*;
         etcd_member_remove($survivor, $old->{host}) if $survivor;
     }
-    eval { guest_exec($old->{vmid}, 'kubeadm reset -f') };
+    # Verify the VM's identity before touching the guest or
+    # the hypervisor: vmids are recycled by nextid, so a
+    # stale record entry can point at an unrelated live
+    # replacement (seen in the lab: removing ghost w2 ran
+    # kubeadm reset on live cp8, which shared vmid 106).
+    # A ghost (gone, or name recycled) skips VM ops while
+    # the node object and record entry are still cleaned.
+    my ($vmid, $vhost) = verify_node_vm($old);
+    if ($vmid) {
+        $VM_HOST{$vmid} = $vhost;
+        eval { guest_exec($vmid, 'kubeadm reset -f') };
+    } else {
+        print "node VM $old->{host} not at recorded "
+            . "location (gone or vmid recycled); "
+            . "skipping guest/hypervisor ops\n";
+    }
     eval { kubectl_on($cp, "delete node $old->{host}") };
-    eval { qm_on($old->{pvehost}, 'stop', $old->{vmid}) };
-    qm_on($old->{pvehost}, 'destroy', $old->{vmid}, '--purge',
-        '--destroy-unreferenced-disks', 1);
-    remove_snippet_on($old->{pvehost}, "k8s-$old->{host}.yaml");
+    if ($vmid) {
+        eval { qm_on($vhost, 'stop', $vmid) };
+        eval { qm_on($vhost, 'destroy', $vmid, '--purge',
+            '--destroy-unreferenced-disks', 1) };
+    }
+    remove_snippet_on($vhost // $old->{pvehost}, "k8s-$old->{host}.yaml");
     print "removed $old->{host} (vmid $old->{vmid} on $old->{pvehost})\n";
+}
+
+# Locate a record node's real VM: (vmid, host) when a VM
+# with the recorded name exists, undef when the VM is gone
+# or its vmid was recycled by an unrelated VM. The record
+# location is checked first; a same-name VM on another
+# host is accepted only with the same vmid (moved, not
+# recycled). A same name with a different vmid means the
+# vmid was recycled: hands off, unconditionally. Plain
+# package sub: remove_node calls it from above.
+sub verify_node_vm {
+    my ($old) = @_;
+
+    my $cfg = eval {
+        qm_on($old->{pvehost}, 'config', $old->{vmid}) } // '';
+    my ($vname) = $cfg =~ /^name:\s*(\S+)/m;
+    return ($old->{vmid}, $old->{pvehost})
+        if $vname && $vname eq $old->{host};
+    return if $vname;
+    for my $h (pve_online_nodes()->@*) {
+        next if $h eq $old->{pvehost};
+        my $list = eval { qm_on($h, 'list') } // '';
+        if ($list =~ /^\s*(\d+)\s+\Q$old->{host}\E\s/m) {
+            return ($1, $h) if $1 eq $old->{vmid};
+            return;
+        }
+    }
+    return;
 }
 
 # --- autoscaler (T2.4) -------------------------------------
@@ -2039,6 +2542,17 @@ sub scale_cluster {
     return $acted;
 }
 
+# The scaler only acts on a settled cluster. Rolls,
+# upgrades and provisions converge membership themselves;
+# a scaler pass in the middle destroys nodes that are only
+# transiently idle or NotReady (seen in the lab,
+# 2026-10-27: a pass during upgrade churn removed a
+# 13-minute-old worker). Pure and unit-tested.
+sub scaler_may_act {
+    my ($state) = @_;
+    return ($state // '') eq 'ready' ? 1 : 0;
+}
+
 sub scale_reconcile {
     my ($name) = @_;
 
@@ -2047,6 +2561,12 @@ sub scale_reconcile {
         or die "cluster '$name' does not exist\n";
     die "cluster '$name' is not provisioned yet\n"
         if !$scfg->{nodes};
+    if (!scaler_may_act($scfg->{state})) {
+        print "scale: cluster '$name' is "
+            . ($scfg->{state} // 'unknown')
+            . ", standing down\n";
+        return 0;
+    }
     my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
     my $prefix = $1;
@@ -2103,6 +2623,14 @@ sub scale_reconcile {
         print "repair: replacing dead node $node->{host} "
             . "(NotReady ${since}s, VM silent)\n";
         remove_node($cp, $node, \@nodes);
+        # Drop the destroyed node from the record BEFORE
+        # recreating it: if provision_cluster dies midway
+        # (host reset, network cut), the record must not
+        # keep pointing at a VM that no longer exists.
+        # provision_cluster rebuilds the pool to size and
+        # stores a fresh inventory at the end.
+        @nodes = grep { $_->{host} ne $node->{host} } @nodes;
+        store_inventory($name, \@nodes, $scfg->{'template-rev'});
         provision_cluster($name);
         print "repair: $node->{host} replaced\n";
         return 1;
@@ -2273,12 +2801,23 @@ sub scale_reconcile {
                 . "left in place\n";
             return 0;
         }
-        eval { guest_exec($node->{vmid}, 'kubeadm reset -f') };
+        # Same vmid-recycle guard as remove_node: verify
+        # the VM's identity before reset/destroy.
+        my ($svmid, $svhost) = verify_node_vm($node);
+        if ($svmid) {
+            $VM_HOST{$svmid} = $svhost;
+            eval { guest_exec($svmid, 'kubeadm reset -f') };
+        }
         kubectl_on($cp, "delete node $host");
-        eval { qm_on($node->{pvehost}, 'stop', $node->{vmid}) };
-        qm_on($node->{pvehost}, 'destroy', $node->{vmid},
-            '--purge', '--destroy-unreferenced-disks', 1);
-        remove_snippet_on($node->{pvehost}, "k8s-$host.yaml");
+        if ($svmid) {
+            eval { qm_on($svhost, 'stop', $svmid) };
+            qm_on($svhost, 'destroy', $svmid,
+                '--purge', '--destroy-unreferenced-disks', 1);
+        } else {
+            print "scale: node VM $host not at recorded "
+                . "location; skipping hypervisor destroy\n";
+        }
+        remove_snippet_on($svhost // $node->{pvehost}, "k8s-$host.yaml");
         set_pool_size($name, $pool->{name}, $pool->{size} - 1);
         provision_cluster($name);
         return 1;
@@ -2309,8 +2848,11 @@ sub roll_cluster {
     my $gateway = $scfg->{gateway} // "$prefix.1";
     my $version = $opts{target_version} // $scfg->{'k8s-version'};
 
-    my $template = find_template($version);
-    my (undef, $want_rev) = find_template_in_list(qm('list'), $version);
+    my (undef, $local_rev) = find_template_in_list(qm('list'), $version);
+    my $want_rev = wanted_roll_rev($scfg->{'template-rev'}, $local_rev,
+        $opts{target_version} ? 1 : 0);
+    my $template = ensure_template_rev_on(
+        local_node_name(), $version, $want_rev);
     print "rolling '$name' to Kubernetes $version template r$want_rev\n";
 
     # After a roll, node names no longer match the canonical
@@ -2357,17 +2899,6 @@ sub roll_cluster {
     my $group_of = ha_group_by_host();
     $_->{site} = $group_of->{$_->{pvehost}} // $_->{pvehost} for @nodes;
 
-    my @behind = grep {
-        !defined $_->{rev} || $_->{rev} != $want_rev
-        || ($opts{target_version}
-            && $version ne $scfg->{'k8s-version'})
-    } @nodes;
-    if (!@behind) {
-        print "all nodes already on Kubernetes $version r$want_rev\n";
-        return 0;
-    }
-
-    set_state($name, 'rolling');
     my $ctx = { version => $version, template => $template,
         gateway => $gateway, storage => $scfg->{storage} // 'local-zfs',
         bridge => cluster_bridge($scfg) };
@@ -2388,6 +2919,132 @@ sub roll_cluster {
     }
     print "roll operations via $cp1->{host}\n";
 
+    # Adopt live members the record does not know before
+    # planning anything. A run that died after a replacement
+    # joined but before the inventory was stored left that
+    # member invisible: the next run planned from the stale
+    # record alone and surged yet another node (lab,
+    # 2026-10-27: 8 control-plane nodes against a spec of
+    # 3, etcd at 6 members). Adopted members carry their
+    # real VM location, live InternalIP and image revision,
+    # so the plan below counts them, placement spreads
+    # around them, and no name or address is reissued while
+    # they live. Adoption is best-effort: with the API down
+    # nothing is adopted and names/addresses stay
+    # conservative via the live-VM scan below.
+    my $pool_defs = PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2);
+    my %pdef_of = map { $_->{name} => $_ } $pool_defs->@*;
+    my $vms = cluster_vms();
+    my %live_kubelet;
+    my %known = map { $_->{host} => 1 } @nodes;
+    my $live = eval {
+        JSON::PP->new->decode(
+            scalar kubectl_on($cp1, 'get nodes -o json')) } // {};
+    my $adopted = 0;
+    for my $item ($live->{items} // []) {
+        my $lname = $item->{metadata}{name} // '';
+        $live_kubelet{$lname} =
+            $item->{status}{nodeInfo}{kubeletVersion} // '';
+        next if $known{$lname};
+        my ($pool, $idx);
+        if ($lname =~ /^\Q$name\E-cp(\d+)$/) {
+            ($pool, $idx) = ('control-plane', $1 + 0);
+        } elsif ($lname =~ /^\Q$name\E-w(\d+)$/) {
+            ($pool, $idx) = ('default', $1 + 0);
+        } else {
+            for my $pname (sort keys %pdef_of) {
+                next if $lname !~ /^\Q$name\E-\Q$pname\E(\d+)$/;
+                ($pool, $idx) = ($pname, $1 + 0);
+                last;
+            }
+        }
+        if (!defined $pool) {
+            print "roll: joined node $lname is not a "
+                . "$name node name; leaving it unmanaged\n";
+            next;
+        }
+        my $vm = $vms->{$lname};
+        if (!$vm) {
+            print "roll: joined node $lname has no VM; "
+                . "leaving it unmanaged\n";
+            next;
+        }
+        my ($ip) = map { $_->{address} }
+            grep { ($_->{type} // '') eq 'InternalIP' }
+            ($item->{status}{addresses} // [])->@*;
+        my $pdef = $pdef_of{$pool} // {};
+        my $node = {
+            host => $lname,
+            role => $pool eq 'control-plane' ? 'cp' : 'worker',
+            pool => $pool, idx => $idx, ip => $ip,
+            vmid => $vm->{vmid}, pvehost => $vm->{node},
+            labels => $pdef->{labels}, taints => $pdef->{taints},
+            pool_hosts => $pdef->{hosts},
+            pool_storage => $pdef->{storage},
+        };
+        $node->{rev} = node_rev_on($node);
+        $node->{site} = $group_of->{$node->{pvehost}}
+            // $node->{pvehost};
+        $VM_HOST{$node->{vmid}} = $node->{pvehost};
+        push @nodes, $node;
+        $known{$lname} = 1;
+        $adopted++;
+        print "roll: adopted live member $lname "
+            . "(vmid $node->{vmid} on $node->{pvehost})\n";
+    }
+    if ($adopted) {
+        @nodes = sort { $a->{role} cmp $b->{role} } @nodes;
+        store_inventory($name, \@nodes,
+            $scfg->{'template-rev'} // $want_rev);
+    }
+
+    # Addresses held by any live cluster VM, joined or not:
+    # a failed-join leftover still owns its ipconfig address
+    # on the wire, so surge allocation must clear it too.
+    my @live_ip_nodes;
+    for my $vname (sort keys $vms->%*) {
+        next if $vname !~ /^\Q$name\E-/;
+        my $cfgtext = eval { qm_on($vms->{$vname}{node},
+            'config', $vms->{$vname}{vmid}) } // '';
+        push @live_ip_nodes, { ip => $1 }
+            if $cfgtext =~ /^ipconfig0:.*?\bip=(\d+\.\d+\.\d+\.\d+)/m;
+    }
+
+    # A node is current when its image revision matches the
+    # target and, for a version upgrade, its live kubelet
+    # already runs the target minor. Comparing the live
+    # kubelet keeps a resume from re-replacing members an
+    # earlier pass already upgraded while the record was
+    # stale. With the API down the kubelet is unknown and
+    # the node counts as behind (re-replacing beats
+    # skipping a node that needs the roll).
+    for my $node (@nodes) {
+        my $at_target = 1;
+        if ($opts{target_version}) {
+            my $kv = $live_kubelet{$node->{host}} // '';
+            $at_target = $kv =~ /^v?\Q$version\E\./ ? 1 : 0;
+        }
+        $node->{current} = (defined $node->{rev}
+            && $node->{rev} == $want_rev && $at_target) ? 1 : 0;
+    }
+    my @behind = grep { !$_->{current} } @nodes;
+    my %desired = ('control-plane' => $scfg->{cp} // 3,
+        map { $_->{name} => $_->{size} // 0 } $pool_defs->@*);
+    my $plan = roll_plan(\@nodes, \%desired);
+    # Work list: behind nodes in order, then any excess
+    # current members the plan retires to reach spec.
+    my @work = (@behind, grep {
+        $_->{current}
+            && ($plan->{$_->{host}} // '') eq 'retire-only'
+    } @nodes);
+    if (!@work) {
+        print "all nodes already on Kubernetes $version r$want_rev\n";
+        return 0;
+    }
+
+    set_state($name, 'rolling');
+
     # etcd snapshot gate before any control-plane replacement
     etcd_snapshot($cp1) if grep { $_->{role} eq 'cp' } @behind;
 
@@ -2403,29 +3060,58 @@ sub roll_cluster {
 
     my ($join_cmd, $cert_key);
     my $upgraded = 0;
-    for my $old (@behind) {
+    # Names taken by record nodes plus joined members plus
+    # every live VM name (create_node_vm re-scans every host
+    # as a backstop, so a stale aggregate here can only
+    # waste an index, never duplicate a VM).
+    my $taken = taken_names(\@nodes, {
+        map { $_ => 1 } keys %{ joined_names($cp1) },
+        keys $vms->%* });
+    for my $old (@work) {
+        # No surge when current members already cover this
+        # node's pool: retire it directly so membership
+        # converges to spec instead of growing by one
+        # replacement per interrupted run.
+        if (($plan->{$old->{host}} // 'surge') eq 'retire-only') {
+            print "roll: $old->{host} already covered by "
+                . "current members; retiring without a surge\n";
+            my @remaining = grep {
+                $_->{host} ne $old->{host} } @nodes;
+            remove_node($cp1, $old, \@remaining);
+            @nodes = @remaining;
+            $cp1 = (grep { $_->{role} eq 'cp' } @nodes)[0]
+                if $cp1->{host} eq $old->{host};
+            store_inventory($name, \@nodes, $want_rev);
+            print "rolled away $old->{host} (no surge)\n";
+            next;
+        }
         # surge: build the replacement first, with a fresh
         # name/IP (next free index in its role/pool)
         my $new = { $old->%* };
         if ($old->{role} eq 'cp') {
             my $next = 1 + (sort { $b <=> $a }
                 map { $_->{idx} } grep { $_->{role} eq 'cp' } @nodes)[0];
+            $next = next_free_index("$name-cp", $taken, $next);
             $new->{host} = "$name-cp$next";
             $new->{idx} = $next;
-            $new->{ip} = "$prefix." . (59 + $next);
+            $new->{ip} = surge_cp_ip($prefix, $next,
+                [@nodes, @live_ip_nodes]);
         } else {
             my @pool = grep { $_->{pool} eq $old->{pool} } @nodes;
             my $next = 1 + (sort { $b <=> $a } map { $_->{idx} } @pool)[0];
-            $new->{host} = $old->{pool} eq 'default'
-                ? "$name-w$next" : "$name-$old->{pool}$next";
+            my $stem = $old->{pool} eq 'default'
+                ? "$name-w" : "$name-$old->{pool}";
+            $next = next_free_index($stem, $taken, $next);
+            $new->{host} = "$stem$next";
             $new->{idx} = $next;
             my $max_ip = (sort { $b <=> $a }
                 map { /(\d+)$/ ? int $1 : 69 }
-                map { $_->{ip} } @nodes)[0];
+                map { $_->{ip} } (@nodes, @live_ip_nodes))[0];
             $new->{ip} = "$prefix." . ($max_ip + 1);
         }
         delete $new->{vmid};
         delete $new->{rev};
+        $taken->{$new->{host}} = 1;
 
         # placement: prefer a different host than the old node
         my %counts;
@@ -2462,7 +3148,12 @@ sub roll_cluster {
             $adopted = $out =~ /^\Q$new->{host}\E\s/m ? 1 : 0;
         }
         if ($adopted) {
-            $new->{vmid} = cluster_vms()->{$new->{host}}->{vmid};
+            my $here = cluster_vms()->{$new->{host}};
+            $new->{vmid} = $here->{vmid};
+            # the adopted VM lives where it lives, not where
+            # placement guessed: record the actual host so the
+            # inventory never points at the wrong PVE node
+            $new->{pvehost} = $here->{node} // $new->{pvehost};
             $VM_HOST{$new->{vmid}} = $new->{pvehost};
             print "adopting already-joined replacement $new->{host}\n";
             goto ADOPTED;
@@ -2482,12 +3173,27 @@ sub roll_cluster {
         # new-version CP joins, run kubeadm upgrade apply on an
         # existing CP with the target kubeadm binary fetched to
         # /tmp (the node itself stays immutable and is replaced
-        # later in this same roll).
+        # later in this same roll). A resumed run must not
+        # re-apply an upgrade a previous run already finished
+        # (lab, 2026-10-27: every resume re-ran preflight plus
+        # apply against a slow API until a transient reset
+        # killed it): when the live server is already at the
+        # target, mark it done and move on.
         if ($opts{target_version} && !$upgraded
             && $new->{role} eq 'cp') {
             my $kver = guest_exec($new->{vmid},
                 'kubeadm version -o short');
             chomp $kver;
+            my $live = eval {
+                server_git_version(scalar kubectl_on($cp1,
+                    'version -o json'))
+            } // '';
+            if ($live ne '' && !upgrade_apply_needed($live, $kver)) {
+                print "control plane already at $live, "
+                    . "skipping kubeadm upgrade apply\n";
+                $upgraded = 1;
+            }
+            if (!$upgraded) {
             guest_exec($cp1->{vmid},
                 "curl -sL https://dl.k8s.io/release/$kver/bin/linux/"
                 . 'amd64/kubeadm -o /tmp/kubeadm && chmod +x /tmp/kubeadm');
@@ -2519,6 +3225,7 @@ sub roll_cluster {
             }
             $upgraded = 1;
             print "control plane upgraded to $kver via $cp1->{host}\n";
+            }
         }
 
         # Join material is refreshed for every replacement, and
@@ -2535,14 +3242,22 @@ sub roll_cluster {
         chomp $cert_key;
         my $join = join_command($join_cmd, $cert_key,
             $new->{role} eq 'cp' ? 1 : 0);
-        my $joined = 0;
+        my ($joined, $join_err) = (0, '');
         for my $attempt (1 .. 3) {
             $joined = eval { guest_exec($new->{vmid}, $join); 1 } // 0;
+            $join_err = $@ if !$joined;
             last if $joined;
             eval { guest_exec($new->{vmid}, 'kubeadm reset -f') };
             sleep 20;
         }
-        die "replacement $new->{host} failed to join\n" if !$joined;
+        if (!$joined) {
+            # the join command carries the bootstrap token and
+            # the certificate key: never let them reach the log
+            $join_err =~ s/--token\s+\S+/--token REDACTED/g;
+            $join_err =~ s/--certificate-key\s+\S+/--certificate-key REDACTED/g;
+            $join_err =~ s/[a-z0-9]{6}\.[a-z0-9]{16}/TOKEN-REDACTED/g;
+            die "replacement $new->{host} failed to join: $join_err";
+        }
       ADOPTED:
         set_external_cloud_provider($new);
         ensure_kubelet_node_ip($new);
@@ -3729,8 +4444,13 @@ sub restore_cluster {
         die "backup '$file' has no PKI archive; fresh-set "
             . "restore is impossible (workers could not "
             . "trust a new CA)\n" if !-f "$path.pki.tgz";
+        my (undef, $restore_rev) = find_template_in_list(
+            qm('list'), $scfg->{'k8s-version'});
+        $restore_rev = wanted_roll_rev(
+            $scfg->{'template-rev'}, $restore_rev, 0);
         my $ctx = { version => $scfg->{'k8s-version'},
-            template => find_template($scfg->{'k8s-version'}),
+            template => ensure_template_rev_on(local_node_name(),
+                $scfg->{'k8s-version'}, $restore_rev),
             # node gateway always derives from the NODE
             # subnet (the VIP may live on the public one)
             gateway => $scfg->{gateway}
@@ -4007,8 +4727,18 @@ sub upgrade_cluster {
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
     my $to = assert_minor_upgrade($scfg->{'k8s-version'}, $target);
-    # template must exist before anything is touched
-    find_template($to);
+    # the target template must exist somewhere in the PVE
+    # cluster before anything is touched (the roll
+    # distributes it to whichever host clones from it)
+    my $lists = qm('list');
+    for my $h (pve_online_nodes()->@*) {
+        next if $h eq local_node_name();
+        $lists .= "\n" . (eval { qm_on($h, 'list') } // '');
+    }
+    my ($upgrade_tpl) = find_template_in_list($lists, $to);
+    die "no template k8s-node-$to-r* found on any host; "
+        . "build one first (images/)\n"
+        if !defined $upgrade_tpl;
     return roll_cluster($name, target_version => $to, force => $opts{force});
 }
 

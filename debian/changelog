@@ -1,3 +1,15 @@
+pve-k8s-manager (0.1.0-1) bookworm; urgency=medium
+
+  * Cluster lifecycle from the PVE UI/API: create, provision,
+    surge rolling replacement, one-minor upgrades, scale,
+    backup/restore, delete with orphan audit.
+  * Immutable Debian node templates for Kubernetes 1.35/1.36;
+    Cilium CNI; kube-vip control-plane VIP; Proxmox SDN VNets.
+  * Maintainer scripts apply/remove the pve-manager
+    integration points (INTEGRATION.md), idempotently.
+
+ -- pve-k8s contributors  Wed, 28 Oct 2026 00:00:00 +0000
+
 pve-k8s-manager (0.0.0-1) bookworm; urgency=medium
 
   * Initial skeleton package (Increment 0). No product behaviour.

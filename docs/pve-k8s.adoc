@@ -1,0 +1,50 @@
+= Kubernetes Clusters on Proxmox VE
+:toc: left
+
+Draft administrator guide for the `pve-k8s-manager` package.
+This is a starting point for the pve-manager documentation
+tree, not finished documentation.
+
+== Overview
+
+The package provisions kubeadm Kubernetes clusters on
+Proxmox VMs from the web UI (Datacenter -> Kubernetes) or
+the `/cluster/k8s` API. Nodes are immutable: they are built
+from versioned Debian templates and replaced, never patched,
+for rolling changes and upgrades. Only Kubernetes 1.35 and
+1.36 are offered, matching the add-on-tested minors.
+
+== Prerequisites
+
+* A Proxmox VE cluster with an SDN zone (EVPN recommended)
+  to act as the tenant VRF.
+* Shared storage reachable by all hosts that run templates.
+* Node templates built with `images/build-template.sh` on a
+  builder VM for each supported Kubernetes minor.
+* Per cluster: one VNet with an internal node subnet and a
+  public subnet for load-balancer IPs and the control-plane
+  VIP. Creating or deleting a cluster needs no router or
+  fabric reconfiguration.
+
+== Day-2 operations
+
+Create, provision, roll (template revision change), upgrade
+(one minor at a time), scale pools, backup/restore etcd, and
+delete with an orphan audit (VMs, disks, SDN objects) are
+available both in the UI and under `pvesh /cluster/k8s`.
+Rolling operations honour the cluster's maintenance window
+unless forced.
+
+The autoscaler runs on the PVE hosts, outside Kubernetes:
+a leader-elected pass simulates pending pods against the
+node pools and adds or retires whole VMs, respecting PDBs,
+affinity and volume constraints. It stands down while a
+cluster is provisioning, rolling or upgrading.
+
+== Safety notes
+
+* Control-plane VMs spread across hosts/HA groups on a
+  best-effort basis; hard anti-affinity is not yet enforced.
+* There is no automated fencing. Before powering off a host
+  manually, make sure its control-plane nodes are not needed
+  for etcd quorum and do not hold the VIP alone.

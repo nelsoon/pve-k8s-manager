@@ -1,0 +1,8 @@
+#!/bin/sh
+# pve-k8s-manager postrm: remove the integration points
+# from stock pve-manager files (the patcher between the
+# heredoc markers is embedded by the Makefile from
+# debian/integrate.pl). Cluster configuration under
+# /etc/pve/k8s is user data and stays on remove and purge.
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    perl - remove <<'PVE_K8S_INTEGRATE_EOF' || true

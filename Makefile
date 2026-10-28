@@ -1,5 +1,5 @@
 PACKAGE := pve-k8s-manager
-VERSION := 0.0.0-1
+VERSION := 0.1.0-1
 BUILD   := build
 STAGE   := $(BUILD)/stage
 DEB     := $(BUILD)/$(PACKAGE)_$(VERSION)_all.deb
@@ -30,10 +30,24 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/network-t34.t
 	@perl -I. -Itests/stubs tests/unit/storage-t36a.t
 	@perl -I. -Itests/stubs tests/unit/volumes-t36b.t
+	@perl -I. -Itests/stubs tests/unit/delete-orphan-audit.t
+	@perl -I. -Itests/stubs tests/unit/update-options.t
+	@perl -I. -Itests/stubs tests/unit/roll-rev-floor.t
+	@perl -I. -Itests/stubs tests/unit/converge-nodes.t
+	@perl -I. -Itests/stubs tests/unit/no-forward-lexical.t
+	@perl -I. -Itests/stubs tests/unit/kube-vip-lease.t
+	@perl -I. -Itests/stubs tests/unit/reuse-template-guard.t
+	@perl -I. -Itests/stubs tests/unit/scaler-standdown.t
+	@perl -I. -Itests/stubs tests/unit/surge-cp-ip.t
+	@perl -I. -Itests/stubs tests/unit/roll-plan.t
+	@perl -I. -Itests/stubs tests/unit/packaging.t
+	@perl -I. -Itests/stubs tests/unit/upgrade-apply-skip.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
-# Skeleton packaging: stage the payload and build with dpkg-deb.
-# A full debhelper build replaces this in Increment 4 (T4.3).
+# Packaging: stage the payload and build with dpkg-deb.
+# Maintainer scripts are real (debian/postinst.*, postrm.*,
+# integrate.pl); a debhelper flow can replace the staging
+# later without changing them.
 deb:
 	@mkdir -p $(STAGE)/DEBIAN $(STAGE)/usr/share/perl5 $(STAGE)/usr/share/pve-manager/js
 	@mkdir -p $(STAGE)/usr/sbin $(STAGE)/lib/systemd/system
@@ -47,10 +61,12 @@ deb:
 	@mkdir -p $(STAGE)/etc/sysctl.d
 	@install -m 0644 systemd/99-pve-k8s-vrf.conf \
 		$(STAGE)/etc/sysctl.d/99-pve-k8s-vrf.conf
-	@printf '#!/bin/sh\nset -e\nif [ "$$1" = configure ]; then\n  sysctl -q -p /etc/sysctl.d/99-pve-k8s-vrf.conf || true\nfi\nexit 0\n' \
-		> $(STAGE)/DEBIAN/postinst
-	@chmod 0755 $(STAGE)/DEBIAN/postinst
-	@printf 'Package: $(PACKAGE)\nVersion: $(VERSION)\nArchitecture: all\nMaintainer: pve-k8s contributors\nDescription: Kubernetes cluster management for Proxmox VE\n Provisions and manages kubeadm Kubernetes clusters on Proxmox\n VMs from the Proxmox web UI, using Proxmox SDN and storage.\n' > $(STAGE)/DEBIAN/control
+	@cat debian/postinst.head debian/integrate.pl \
+		debian/postinst.tail > $(STAGE)/DEBIAN/postinst
+	@cat debian/postrm.head debian/integrate.pl \
+		debian/postrm.tail > $(STAGE)/DEBIAN/postrm
+	@chmod 0755 $(STAGE)/DEBIAN/postinst $(STAGE)/DEBIAN/postrm
+	@printf 'Package: $(PACKAGE)\nVersion: $(VERSION)\nArchitecture: all\nMaintainer: pve-k8s contributors\nDepends: pve-manager, perl\nDescription: Kubernetes cluster management for Proxmox VE\n Provisions and manages kubeadm Kubernetes clusters on Proxmox\n VMs from the Proxmox web UI, using Proxmox SDN and storage.\n' > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEB) >/dev/null
 	@echo "built $(DEB)"
 
