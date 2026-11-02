@@ -1092,6 +1092,12 @@ my sub ensure_cluster_vnet {
     my $vnets = sdn_get('/cluster/sdn/vnets');
     my ($existing) = grep { ($_->{vnet} // '') eq $vnet }
         $vnets->@*;
+    # Truncated VNet ids can collide between long cluster
+    # names; never hijack another cluster's VNet.
+    die "SDN VNet '$vnet' already belongs to cluster '"
+        . ($existing->{alias} // '?') . "', not '$name'; "
+        . "use a shorter or more distinct cluster name\n"
+        if $existing && ($existing->{alias} // '') ne $name;
     my $vni = $scfg->{'sdn-vni'};
     if (!$existing) {
         if (!$vni) {
@@ -5026,7 +5032,7 @@ sub parse_top_pods {
         next if $line !~ /^(\S+)\s+(\S+)\s+(\d+)m?\s+(\d+)(Ki|Mi|Gi)\s*$/;
         my ($ns, $pod, $cpu, $num, $unit) = ($1, $2, $3, $4, $5);
         my $mem = $unit eq 'Gi' ? $num * 1024
-            : $unit eq 'Ki' ? int($num / 1024) : $num;
+            : $unit eq 'Ki' ? int($num / 1024) : $num + 0;
         push @rows, { namespace => $ns, name => $pod,
             cpu_m => $cpu + 0, mem_mi => $mem };
     }

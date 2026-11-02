@@ -481,9 +481,12 @@ sub cephfs_name {
 sub cluster_vnet_name {
     my ($name) = @_;
 
+    # PVE VNet ids are at most 8 characters: 'k8s' + 5.
+    # (Was 7: 'k8suitest' died with a raw pvesh 400 halfway
+    # into provision, lab 2026-11-02.)
     my $clean = lc $name;
     $clean =~ s/[^a-z0-9]//g;
-    return 'k8s' . substr($clean, 0, 7);
+    return 'k8s' . substr($clean, 0, 5);
 }
 
 # The apiserver VIP: on the public subnet in dedicated

@@ -149,7 +149,9 @@ is(PVE::K8s::Config::vip_for({
         'public-subnet' => '192.168.212.0/24' }),
     '192.168.212.59', 'dedicated VIP sits on the public subnet');
 is(PVE::K8s::Config::cluster_vnet_name('Tenant Lab 6!'),
-    'k8stenantl', 'VNet ids are short and bridge-safe');
+    'k8stenan', 'VNet ids fit the PVE 8-char limit');
+is(PVE::K8s::Config::cluster_vnet_name('uitest'),
+    'k8suites', 'long cluster names truncate to 8 chars');
 
 my $prov = do {
     open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
