@@ -1896,6 +1896,18 @@ sub provision_cluster {
     # never clone its stale local copy while recording the
     # newer revision.
     my (undef, $local_tpl_rev) = find_template_in_list(qm('list'), $version);
+    # No template anywhere yet and the cluster recorded a
+    # builder address: the plugin builds its own template
+    # instead of dying "build one first" (fresh installs
+    # must not need operator shell work).
+    if ($local_tpl_rev < 0 && $scfg->{'builder-ip'}) {
+        print "no template for $version; building one\n";
+        build_template($version,
+            builder_ip => $scfg->{'builder-ip'},
+            gateway => $gateway, storage => $storage);
+        (undef, $local_tpl_rev) = find_template_in_list(
+            qm('list'), $version);
+    }
     my $want_tpl_rev = wanted_roll_rev(
         $scfg->{'template-rev'}, $local_tpl_rev, 0);
     my $template = ensure_template_rev_on(
@@ -4834,6 +4846,123 @@ sub cluster_events {
     $limit //= 100;
     @events = @events[-$limit .. -1] if @events > $limit;
     return \@events;
+}
+
+# --- certificate expiry (kubeadm PKI expires after 1 year;
+# nothing else in the plugin ever looked). Parse is pure and
+# unit-tested; the live path runs check-expiration on the ops
+# CP. Renewal happens by rolling/upgrading CPs onto fresh
+# nodes (new certs), or by `kubeadm certs renew all` issued
+# by the operator; this surfaces the deadline before either
+# becomes an outage.
+sub parse_cert_expiration {
+    my ($text) = @_;
+
+    my @rows;
+    for my $line (split /\n/, $text // '') {
+        next if $line !~ /^(\S+)\s+(\w{3} \d+, \d{4} \d{2}:\d{2} UTC)\s+(\S+)/;
+        my ($cert, $expires, $residual) = ($1, $2, $3);
+        my $days = $residual =~ /^(\d+)d/ ? $1 + 0
+            : $residual =~ /^(\d+)h/ ? int($1 / 24)
+            : undef;
+        push @rows, {
+            certificate => $cert, expires => $expires,
+            residual => $residual, days => $days,
+            level => !defined $days ? 'unknown'
+                : $days <= 30 ? 'critical'
+                : $days <= 90 ? 'warning' : 'ok',
+        };
+    }
+    return \@rows;
+}
+
+sub cert_expiry {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    my $out = guest_exec($cp->{vmid},
+        'kubeadm certs check-expiration 2>/dev/null');
+    my $rows = parse_cert_expiration($out);
+    die "no certificate data from $cp->{host}\n" if !$rows->@*;
+    return $rows;
+}
+
+# --- cluster power lifecycle: the plugin boots the machines
+# (and stops them) itself. Start order is CP-first so etcd
+# quorum exists before workers look for the API; stop order
+# is workers-first for the mirror reason. Pure ordering is
+# unit-tested.
+sub power_order {
+    my ($nodes, $action) = @_;
+
+    my @cp = grep { $_->{role} eq 'cp' } $nodes->@*;
+    my @wk = grep { $_->{role} ne 'cp' } $nodes->@*;
+    return $action eq 'start' ? [@cp, @wk] : [@wk, @cp];
+}
+
+sub set_cluster_power {
+    my ($name, $action) = @_;
+
+    die "power action must be start or stop\n"
+        if $action ne 'start' && $action ne 'stop';
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    for my $node (power_order($nodes, $action)->@*) {
+        my $st = eval {
+            qm_on($node->{pvehost}, 'status', $node->{vmid}) } // '';
+        my $running = $st =~ /^status:\s*running/m;
+        if ($action eq 'start' && !$running) {
+            qm_on($node->{pvehost}, 'start', $node->{vmid});
+            print "started $node->{host} (vmid $node->{vmid})\n";
+        } elsif ($action eq 'stop' && $running) {
+            qm_on($node->{pvehost}, 'stop', $node->{vmid});
+            print "stopped $node->{host} (vmid $node->{vmid})\n";
+        } else {
+            print "$node->{host} already $action"
+                . ($action eq 'start' ? 'ed' : 'ped') . "\n";
+        }
+    }
+    return 1;
+}
+
+# --- plugin-built templates: today find_template dies with
+# "build one first" and building is a manual builder-VM step
+# (images/build-template.sh). The plugin runs that recipe on
+# the local host with a throwaway builder address taken from
+# the host's own subnet, so a fresh install can provision
+# without operator shell work. Supported versions only.
+sub build_template {
+    my ($version, %opts) = @_;
+
+    PVE::K8s::Config::assert_supported_version($version);
+    my $dir = '/usr/share/pve-k8s/images';
+    $dir = 'images' if !-d $dir && -d 'images';
+    die "template recipe not found in $dir\n"
+        if !-f "$dir/build-template.sh";
+    my $storage = $opts{storage} // 'local-zfs';
+    my $vmid = $opts{vmid} // 9000;
+    my $ip = $opts{builder_ip}
+        or die "build_template needs a free builder IP "
+            . "on the host network (builder_ip)\n";
+    my $gw = $opts{gateway}
+        or die "build_template needs the host gateway (gateway)\n";
+    my $out = run(['sh', '-c',
+        "cd $dir && BUILDER_IP=$ip BUILDER_GW=$gw "
+        . "./build-template.sh --k8s-version $version "
+        . "--storage $storage --vmid $vmid"],
+        timeout => 3600);
+    print $out if $out;
+    my ($found) = find_template_in_list(qm('list'), $version);
+    die "template build finished but no k8s-node-$version "
+        . "template appeared\n" if !$found;
+    print "template k8s-node-$version built (vmid $found)\n";
+    return $found;
 }
 
 sub upgrade_cluster {

@@ -96,6 +96,14 @@ my $defaultData = {
             description => "Gateway for node VMs, e.g. '192.168.200.1'.",
             optional => 1,
         },
+        'builder-ip' => {
+            type => 'string',
+            description => "Free static IP on the host network "
+                . "for the throwaway template-builder VM. When "
+                . "set and no node template exists, provision "
+                . "builds one itself.",
+            optional => 1,
+        },
         'lb-range' => {
             type => 'string',
             description => "LoadBalancer address range, e.g. '192.168.200.100-192.168.200.120'.",
@@ -248,6 +256,7 @@ sub options {
         pools => { optional => 1 },
         'node-subnet' => { optional => 1 },
         gateway => { optional => 1 },
+        'builder-ip' => { optional => 1 },
         gateway => {
             type => 'string',
             description => "Gateway for node VMs, e.g. '192.168.200.1'.",

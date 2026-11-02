@@ -97,6 +97,13 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Gateway for node VMs, e.g. '192.168.200.1'.",
             },
+            'builder-ip' => {
+                type => 'string',
+                optional => 1,
+                description => "Free static IP for the throwaway "
+                    . "template-builder VM; provision builds a "
+                    . "node template itself when none exists.",
+            },
             'lb-range' => {
                 type => 'string',
                 optional => 1,
@@ -482,6 +489,74 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         return PVE::K8s::Provision::cluster_events($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'certificates',
+    path => '{name}/certificates',
+    method => 'GET',
+    description => "kubeadm certificate expiry for the cluster "
+        . "(control-plane PKI expires after one year).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::cert_expiry($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'power',
+    path => '{name}/power',
+    method => 'POST',
+    protected => 1,
+    description => "Start or stop every node VM of the cluster "
+        . "(start: control plane first; stop: workers first).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            action => {
+                type => 'string',
+                enum => ['start', 'stop'],
+                description => "Power action.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8spower',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::set_cluster_power(
+                    $param->{name}, $param->{action});
+            });
     }});
 
 __PACKAGE__->register_method({

@@ -91,6 +91,20 @@ pvesh create /cluster/k8s/c1/scale
 pvesh delete /cluster/k8s/c1
 ```
 
+Cluster lifecycle extras:
+
+```sh
+# certificate expiry of the kubeadm PKI (1-year lifetime);
+# rolling or upgrading the control plane renews it
+pvesh get /cluster/k8s/c1/certificates
+# start (control plane first) or stop (workers first) all VMs
+pvesh create /cluster/k8s/c1/power --action start
+# templates: with --builder-ip recorded at create time,
+# provision builds a missing node template itself
+pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \
+    --builder-ip 10.0.0.50 ...
+```
+
 ## Known limitations
 
 - Control-plane placement prefers spreading across hosts

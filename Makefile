@@ -42,6 +42,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/roll-plan.t
 	@perl -I. -Itests/stubs tests/unit/packaging.t
 	@perl -I. -Itests/stubs tests/unit/upgrade-apply-skip.t
+	@perl -I. -Itests/stubs tests/unit/lifecycle.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Packaging: stage the payload and build with dpkg-deb.
@@ -53,6 +54,8 @@ deb:
 	@mkdir -p $(STAGE)/usr/sbin $(STAGE)/lib/systemd/system
 	@cp -r PVE $(STAGE)/usr/share/perl5/
 	@cp www/manager6/*.js $(STAGE)/usr/share/pve-manager/js/
+	@mkdir -p $(STAGE)/usr/share/pve-k8s
+	@cp -r images $(STAGE)/usr/share/pve-k8s/
 	@install -m 0755 tools/pve-k8s-scaler $(STAGE)/usr/sbin/pve-k8s-scaler
 	@install -m 0755 tools/pve-k8s-backup $(STAGE)/usr/sbin/pve-k8s-backup
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
