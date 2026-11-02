@@ -373,7 +373,8 @@ stage_upgrade() {
     echo "kubelet versions: $vers"
     echo "$vers" | grep -q "v1.35" \
         && die "a node is still on 1.35"
-    [ "$(nodes_ready)" = 6 ] || die "not 6 Ready after upgrade"
+    # 5 nodes: S5 scale-in returned the pool to 2 workers
+    [ "$(nodes_ready)" = 5 ] || die "not 5 Ready after upgrade"
     KCP "get pods -n kube-system -l component=etcd --no-headers"
     grep -qiE "surge|3->4|quorum" /tmp/$NAME-upgrade.log \
         || say "note: upgrade log has no surge/quorum line"
