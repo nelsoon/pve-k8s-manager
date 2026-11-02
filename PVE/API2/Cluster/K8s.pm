@@ -939,7 +939,7 @@ __PACKAGE__->register_method({
             },
             addon => {
                 type => 'string',
-                pattern => '^(cert-manager|external-dns)$',
+                pattern => '^(cert-manager|external-dns|metrics-server)$',
                 description => "The add-on to enable.",
             },
             issuer => {
@@ -1001,6 +1001,98 @@ __PACKAGE__->register_method({
                 PVE::K8s::Provision::enable_addon(
                     $param->{name}, $addon, \%opts);
             });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'addon_disable',
+    path => '{name}/addons/{addon}/disable',
+    method => 'POST',
+    protected => 1,
+    description => "Disable an add-on (metrics-server).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            addon => {
+                type => 'string',
+                pattern => '^metrics-server$',
+                description => "The add-on to disable.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return $rpcenv->fork_worker('k8saddon',
+            $param->{name}, $authuser, sub {
+                PVE::K8s::Provision::disable_addon(
+                    $param->{name}, $param->{addon});
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'workloads',
+    path => '{name}/workloads',
+    method => 'GET',
+    description => "Read-only workload listing (deployments, "
+        . "pods, services) for the cluster.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::workloads_cluster(
+            $param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'metrics',
+    path => '{name}/metrics',
+    method => 'GET',
+    description => "Node VM metrics (PVE RRD) and, when the "
+        . "metrics-server add-on is enabled, pod CPU/memory.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::metrics_cluster(
+            $param->{name});
     }});
 
 __PACKAGE__->register_method({

@@ -4407,6 +4407,17 @@ sub list_addons {
             ($conf ? (config => $conf) : ()),
         };
     }
+    {
+        my $conf = $state->{'metrics-server'};
+        push @addons, {
+            name => 'metrics-server',
+            status => $conf ? 'configured' : 'unconfigured',
+            mustdeploy => 0,
+            summary => 'Pod/node CPU+memory metrics '
+                . '(kubectl top; feeds the Metrics panel)',
+            ($conf ? (config => $conf) : ()),
+        };
+    }
     for my $addon (
         ['cilium-mesh', 'Cilium service mesh features (mTLS, '
             . 'L7 policy, Hubble)'],
@@ -4469,9 +4480,15 @@ sub enable_addon {
         );
         print "external-dns enabled on cluster '$name' "
             . "for zone '$record{zone}'\n";
+    } elsif ($addon eq 'metrics-server') {
+        guest_exec($cp->{vmid},
+            PVE::K8s::Addons::metrics_server_install_cmd(
+                $kubeconfig));
+        %record = (version => $PVE::K8s::Addons::METRICS_SERVER_VERSION);
+        print "metrics-server enabled on cluster '$name'\n";
     } else {
         die "add-on '$addon' cannot be enabled "
-            . "(want cert-manager or external-dns)\n";
+            . "(want cert-manager, external-dns or metrics-server)\n";
     }
 
     PVE::K8s::Config::lock_config(sub {
@@ -4482,6 +4499,35 @@ sub enable_addon {
             JSON::PP->new->canonical->encode($state);
         PVE::K8s::Config::store_config($locked);
     });
+    return 1;
+}
+
+sub disable_addon {
+    my ($name, $addon) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "cluster '$name' is not ready\n"
+        if ($scfg->{state} // '') ne 'ready';
+    die "add-on '$addon' cannot be disabled "
+        . "(only metrics-server)\n"
+        if $addon ne 'metrics-server';
+
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    guest_exec($cp->{vmid},
+        PVE::K8s::Addons::metrics_server_delete_cmd(
+            '/etc/kubernetes/admin.conf'));
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        my $state = addons_state($locked->{ids}->{$name});
+        delete $state->{$addon};
+        $locked->{ids}->{$name}->{addons} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($locked);
+    });
+    print "metrics-server disabled on cluster '$name'\n";
     return 1;
 }
 
@@ -4880,6 +4926,154 @@ sub parse_cert_expiration {
         };
     }
     return \@rows;
+}
+
+# --- read-only workload visibility for the UI tree
+# (Deployments/Pods/Services tabs). Pure row builders are
+# unit-tested; the live path is one kubectl_json per kind.
+sub deployment_rows {
+    my ($data) = @_;
+
+    my @rows;
+    for my $d (($data->{items} // [])->@*) {
+        my $st = $d->{status} // {};
+        push @rows, {
+            name => $d->{metadata}{name} // '',
+            namespace => $d->{metadata}{namespace} // '',
+            ready => ($st->{readyReplicas} // 0) . '/'
+                . ($d->{spec}{replicas} // 0),
+            uptodate => $st->{updatedReplicas} // 0,
+            available => $st->{availableReplicas} // 0,
+        };
+    }
+    return \@rows;
+}
+
+sub pod_rows {
+    my ($data) = @_;
+
+    my @rows;
+    for my $p (($data->{items} // [])->@*) {
+        my $st = $p->{status} // {};
+        my $cs = $st->{containerStatuses} // [];
+        my $ready = grep { ($_->{ready} // 0) } $cs->@*;
+        my $restarts = 0;
+        $restarts += $_->{restartCount} // 0 for $cs->@*;
+        push @rows, {
+            name => $p->{metadata}{name} // '',
+            namespace => $p->{metadata}{namespace} // '',
+            ready => "$ready/" . scalar($cs->@*),
+            status => $st->{phase} // '',
+            restarts => $restarts,
+            node => $p->{spec}{nodeName} // '',
+        };
+    }
+    return \@rows;
+}
+
+sub service_rows {
+    my ($data) = @_;
+
+    my @rows;
+    for my $s (($data->{items} // [])->@*) {
+        my $spec = $s->{spec} // {};
+        my @ports = map {
+            ($_->{port} // '') . ($_->{nodePort}
+                ? ':' . $_->{nodePort} : '')
+        } ($spec->{ports} // [])->@*;
+        my $ext = ($spec->{type} // '') eq 'LoadBalancer'
+            ? (($s->{status}{loadBalancer}{ingress}[0]{ip}
+                // $s->{status}{loadBalancer}{ingress}[0]{hostname}
+                // 'pending'))
+            : '';
+        push @rows, {
+            name => $s->{metadata}{name} // '',
+            namespace => $s->{metadata}{namespace} // '',
+            type => $spec->{type} // 'ClusterIP',
+            clusterip => $spec->{clusterIP} // '',
+            externalip => $ext,
+            ports => join(',', @ports),
+        };
+    }
+    return \@rows;
+}
+
+sub workloads_cluster {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    return {
+        deployments => deployment_rows(
+            kubectl_json($cp, 'get deployments -A')),
+        pods => pod_rows(kubectl_json($cp, 'get pods -A')),
+        services => service_rows(
+            kubectl_json($cp, 'get services -A')),
+    };
+}
+
+# `kubectl top pods -A` text: NAMESPACE NAME CPU MEMORY.
+# CPU is millicores with an m suffix; MEMORY carries a
+# Ki/Mi/Gi unit. Pure and unit-tested.
+sub parse_top_pods {
+    my ($text) = @_;
+
+    my @rows;
+    for my $line (split /\n/, $text // '') {
+        next if $line !~ /^(\S+)\s+(\S+)\s+(\d+)m?\s+(\d+)(Ki|Mi|Gi)\s*$/;
+        my ($ns, $pod, $cpu, $num, $unit) = ($1, $2, $3, $4, $5);
+        my $mem = $unit eq 'Gi' ? $num * 1024
+            : $unit eq 'Ki' ? int($num / 1024) : $num;
+        push @rows, { namespace => $ns, name => $pod,
+            cpu_m => $cpu + 0, mem_mi => $mem };
+    }
+    return \@rows;
+}
+
+# Node metrics are PVE-side (RRD of each node VM), pod
+# metrics exist only with the metrics-server add-on; the
+# panel shows both and says which source is live.
+sub metrics_cluster {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my @node_rows;
+    for my $node ($nodes->@*) {
+        my $row = { name => $node->{host} };
+        my $out = eval {
+            host_run_on($node->{pvehost}, 'pvesh', 'get',
+                "/nodes/$node->{pvehost}/qemu/$node->{vmid}/rrddata",
+                '--timeframe', 'hour', '--cf', 'AVERAGE',
+                '--output-format', 'json');
+        } // '';
+        my $data = eval {
+            PVE::K8s::Provision::decode_pvesh_json($out) } // [];
+        my ($last) = grep { defined $_->{cpu} }
+            reverse $data->@*;
+        if ($last) {
+            $row->{cpu} = $last->{cpu};
+            $row->{mem} = $last->{mem};
+            $row->{maxmem} = $last->{maxmem};
+        }
+        push @node_rows, $row;
+    }
+    my $state = addons_state($scfg);
+    my $have_ms = $state->{'metrics-server'} ? 1 : 0;
+    my @pod_rows;
+    if ($have_ms) {
+        my $cp = ops_cp($nodes);
+        my $out = eval {
+            kubectl_on($cp, 'top pods -A --no-headers') } // '';
+        @pod_rows = parse_top_pods($out)->@*;
+    }
+    return { nodes => \@node_rows, pods => \@pod_rows,
+        metrics_server => $have_ms };
 }
 
 sub cert_expiry {

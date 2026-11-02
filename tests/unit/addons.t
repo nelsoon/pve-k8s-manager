@@ -75,8 +75,8 @@ like($api, qr/name => 'addons'/, 'addons list endpoint exists');
 like($api, qr/name => 'addon_enable'/, 'addon enable endpoint exists');
 like($api, qr/fork_worker\('k8saddon'/,
     'addon enable runs as a k8saddon PVE task');
-like($api, qr/pattern => '\^\(cert-manager\|external-dns\)\$'/,
-    'only cert-manager and external-dns can be enabled');
+like($api, qr/pattern => '\^\(cert-manager\|external-dns\|metrics-server\)\$'/,
+    'only cert-manager, external-dns, metrics-server enable');
 
 my $cfgpm = do {
     open my $fh, '<', 'PVE/K8s/Config.pm' or die $!;

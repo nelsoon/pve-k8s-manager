@@ -84,4 +84,21 @@ like($provsrc, qr/etcdutl snapshot restore/,
 like($provsrc, qr/if \(!\$destroyed\) \{\n            my \$retired/,
     'ghost marker only kept when the destroy failed');
 
+# Tree workspace (SDN-style subtree): clusters as tree
+# nodes with per-cluster panels, read-only workloads and
+# metrics backed by their API endpoints.
+like($js, qr/Ext\.tree\.Panel/, 'workspace has a cluster tree');
+for my $panel (qw(overview nodes workloads metrics addons
+    events backups settings)) {
+    like($js, qr/'\Q$panel\E'/, "tree offers the $panel panel");
+}
+like($js, qr|'/workloads'|,
+    'workloads panel reads the workloads endpoint');
+like($js, qr|'/metrics'|,
+    'metrics panel reads the metrics endpoint');
+like($js, qr|'/certificates'|,
+    'overview shows certificate expiry');
+like($api, qr/name => 'workloads'/, 'workloads endpoint exists');
+like($api, qr/name => 'metrics'/, 'metrics endpoint exists');
+
 done_testing();

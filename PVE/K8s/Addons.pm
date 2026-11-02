@@ -506,4 +506,34 @@ kubectl -n external-dns rollout status deploy/external-dns --timeout=300s
 EOF
 }
 
+# --- metrics-server: pod/node CPU+memory via the metrics
+# API (kubectl top). kubeadm kubelets use a self-signed
+# serving cert, so --kubelet-insecure-tls is required.
+our $METRICS_SERVER_VERSION = '0.8.0';
+
+sub metrics_server_install_cmd {
+    my ($kubeconfig) = @_;
+
+    return sprintf(<<'EOF', $kubeconfig, $METRICS_SERVER_VERSION);
+export KUBECONFIG=%s
+MS=https://github.com/kubernetes-sigs/metrics-server/releases/download/v%s/components.yaml
+curl -fsSL $MS > /root/ms.yaml
+sed -i 's|--kubelet-use-node-status-port|&\n        - --kubelet-insecure-tls|' /root/ms.yaml
+kubectl apply -f /root/ms.yaml
+kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s
+EOF
+}
+
+sub metrics_server_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    return sprintf(<<'EOF', $kubeconfig, $METRICS_SERVER_VERSION);
+export KUBECONFIG=%s
+MS=https://github.com/kubernetes-sigs/metrics-server/releases/download/v%s/components.yaml
+curl -fsSL $MS > /root/ms.yaml
+sed -i 's|--kubelet-use-node-status-port|&\n        - --kubelet-insecure-tls|' /root/ms.yaml
+kubectl delete -f /root/ms.yaml --ignore-not-found
+EOF
+}
+
 1;
