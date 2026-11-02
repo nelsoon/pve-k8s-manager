@@ -28,100 +28,140 @@ Ext.define('PVE.dc.K8sCreateWindow', {
             },
             items: [
                 {
-                    xtype: 'textfield',
-                    name: 'name',
-                    fieldLabel: gettext('Name'),
-                    allowBlank: false,
+                    xtype: 'fieldset',
+                    title: gettext('Basics'),
+                    collapsible: false,
+                    defaults: { anchor: '100%', labelWidth: 160 },
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            name: 'name',
+                            fieldLabel: gettext('Name'),
+                            emptyText: 'c1',
+                            allowBlank: false,
+                        },
+                        {
+                            xtype: 'combobox',
+                            name: 'k8s-version',
+                            fieldLabel: gettext('Kubernetes Version'),
+                            // add-on-tested minors only; keep in sync
+                            // with PVE::K8s::Config supported list
+                            store: ['1.35', '1.36'],
+                            value: '1.36',
+                            editable: false,
+                            allowBlank: false,
+                        },
+                        {
+                            xtype: 'combobox',
+                            name: 'cp',
+                            fieldLabel: gettext('Control Plane Nodes'),
+                            store: [1, 3, 5],
+                            value: 3,
+                            editable: false,
+                        },
+                        {
+                            xtype: 'numberfield',
+                            name: 'workers',
+                            fieldLabel: gettext('Worker Nodes'),
+                            value: 2,
+                            minValue: 0,
+                            maxValue: 50,
+                        },
+                    ],
                 },
                 {
-                    xtype: 'combobox',
-                    name: 'k8s-version',
-                    fieldLabel: gettext('Kubernetes Version'),
-                    // add-on-tested minors only; keep in sync
-                    // with PVE::K8s::Config supported list
-                    store: ['1.35', '1.36'],
-                    value: '1.36',
-                    editable: false,
-                    allowBlank: false,
-                },
-                {
-                    xtype: 'combobox',
-                    name: 'cp',
-                    fieldLabel: gettext('Control Plane Nodes'),
-                    store: [1, 3, 5],
-                    value: 3,
-                    editable: false,
-                },
-                {
-                    xtype: 'numberfield',
-                    name: 'workers',
-                    fieldLabel: gettext('Worker Nodes'),
-                    value: 2,
-                    minValue: 0,
-                    maxValue: 50,
-                },
-                {
-                    xtype: 'textarea',
-                    name: 'pools',
-                    fieldLabel: gettext('Worker Pools (JSON)'),
-                    emptyText: '[{"name":"default","size":2}]',
-                    height: 60,
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'node-subnet',
-                    fieldLabel: gettext('SDN Node Subnet'),
-                    emptyText: '192.168.200.0/24',
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'gateway',
-                    fieldLabel: gettext('Gateway'),
-                    emptyText: '192.168.200.1',
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'lb-range',
-                    fieldLabel: gettext('LoadBalancer Range'),
-                    emptyText: '192.168.200.100-192.168.200.120',
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'storage',
-                    fieldLabel: gettext('Storage'),
-                    emptyText: gettext('Proxmox storage for node disks'),
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'sdn-zone',
-                    fieldLabel: gettext('SDN EVPN Zone'),
-                    emptyText: gettext('dedicated VNet mode (with Public Subnet)'),
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'public-subnet',
-                    fieldLabel: gettext('Public Subnet (LB/VIP)'),
-                    emptyText: '192.168.212.0/24',
-                },
-                {
-                    xtype: 'combobox',
-                    name: 'file-backend',
-                    fieldLabel: gettext('Shared-File (RWX) Backend'),
-                    store: ['', 'nfs'],
-                    value: '',
-                    editable: false,
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'file-server',
-                    fieldLabel: gettext('NFS Server'),
-                    emptyText: gettext('only for Shared-File nfs'),
-                },
-                {
-                    xtype: 'textfield',
-                    name: 'file-share',
-                    fieldLabel: gettext('NFS Export Path'),
-                    emptyText: '/srv/k8s',
+                    xtype: 'fieldset',
+                    title: gettext('Advanced (network, storage, pools)'),
+                    collapsible: true,
+                    collapsed: true,
+                    defaults: { anchor: '100%', labelWidth: 160 },
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            name: 'sdn-zone',
+                            fieldLabel: gettext('SDN EVPN Zone'),
+                            emptyText: gettext('dedicated VNet mode (with Public Subnet)'),
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'public-subnet',
+                            fieldLabel: gettext('Public Subnet (LB/VIP)'),
+                            emptyText: '192.168.212.0/24',
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'node-subnet',
+                            fieldLabel: gettext('SDN Node Subnet'),
+                            emptyText: '192.168.200.0/24',
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'gateway',
+                            fieldLabel: gettext('Gateway'),
+                            emptyText: '192.168.200.1',
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'lb-range',
+                            fieldLabel: gettext('LoadBalancer Range'),
+                            emptyText: '192.168.200.100-192.168.200.120',
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'storage',
+                            fieldLabel: gettext('Storage'),
+                            emptyText: gettext('Proxmox storage for node disks'),
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'builder-ip',
+                            fieldLabel: gettext('Template Builder IP'),
+                            emptyText: gettext('free IP; plugin builds a missing template itself'),
+                        },
+                        {
+                            xtype: 'numberfield',
+                            name: 'pool-min',
+                            fieldLabel: gettext('Default Pool Min'),
+                            emptyText: gettext('scaler floor (default 1)'),
+                            minValue: 0,
+                            maxValue: 50,
+                        },
+                        {
+                            xtype: 'numberfield',
+                            name: 'pool-max',
+                            fieldLabel: gettext('Default Pool Max'),
+                            emptyText: gettext('scaler ceiling (default = workers)'),
+                            minValue: 0,
+                            maxValue: 50,
+                        },
+                        {
+                            xtype: 'textarea',
+                            name: 'pools',
+                            fieldLabel: gettext('Worker Pools (JSON, overrides)'),
+                            emptyText: '[{"name":"default","size":2,"min":1,"max":3}]',
+                            height: 60,
+                        },
+                        {
+                            xtype: 'combobox',
+                            name: 'file-backend',
+                            fieldLabel: gettext('Shared-File (RWX) Backend'),
+                            store: ['', 'nfs'],
+                            value: '',
+                            editable: false,
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'file-server',
+                            fieldLabel: gettext('NFS Server'),
+                            emptyText: gettext('only for Shared-File nfs'),
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'file-share',
+                            fieldLabel: gettext('NFS Export Path'),
+                            emptyText: '/srv/k8s',
+                        },
+                    ],
                 },
             ],
         });
@@ -142,6 +182,23 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                                 delete values[key];
                             }
                         });
+                        // structured pool bounds compose the
+                        // default pool unless raw JSON overrides
+                        if (!values.pools
+                            && (values['pool-min'] !== undefined
+                                || values['pool-max'] !== undefined)) {
+                            let size = parseInt(values.workers, 10) || 2;
+                            values.pools = Ext.encode([{
+                                name: 'default',
+                                size: size,
+                                min: values['pool-min'] !== undefined
+                                    ? parseInt(values['pool-min'], 10) : 1,
+                                max: values['pool-max'] !== undefined
+                                    ? parseInt(values['pool-max'], 10) : size,
+                            }]);
+                        }
+                        delete values['pool-min'];
+                        delete values['pool-max'];
                         me.setLoading(true);
                         Proxmox.Utils.API2Request({
                             url: '/cluster/k8s',
@@ -205,7 +262,6 @@ Ext.define('PVE.dc.K8sView', {
     alias: 'widget.pveDcK8sView',
 
     title: gettext('Kubernetes'),
-    layout: 'border',
 
     initComponent: function() {
         let me = this;
@@ -233,7 +289,7 @@ Ext.define('PVE.dc.K8sView', {
                 api({
                     url: url, method: 'POST', params: params || {},
                     success: function(r) {
-                        task(r.result.data); me.reloadTree();
+                        task(r.result.data); me.reloadClusters();
                     },
                 });
             });
@@ -248,7 +304,6 @@ Ext.define('PVE.dc.K8sView', {
         });
 
         let panels = {};   // clusterName:panelKey -> component
-        let center;
 
         let grid = function(fields, url, columns, tbar) {
             return Ext.create('Ext.grid.Panel', {
@@ -326,7 +381,7 @@ Ext.define('PVE.dc.K8sView', {
                             url: '/cluster/k8s/' + n + '/provision',
                             method: 'POST',
                             success: function(r) {
-                                task(r.result.data); me.reloadTree();
+                                task(r.result.data); me.reloadClusters();
                             },
                         });
                     }),
@@ -341,7 +396,7 @@ Ext.define('PVE.dc.K8sView', {
                             url: '/cluster/k8s/' + n + '/scale',
                             method: 'POST',
                             success: function(r) {
-                                task(r.result.data); me.reloadTree();
+                                task(r.result.data); me.reloadClusters();
                             },
                         });
                     }),
@@ -355,23 +410,31 @@ Ext.define('PVE.dc.K8sView', {
                                     method: 'POST',
                                     params: { to: value, force: 1 },
                                     success: function(r) {
-                                        task(r.result.data); me.reloadTree();
+                                        task(r.result.data); me.reloadClusters();
                                     },
                                 });
                             });
                     }),
-                    act(gettext('Power'), 'fa fa-fw fa-power-off', function(n) {
-                        Ext.Msg.confirm(gettext('Power'),
+                    act(gettext('Start VMs'), 'fa fa-fw fa-play-circle', function(n) {
+                        api({
+                            url: '/cluster/k8s/' + n + '/power',
+                            method: 'POST',
+                            params: { action: 'start' },
+                            success: function(r) {
+                                task(r.result.data);
+                            },
+                        });
+                    }),
+                    act(gettext('Stop VMs'), 'fa fa-fw fa-stop', function(n) {
+                        Ext.Msg.confirm(gettext('Stop VMs'),
                             Ext.String.format(gettext(
-                                'Start all node VMs of {0}? (No = stop workers-first)'), n),
+                                'Stop all node VMs of {0} (workers first)?'), n),
                             function(answer) {
+                                if (answer !== 'yes') { return; }
                                 api({
                                     url: '/cluster/k8s/' + n + '/power',
                                     method: 'POST',
-                                    params: {
-                                        action: answer === 'yes'
-                                            ? 'start' : 'stop',
-                                    },
+                                    params: { action: 'stop' },
                                     success: function(r) {
                                         task(r.result.data);
                                     },
@@ -411,22 +474,6 @@ Ext.define('PVE.dc.K8sView', {
                                 win.show();
                             },
                         });
-                    }),
-                    '-',
-                    act(gettext('Destroy'), 'fa fa-fw fa-trash-o', function(n) {
-                        Ext.Msg.confirm(gettext('Confirm'),
-                            Ext.String.format(gettext(
-                                'Delete cluster {0} and all its VMs?'), n),
-                            function(answer) {
-                                if (answer !== 'yes') { return; }
-                                api({
-                                    url: '/cluster/k8s/' + n,
-                                    method: 'DELETE',
-                                    success: function(r) {
-                                        task(r.result.data); me.reloadTree();
-                                    },
-                                });
-                            });
                     }),
                 ],
                 items: [{
@@ -497,6 +544,26 @@ Ext.define('PVE.dc.K8sView', {
                     {
                         text: gettext('Reload'),
                         handler: function() { loadNodes(); },
+                    },
+                    {
+                        text: gettext('Evacuate Host'),
+                        iconCls: 'fa fa-fw fa-sign-out',
+                        handler: function() {
+                            Ext.Msg.prompt(gettext('Evacuate PVE Host'),
+                                gettext('Host to empty by live-migrating all '
+                                    + 'managed cluster VMs off it:'),
+                                function(answer, value) {
+                                    if (answer !== 'ok' || !value) { return; }
+                                    api({
+                                        url: '/cluster/k8s/' + name
+                                            + '/hosts/' + value + '/evacuate',
+                                        method: 'POST',
+                                        success: function(r) {
+                                            task(r.result.data);
+                                        },
+                                    });
+                                });
+                        },
                     },
                 ],
                 listeners: {
@@ -897,26 +964,6 @@ Ext.define('PVE.dc.K8sView', {
                                 });
                         },
                     },
-                    {
-                        text: gettext('Evacuate Host'),
-                        iconCls: 'fa fa-fw fa-sign-out',
-                        handler: function() {
-                            Ext.Msg.prompt(gettext('Evacuate PVE Host'),
-                                gettext('Host to empty by live-migrating all '
-                                    + 'managed cluster VMs off it:'),
-                                function(answer, value) {
-                                    if (answer !== 'ok' || !value) { return; }
-                                    api({
-                                        url: '/cluster/k8s/' + name
-                                            + '/hosts/' + value + '/evacuate',
-                                        method: 'POST',
-                                        success: function(r) {
-                                            task(r.result.data);
-                                        },
-                                    });
-                                });
-                        },
-                    },
                 ]);
             return g;
         };
@@ -939,6 +986,11 @@ Ext.define('PVE.dc.K8sView', {
             });
         };
 
+        // One tab strip: "Clusters" grid first, then the
+        // selected cluster's panels as sibling tabs. No
+        // third navigation column: the selector sits in
+        // this view's own toolbar (the SDN-view pattern).
+        let outer;
         let panelFor = function(clusterName, key, rec) {
             let id = clusterName + ':' + key;
             if (panels[id]) { return panels[id]; }
@@ -953,60 +1005,89 @@ Ext.define('PVE.dc.K8sView', {
             else { p = settingsPanel(rec); }
             p.itemId = id;
             panels[id] = p;
-            center.add(p);
             return p;
         };
 
-        let treeStore = Ext.create('Ext.data.TreeStore', {
-            root: {
-                text: gettext('Clusters'),
-                expanded: true,
-                children: [],
+        let showCluster = function(name) {
+            if (me.currentCluster === name && outer
+                && outer.items.getCount() > 1) {
+                return;
+            }
+            me.currentCluster = name;
+            let rec = me.clusterIndex[name] || {};
+            let defs = [
+                ['overview', gettext('Overview')],
+                ['nodes', gettext('Nodes')],
+                ['workloads', gettext('Workloads')],
+                ['metrics', gettext('Metrics')],
+                ['addons', gettext('Add-ons')],
+                ['events', gettext('Events')],
+                ['backups', gettext('Backups')],
+                ['settings', gettext('Settings')],
+            ];
+            let active = outer.getActiveTab();
+            let activeKey = active ? active.panelKey : 'overview';
+            // drop previous cluster tabs, keep the grid (index 0)
+            while (outer.items.getCount() > 1) {
+                outer.remove(outer.items.getAt(1), false);
+            }
+            defs.forEach(function(d) {
+                let p = panelFor(name, d[0], rec);
+                p.title = d[1];
+                p.panelKey = d[0];
+                outer.add(p);
+            });
+            let keep = outer.items.findBy(function(c) {
+                return c.panelKey === activeKey;
+            });
+            outer.setActiveTab(keep || outer.items.getAt(1));
+            destroyBtn.setDisabled(false);
+        };
+
+        let selector = Ext.create('Ext.form.field.ComboBox', {
+            fieldLabel: gettext('Cluster'),
+            labelWidth: 60,
+            width: 320,
+            store: Ext.create('Ext.data.Store', {
+                fields: ['name', 'label'],
+            }),
+            displayField: 'label',
+            valueField: 'name',
+            editable: false,
+            listeners: {
+                change: function(field, value) {
+                    if (value) { showCluster(value); }
+                },
             },
         });
-        let tree = Ext.create('Ext.tree.Panel', {
-            region: 'west',
-            width: 280,
-            split: true,
-            rootVisible: true,
-            store: treeStore,
-            tbar: [
-                {
-                    text: gettext('Create'),
-                    iconCls: 'fa fa-fw fa-plus-circle',
-                    handler: function() {
-                        Ext.create('PVE.dc.K8sCreateWindow', {
-                            onDone: function() { me.reloadTree(); },
-                        }).show();
-                    },
-                },
-                {
-                    text: gettext('Reload'),
-                    iconCls: 'fa fa-fw fa-refresh',
-                    handler: function() { me.reloadTree(); },
-                },
-            ],
-            listeners: {
-                selectionchange: function(model, selected) {
-                    let node = selected && selected[0];
-                    if (!node) { return; }
-                    let d = node.data;
-                    if (d.panelKey && d.clusterName) {
-                        let rec = me.clusterIndex[d.clusterName] || {};
-                        center.getLayout().setActiveItem(
-                            panelFor(d.clusterName, d.panelKey, rec));
-                    } else if (d.clusterName && !d.panelKey) {
-                        let rec = me.clusterIndex[d.clusterName] || {};
-                        center.getLayout().setActiveItem(
-                            panelFor(d.clusterName, 'overview', rec));
-                    } else {
-                        center.getLayout().setActiveItem('k8s-home');
-                    }
-                },
+
+        let destroyBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Destroy'),
+            iconCls: 'fa fa-fw fa-trash-o',
+            disabled: true,
+            handler: function() {
+                let name = me.currentCluster;
+                if (!name) { return; }
+                Ext.Msg.confirm(gettext('Confirm'),
+                    Ext.String.format(gettext(
+                        'Delete cluster {0} and all its VMs?'), name),
+                    function(answer) {
+                        if (answer !== 'yes') { return; }
+                        api({
+                            url: '/cluster/k8s/' + name,
+                            method: 'DELETE',
+                            success: function(r) {
+                                task(r.result.data);
+                                me.currentCluster = null;
+                                me.reloadClusters();
+                            },
+                        });
+                    });
             },
         });
 
         let home = Ext.create('Ext.grid.Panel', {
+            title: gettext('Clusters'),
             itemId: 'k8s-home',
             border: false,
             store: clusterStore,
@@ -1030,88 +1111,79 @@ Ext.define('PVE.dc.K8sView', {
             ],
             listeners: {
                 itemdblclick: function(view, rec) {
-                    let node = tree.getRootNode().findChild(
-                        'clusterName', rec.data.name, false);
-                    if (node) { tree.getSelectionModel().select(node); }
+                    selector.setValue(rec.data.name);
                 },
             },
         });
 
-        center = Ext.create('Ext.panel.Panel', {
-            region: 'center',
-            layout: 'card',
+        outer = Ext.create('Ext.tab.Panel', {
             border: false,
             items: [home],
         });
 
         me.clusterIndex = {};
-        me.reloadTree = function(keepSelection) {
+        me.currentCluster = null;
+        me.reloadClusters = function() {
             clusterStore.load({
                 callback: function(records) {
                     me.clusterIndex = {};
-                    let children = (records || []).map(function(r) {
+                    let rows = (records || []).map(function(r) {
                         me.clusterIndex[r.data.name] = r.data;
-                        let leaf = function(text, key, icon) {
-                            return {
-                                text: text, leaf: true,
-                                iconCls: icon,
-                                clusterName: r.data.name, panelKey: key,
-                            };
-                        };
                         return {
-                            text: r.data.name
-                                + (r.data.state
-                                    ? ' (' + r.data.state + ')' : ''),
-                            expanded: false,
-                            iconCls: 'fa fa-fw fa-cubes',
-                            clusterName: r.data.name,
-                            children: [
-                                leaf(gettext('Overview'), 'overview',
-                                    'fa fa-fw fa-info-circle'),
-                                leaf(gettext('Nodes'), 'nodes',
-                                    'fa fa-fw fa-server'),
-                                leaf(gettext('Workloads'), 'workloads',
-                                    'fa fa-fw fa-th'),
-                                leaf(gettext('Metrics'), 'metrics',
-                                    'fa fa-fw fa-line-chart'),
-                                leaf(gettext('Add-ons'), 'addons',
-                                    'fa fa-fw fa-puzzle-piece'),
-                                leaf(gettext('Events'), 'events',
-                                    'fa fa-fw fa-list'),
-                                leaf(gettext('Backups'), 'backups',
-                                    'fa fa-fw fa-save'),
-                                leaf(gettext('Settings'), 'settings',
-                                    'fa fa-fw fa-cog'),
-                            ],
+                            name: r.data.name,
+                            label: r.data.name + (r.data.state
+                                ? ' (' + r.data.state + ')' : ''),
                         };
                     });
-                    let selPath = null;
-                    let sel = tree.getSelectionModel().getSelection()[0];
-                    if (keepSelection && sel) {
-                        selPath = sel.getPath('text');
-                    }
-                    treeStore.setRootNode({
-                        text: gettext('Clusters'),
-                        expanded: true,
-                        children: children,
-                    });
-                    if (selPath) {
-                        tree.selectPath(selPath, 'text', '/', function() {});
-                    }
-                    if (!center.getLayout().getActiveItem()) {
-                        center.getLayout().setActiveItem('k8s-home');
+                    let store = selector.getStore();
+                    store.loadData(rows);
+                    let keep = me.currentCluster
+                        && me.clusterIndex[me.currentCluster];
+                    if (keep) {
+                        selector.setValue(me.currentCluster, false);
+                        showCluster(me.currentCluster);
+                    } else if (rows.length) {
+                        selector.setValue(rows[0].name);
+                    } else {
+                        me.currentCluster = null;
+                        destroyBtn.setDisabled(true);
+                        while (outer.items.getCount() > 1) {
+                            outer.remove(outer.items.getAt(1), false);
+                        }
                     }
                 },
             });
         };
 
         Ext.apply(me, {
-            items: [tree, center],
+            layout: { type: 'vbox', align: 'stretch' },
+            items: [{
+                xtype: 'toolbar',
+                items: [
+                    selector,
+                    {
+                        text: gettext('Create'),
+                        iconCls: 'fa fa-fw fa-plus-circle',
+                        handler: function() {
+                            Ext.create('PVE.dc.K8sCreateWindow', {
+                                onDone: function() { me.reloadClusters(); },
+                            }).show();
+                        },
+                    },
+                    destroyBtn,
+                    '->',
+                    {
+                        text: gettext('Reload'),
+                        iconCls: 'fa fa-fw fa-refresh',
+                        handler: function() { me.reloadClusters(); },
+                    },
+                ],
+            }, Ext.apply(outer, { flex: 1 })],
             listeners: {
                 afterrender: function() {
-                    me.reloadTree();
+                    me.reloadClusters();
                     me.pollTask = Ext.util.TaskManager.start({
-                        run: function() { me.reloadTree(true); },
+                        run: function() { me.reloadClusters(); },
                         interval: 30000,
                     });
                 },

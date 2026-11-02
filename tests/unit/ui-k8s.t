@@ -87,7 +87,11 @@ like($provsrc, qr/if \(!\$destroyed\) \{\n            my \$retired/,
 # Tree workspace (SDN-style subtree): clusters as tree
 # nodes with per-cluster panels, read-only workloads and
 # metrics backed by their API endpoints.
-like($js, qr/Ext\.tree\.Panel/, 'workspace has a cluster tree');
+like($js, qr/Ext\.form\.field\.ComboBox/,
+    'workspace selects clusters via a combobox (no 3rd sidebar)');
+like($js, qr/Ext\.tab\.Panel/, 'cluster panels are tabs');
+unlike($js, qr/Ext\.tree\.Panel/, 'no tree panel (no 3rd sidebar)');
+like($js, qr/'pool-min'/, 'create composes pool bounds from fields');
 for my $panel (qw(overview nodes workloads metrics addons
     events backups settings)) {
     like($js, qr/'\Q$panel\E'/, "tree offers the $panel panel");
