@@ -100,5 +100,7 @@ like($body, qr{/readyz},
     'ops control-plane node must prove VIP API reachability');
 like($body, qr/not usable, /,
     'unusable ops candidate falls through to the next CP');
+like($body, qr/\(\$_->\{ip\} \/\/ ''\)/,
+    'worker surge-IP scan tolerates nodes without an IP yet');
 
 done_testing();

@@ -3226,8 +3226,8 @@ sub roll_cluster {
             $new->{host} = "$stem$next";
             $new->{idx} = $next;
             my $max_ip = (sort { $b <=> $a }
-                map { /(\d+)$/ ? int $1 : 69 }
-                map { $_->{ip} } (@nodes, @live_ip_nodes))[0];
+                map { ($_->{ip} // '') =~ /(\d+)$/ ? int $1 : 69 }
+                (@nodes, @live_ip_nodes))[0];
             $new->{ip} = "$prefix." . ($max_ip + 1);
         }
         delete $new->{vmid};
