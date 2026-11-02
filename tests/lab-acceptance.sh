@@ -60,7 +60,11 @@ CP() {
         qm guest exec "$_vmid" --timeout 600 -- /bin/sh -c "$_cmd"
     else
         _enc=$(printf %s "$_cmd" | base64 -w0)
-        timeout 660 ssh -o BatchMode=yes "root@$_host" \
+        # ConnectTimeout so a wedged host fails fast with a
+        # clear error instead of hanging a stage for 10 min
+        # (seen 2026-11-02: pve3 wedged, preflight stalled).
+        timeout 660 ssh -o BatchMode=yes -o ConnectTimeout=20 \
+            "root@$_host" \
             "qm guest exec $_vmid --timeout 600 -- /bin/sh -c \"\$(echo $_enc | base64 -d)\""
     fi | unwrap_exec
 }
@@ -380,12 +384,13 @@ preflight() {
     pvecm status 2>/dev/null | grep -q "Quorate:.*Yes" \
         || die "preflight: corosync not quorate"
     if command -v vtysh >/dev/null; then
-        vtysh -c "show bgp summary" 2>/dev/null \
-            | grep -qE "Established" \
-            || die "preflight: no BGP peer Established"
-        vtysh -c "show bgp summary" 2>/dev/null \
-            | grep -qE " (Idle|Active) " \
-            && die "preflight: BGP peer Idle/Active (FRR/BFD?)"
+        # Established peers show a numeric prefix count in
+        # State/PfxRcd; down peers show Idle/Active/Connect.
+        bgp=$(vtysh -c "show bgp summary" 2>/dev/null)
+        echo "$bgp" | grep -qE "Total number of neighbors [1-9]" \
+            || die "preflight: no BGP neighbors"
+        echo "$bgp" | grep -qE " (Idle|Active|Connect) " \
+            && die "preflight: BGP peer not Established (FRR/BFD?)"
     fi
     swap_used=$(awk '/SwapTotal:/ {t=$2} /SwapFree:/ {f=$2}
         END { if (t > 0) printf "%d", (t - f) * 100 / t;
