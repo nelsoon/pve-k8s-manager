@@ -270,13 +270,29 @@ print(",".join(sorted(n["vmid"] for n in
 }
 
 stage_scale() {
-    say "S5 scaler: pending pod grows pool, max reports"
+    say "S5 scaler: pending pod grows pool, max reports, idle shrinks"
     alloc=$(KCP "get node -o jsonpath={.items[3].status.allocatable.cpu}")
     alloc_m=$(python3 -c "
 a = '$alloc'
 print(int(float(a.rstrip('m')) * (1000 if not a.endswith('m') else 1)))")
     req=$((alloc_m - 600))
     [ $req -gt 500 ] || die "worker allocatable too small: $alloc"
+    # Fillers pin both workers first: 2 fillers + acc-big at
+    # req = alloc-600 exceed 2 workers only when alloc > 1800
+    # (2-CPU workers: 1900m), so acc-big deterministically
+    # goes Pending instead of scheduling immediately.
+    [ "$alloc_m" -gt 1800 ] || die "worker too small for S5: $alloc"
+    for f in fill-1 fill-2; do
+        KAPPLY "apiVersion: v1
+kind: Pod
+metadata: {name: $f}
+spec:
+  containers:
+  - name: w
+    image: busybox:1.36
+    command: ['sleep', '3600']
+    resources: {requests: {cpu: '${req}m', memory: '256Mi'}}"
+    done
     KAPPLY "apiVersion: v1
 kind: Pod
 metadata: {name: acc-big}
@@ -307,18 +323,20 @@ import json, sys
 pools = json.loads(json.load(sys.stdin)["pools"])
 print([p["size"] for p in pools if p["name"] == "default"][0])')
     [ "$size" = 3 ] || die "pool did not grow to 3 (size=$size)"
-    # pool now at max (3 workers): another big pod cannot be
-    # hosted and the pass must say so instead of scaling
-    KCP "delete pod acc-big"
+    # pool now at max (3 workers): a pod requesting twice a
+    # whole worker can never be hosted, and the pass must say
+    # so instead of scaling
+    KCP "delete pod acc-big fill-1 fill-2"
+    huge=$((alloc_m * 2))
     KAPPLY "apiVersion: v1
 kind: Pod
-metadata: {name: acc-big2}
+metadata: {name: acc-huge}
 spec:
   containers:
   - name: w
     image: busybox:1.36
     command: ['sleep', '3600']
-    resources: {requests: {cpu: '${req}m', memory: '512Mi'}}"
+    resources: {requests: {cpu: '${huge}m', memory: '512Mi'}}"
     sleep 150
     setsid sh -c "pvesh create /cluster/k8s/$NAME/scale \
         > /tmp/$NAME-scale2.log 2>&1" < /dev/null > /dev/null 2>&1 &
@@ -326,9 +344,21 @@ spec:
     grep -qE "no pool can host|saturated" /tmp/$NAME-scale2.log \
         || die "max/saturated pass did not report"
     tail -2 /tmp/$NAME-scale2.log
-    KCP "delete pod acc-big2"
+    # idle pool shrinks back: remove the pressure, run a pass,
+    # the extra worker is retired and the pool returns to 2
+    KCP "delete pod acc-huge"
+    setsid sh -c "pvesh create /cluster/k8s/$NAME/scale \
+        > /tmp/$NAME-scale3.log 2>&1" < /dev/null > /dev/null 2>&1 &
+    sleep 420
+    tail -3 /tmp/$NAME-scale3.log
+    size=$(cluster_json | python3 -c '
+import json, sys
+pools = json.loads(json.load(sys.stdin)["pools"])
+print([p["size"] for p in pools if p["name"] == "default"][0])')
+    [ "$size" = 2 ] || die "pool did not shrink to 2 (size=$size)"
     echo "S5 PASS (pool grew 2->3 for a pending pod; at max "
-    echo "    the scaler reports instead of scaling)"
+    echo "    the scaler reports instead of scaling; idle "
+    echo "    pool shrank 3->2)"
 }
 
 stage_upgrade() {
