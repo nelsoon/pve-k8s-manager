@@ -1986,6 +1986,12 @@ sub provision_cluster {
     # join the existing control plane through the loop
     # below instead.
     my $cp1 = $nodes[0];
+    # Adopted members can lack a recorded InternalIP (their
+    # address was never stored); the VIP reaches the same
+    # apiserver, so use it as the probe address fallback (lab,
+    # 2026-11-02: --server https://:6443 warned and could
+    # never succeed while cp1 was an IP-less adoptee).
+    my $cp1_ip = $cp1->{ip} // $vip;
     my $enc_key = cluster_encryption_key($name);
     create_node_vm($ctx, $cp1, node_userdata(
         hostname => $cp1->{host}, role => 'cp', vip => $vip,
@@ -2004,7 +2010,7 @@ sub provision_cluster {
             guest_exec($cp1->{vmid},
                 'test -f /etc/kubernetes/admin.conf && kubectl '
                 . '--kubeconfig /etc/kubernetes/admin.conf '
-                . "--server https://$cp1->{ip}:6443 get nodes >/dev/null");
+                . "--server https://$cp1_ip:6443 get nodes >/dev/null");
             1;
         } // 0;
         last if $cp_ready;
@@ -2026,7 +2032,7 @@ sub provision_cluster {
         my $out = eval {
             guest_exec($cp1->{vmid},
                 'kubectl --kubeconfig /etc/kubernetes/admin.conf '
-                . "--server https://$cp1->{ip}:6443 get nodes --no-headers");
+                . "--server https://$cp1_ip:6443 get nodes --no-headers");
         } // '';
         $node_seen = 1 if $out =~ /^\Q$cp1->{host}\E\s/m;
         last if $node_seen;
@@ -2114,7 +2120,7 @@ sub provision_cluster {
             my $out = eval {
                 guest_exec($cp1->{vmid},
                     'kubectl --kubeconfig /etc/kubernetes/admin.conf '
-                    . "--server https://$cp1->{ip}:6443 get nodes --no-headers");
+                    . "--server https://$cp1_ip:6443 get nodes --no-headers");
             } // '';
             $seen = 1 if $out =~ /^\Q$node->{host}\E\s/m;
             last if $seen;

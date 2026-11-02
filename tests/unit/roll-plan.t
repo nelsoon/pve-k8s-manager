@@ -102,5 +102,7 @@ like($body, qr/not usable, /,
     'unusable ops candidate falls through to the next CP');
 like($body, qr/\(\$_->\{ip\} \/\/ ''\)/,
     'worker surge-IP scan tolerates nodes without an IP yet');
+like($src, qr/my \$cp1_ip = \$cp1->\{ip\} \/\/ \$vip/,
+    'ops probe falls back to the VIP for an IP-less node');
 
 done_testing();
