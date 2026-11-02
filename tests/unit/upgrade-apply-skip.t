@@ -38,4 +38,21 @@ my ($body) = $src =~ /^sub roll_cluster \{(.*?)^(?:my\s+)?sub /ms;
 ok(defined $body && $body =~ /upgrade_apply_needed/,
     'roll path consults the apply-needed guard');
 
+# The live-server check regresses while members are
+# replaced (lab, 2026-10-28: a resume re-ran a finished
+# apply and died in preflight), so completion is recorded
+# and the record gates the resume.
+ok($body =~ /upgrade-applied/,
+    'roll path consults the recorded apply flag');
+ok($src =~ /set_upgrade_applied\(\$name, \$kver\)/,
+    'a finished apply is recorded for resumes');
+
+open(my $cfh, '<', 'PVE/K8s/Config.pm') or die $!;
+my $csrc = do { local $/; <$cfh> };
+close($cfh);
+ok($csrc =~ /'upgrade-applied' => \{\n\s+type => 'string'/,
+    'cluster schema accepts the recorded apply flag');
+ok($csrc =~ /'upgrade-applied' => \{ optional => 1 \}/,
+    'update options accept the recorded apply flag');
+
 done_testing();

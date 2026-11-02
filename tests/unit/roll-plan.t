@@ -57,6 +57,24 @@ is($plan->{'c-cp1'}, 'surge', 'CP pool plans on its own count');
 is($plan->{'c-w1'}, 'surge', 'worker pool short: surge');
 is($plan->{'c-w2'}, 'retire-only', 'worker pool covered: retire');
 
+my $good = PVE::K8s::Provision::live_node_items(
+    '{"items":[{"metadata":{"name":"c-cp7"},'
+    . '"status":{"nodeInfo":{"kubeletVersion":"v1.36.5"},'
+    . '"addresses":[{"type":"InternalIP",'
+    . '"address":"192.168.206.64"}]}}]}');
+is(scalar $good->@*, 1, 'NodeList-shaped payload yields its nodes');
+is(PVE::K8s::Provision::live_node_items('[1,2]')->@*, 0,
+    'top-level array yields no nodes');
+is(PVE::K8s::Provision::live_node_items('"oops"')->@*, 0,
+    'top-level string yields no nodes');
+is(PVE::K8s::Provision::live_node_items('not json')->@*, 0,
+    'garbage yields no nodes');
+is(PVE::K8s::Provision::live_node_items('{"items":{}}')->@*, 0,
+    'non-array items yields no nodes');
+is(PVE::K8s::Provision::live_node_items(
+    '{"items":["c-cp7",{}]}')->@*, 1,
+    'non-hash elements are filtered out');
+
 my $file = 'PVE/K8s/Provision.pm';
 open(my $fh, '<', $file) or die "open $file: $!\n";
 my $src = do { local $/; <$fh> };
@@ -72,5 +90,15 @@ like($body, qr/'retire-only'/,
     'roll executes the retire-only branch');
 like($body, qr/live_kubelet/,
     'upgrade currency compares live kubelet versions');
+like($src, qr/sub etcd_snapshot_any/,
+    'snapshot tries every CP instead of one fixed node');
+like($body, qr/etcd_snapshot_any\(\\\@nodes\)/,
+    'roll snapshots through any serving member');
+like($src, qr/grep \{ \$_->\{current\} \} \@cands/,
+    'etcd removal prefers a current member as endpoint');
+like($body, qr{/readyz},
+    'ops control-plane node must prove VIP API reachability');
+like($body, qr/not usable, /,
+    'unusable ops candidate falls through to the next CP');
 
 done_testing();

@@ -78,7 +78,8 @@ my sub run_patch {
     }
     backup_once($file) if $mode eq 'apply';
     if (write_atomic($file, $new)) {
-        print "pve-k8s: ${mode}ed integration in $file\n";
+        my $past = $mode eq 'apply' ? 'applied' : 'removed';
+        print "pve-k8s: $past integration in $file\n";
     } else {
         print STDERR "pve-k8s: cannot write $file, skipping\n";
     }

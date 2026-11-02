@@ -408,6 +408,23 @@ sub surge_cp_ip {
     return "$prefix.$octet";
 }
 
+# Live node objects out of `kubectl get nodes -o json`.
+# Anything but a NodeList-shaped payload (an API hiccup, a
+# half-written answer, a proxy error page) yields an empty
+# list instead of dying the caller: adoption is best-effort
+# (lab, 2026-10-28: a transient non-hash payload killed a
+# roll worker with "Not a HASH reference"). Pure and
+# unit-tested.
+sub live_node_items {
+    my ($json) = @_;
+
+    my $live = eval { JSON::PP->new->decode($json // '') } // {};
+    return [] if ref $live ne 'HASH';
+    my $items = $live->{items};
+    return [] if ref $items ne 'ARRAY';
+    return [grep { ref $_ eq 'HASH' } $items->@*];
+}
+
 # Plan one roll pass over a pool-grouped node list: nodes
 # flagged `current` already satisfy the target; every other
 # node is either surged (a replacement joins first) or, when
@@ -1412,6 +1429,24 @@ sub converge_nodes {
 
 # Record the node inventory in the cluster config so rolls,
 # upgrades and the UI know what is running where.
+# Record that `kubeadm upgrade apply` completed for a
+# target version. The live-server check alone cannot gate a
+# resume: it reports whichever member answers, and the
+# answer regresses while members are being replaced (lab,
+# 2026-10-28: a resume re-ran a finished apply and died in
+# preflight on a retiring member). The record is
+# authoritative; the live check stays as best-effort cover
+# for upgrades applied before this flag existed.
+my sub set_upgrade_applied {
+    my ($name, $kver) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        $locked->{ids}->{$name}->{'upgrade-applied'} = $kver;
+        PVE::K8s::Config::store_config($locked);
+    });
+}
+
 my sub store_inventory {
     my ($name, $nodes, $rev) = @_;
 
@@ -1494,10 +1529,22 @@ sub create_node_vm {
         print "created $vmname (vmid $vmid on $target, $node->{ip})\n";
     } else {
         $VM_HOST{$vmid} = $target;
-        # A reused VM is unjoined by construction (joined ones
-        # are adopted upstream, never rebuilt here), so stop
-        # it first: the converge step below rewrites network
-        # attachments that only apply cleanly stopped.
+        # A running same-name VM is a live member, not a
+        # leftover: hands off. Stopping it would bounce a
+        # healthy node for no reason, and on a
+        # control-plane node that risks etcd quorum (lab,
+        # 2026-10-28: a converge provision stopped cp6 and
+        # its restart flaked, leaving 2/3 etcd). A stopped
+        # leftover still goes through the full reuse path
+        # below: its attachments may predate the cluster
+        # VNet and only apply cleanly stopped.
+        my $st = eval { qm_on($target, 'status', $vmid) } // '';
+        if ($st =~ /^status:\s*running/m) {
+            print "reusing running $vmname (vmid $vmid on $target), "
+                . "leaving it alone\n";
+            $node->{vmid} = $vmid;
+            return $vmid;
+        }
         eval { qm_on($target, 'stop', $vmid) };
         print "reusing $vmname (vmid $vmid on $target)\n";
     }
@@ -1686,7 +1733,7 @@ sub install_file_tier {
             if !$ok;
         guest_exec($cp1->{vmid},
             PVE::K8s::Addons::nfs_csi_install_cmd(
-                '/root/local-super-admin.conf', $scfg));
+                '/etc/kubernetes/admin.conf', $scfg));
         # Probe from a worker (the data path pods use):
         # real mount, write/read, capacity from df.
         my ($worker) = grep { $_->{role} ne 'cp' } $nodes->@*;
@@ -1795,7 +1842,7 @@ sub install_file_tier {
     });
     guest_exec($cp1->{vmid},
         PVE::K8s::Addons::cephfs_csi_install_cmd(
-            '/root/local-super-admin.conf', $fsid, $fs,
+            '/etc/kubernetes/admin.conf', $fsid, $fs,
             $mons, $user, $key));
     my $df = ceph_cli_json('df') // {};
     my ($pool) = grep { ($_->{name} // '') eq "cephfs.${fs}.data" }
@@ -1982,9 +2029,14 @@ sub provision_cluster {
     guest_exec($cp1->{vmid},
         'kubeadm init phase bootstrap-token '
         . '--kubeconfig /etc/kubernetes/admin.conf');
+    # Cilium installs once, on the fresh init node: on
+    # converge the chart is already deployed, and the
+    # super-admin kubeconfig only ever existed on the init
+    # node (lab, 2026-10-28: a post-roll scale re-ran the
+    # install on a converged CP and died on localhost:8080).
     guest_exec($cp1->{vmid},
         PVE::K8s::Addons::cilium_install_cmd(
-            '/root/local-super-admin.conf', $vip));
+            '/root/local-super-admin.conf', $vip)) if $fresh;
     set_external_cloud_provider($cp1);
     ensure_kubelet_node_ip($cp1);
     print "control plane initialised on $cp1->{host}\n";
@@ -2009,10 +2061,28 @@ sub provision_cluster {
             enc_key => $is_cp ? $enc_key : undef,
             extra_runcmd => '',
         ));
-        my $joined = eval {
-            guest_exec($node->{vmid}, 'test -f /etc/kubernetes/kubelet.conf');
-            1;
-        } // 0;
+        # Join state probe: the command always exits 0 and
+        # reports state, so a transport/agent failure (which
+        # dies) is distinguishable from a genuinely unjoined
+        # node. Never mistake a dead agent for an unjoined
+        # node: the join below starts with kubeadm reset
+        # between attempts, which would wipe a healthy
+        # member's credentials (lab, 2026-10-28: flaked
+        # probes reset w3/w4 and took them NotReady).
+        my ($probe, $probe_err);
+        for (1 .. 3) {
+            $probe = eval {
+                guest_exec($node->{vmid},
+                    'if [ -f /etc/kubernetes/kubelet.conf ]; '
+                    . 'then echo JOINED; else echo ABSENT; fi');
+            };
+            $probe_err = $@;
+            last if defined $probe;
+            sleep 15;
+        }
+        die "cannot probe join state of $node->{host}: $probe_err\n"
+            if !defined $probe;
+        my $joined = $probe =~ /JOINED/ ? 1 : 0;
         if (!$joined) {
             my $last_error = '';
             for my $attempt (1 .. 3) {
@@ -2060,7 +2130,7 @@ sub provision_cluster {
     for (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /root/local-super-admin.conf get nodes --no-headers');
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers');
         } // '';
         my @ready_nodes = grep { /\sReady\s/ } split /\n/, $out;
         $ready = scalar @ready_nodes;
@@ -2085,7 +2155,7 @@ sub provision_cluster {
         push @label, grep { /^[a-zA-Z0-9.\/-]+=[^,]+$/ }
             split /\s*,\s*/, $node->{labels} // '';
         guest_exec($cp1->{vmid},
-            'kubectl --kubeconfig /root/local-super-admin.conf label nodes '
+            'kubectl --kubeconfig /etc/kubernetes/admin.conf label nodes '
             . "$node->{host} " . join(' ', @label) . ' --overwrite');
         if ($node->{taints}) {
             my $effect = '(NoSchedule|NoExecute|PreferNoSchedule)';
@@ -2093,7 +2163,7 @@ sub provision_cluster {
                 || /^[a-zA-Z0-9.\/-]+:$effect$/ }
                 split /\s*,\s*/, $node->{taints};
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /root/local-super-admin.conf taint nodes '
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes '
                 . "$node->{host} " . join(' ', @taint) . ' --overwrite')
                 if @taint;
         }
@@ -2111,18 +2181,18 @@ sub provision_cluster {
     for my $node (@nodes) {
         eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /root/local-super-admin.conf taint nodes '
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes '
                 . "$node->{host} node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule "
                 . '--overwrite');
         };
     }
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::ccm_apply_cmd(
-        '/root/local-super-admin.conf', $ccm_config));
+        '/etc/kubernetes/admin.conf', $ccm_config));
     my $identified = 0;
     for (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /root/local-super-admin.conf '
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
                 . 'get nodes -o jsonpath=\'{range .items[*]}{.spec.providerID}{"\n"}{end}\'');
         } // '';
         my @ids = grep { /^proxmox:\/\// } split /\n/, $out;
@@ -2140,14 +2210,14 @@ sub provision_cluster {
         pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
         $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::csi_install_cmd(
-        '/root/local-super-admin.conf', $csi_values));
+        '/etc/kubernetes/admin.conf', $csi_values));
     my $csi_ok = 0;
     for (1 .. 20) {
         $csi_ok = eval {
             my $out = guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /root/local-super-admin.conf get csidriver '
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf get csidriver '
                 . 'csi.proxmox.sinextra.dev -o name; '
-                . 'kubectl --kubeconfig /root/local-super-admin.conf get sc '
+                . 'kubectl --kubeconfig /etc/kubernetes/admin.conf get sc '
                 . '-o name');
             $out =~ /csidriver/ && $out =~ /shared-block/ && $out =~ /local-block/;
         } // 0;
@@ -2197,7 +2267,7 @@ sub provision_cluster {
     }
     if ($range) {
         guest_exec($cp1->{vmid}, PVE::K8s::Addons::lb_apply_cmd(
-            '/root/local-super-admin.conf',
+            '/etc/kubernetes/admin.conf',
             PVE::K8s::Addons::lb_pool_yaml($range)));
         print "LoadBalancer pool $range applied "
             . "(Cilium LB IPAM, L2 announcement)\n";
@@ -2324,6 +2394,23 @@ my sub etcd_snapshot {
     return $file;
 }
 
+# Snapshot etcd through the first control-plane node
+# whose etcd actually answers: the operations node can be
+# a behind member whose etcd is already gone (lab,
+# 2026-10-28: the snapshot hung on memberless cp4 while
+# cp5/cp6 served). Dies only when no CP can snapshot.
+my sub etcd_snapshot_any {
+    my ($nodes) = @_;
+
+    my $err = 'no control-plane nodes';
+    for my $cp (grep { $_->{role} eq 'cp' } $nodes->@*) {
+        my $file = eval { etcd_snapshot($cp) };
+        return $file if defined $file;
+        $err = $@;
+    }
+    die "no etcd snapshot possible: $err\n";
+}
+
 my sub etcd_member_remove {
     my ($survivor, $old_host) = @_;
 
@@ -2388,8 +2475,13 @@ sub remove_node {
     eval { kubectl_on($cp, "drain $old->{host} --ignore-daemonsets "
         . '--delete-emptydir-data --force --timeout=240s') };
     if ($old->{role} eq 'cp') {
-        my ($survivor) = grep {
+        # Prefer a current member as the removal endpoint:
+        # a behind survivor may itself be memberless (lab,
+        # 2026-10-28: operations ran via retired cp4).
+        my @cands = grep {
             $_->{role} eq 'cp' && $_->{host} ne $old->{host} } $all->@*;
+        my ($survivor) = grep { $_->{current} } @cands;
+        $survivor //= $cands[0];
         etcd_member_remove($survivor, $old->{host}) if $survivor;
     }
     # Verify the VM's identity before touching the guest or
@@ -2904,17 +2996,26 @@ sub roll_cluster {
         bridge => cluster_bridge($scfg) };
     my $hosts = pve_online_nodes();
     # Operations (snapshot, join material, upgrade apply,
-    # kubectl) run from the first control-plane node whose
-    # guest agent actually answers; any CP can serve, and the
-    # first by name may be the least healthy one.
+    # kubectl) run from the first control-plane node that can
+    # actually reach the API: a live agent is not enough, the
+    # node must serve operations through the VIP, else every
+    # kubectl below hangs on a blackholed endpoint (lab,
+    # 2026-10-28: ops ran via memberless cp4, whose VIP route
+    # was gone, and the run stalled 20+ minutes in timeouts).
     my ($cp1) = grep { $_->{role} eq 'cp' } @nodes;
     for my $candidate (grep { $_->{role} eq 'cp' } @nodes) {
-        my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
+        my $ok = eval {
+            guest_exec($candidate->{vmid}, 'true');
+            guest_exec($candidate->{vmid},
+                "curl -sk --max-time 20 https://$vip:6443/readyz "
+                . "| grep -q ok");
+            1;
+        } // 0;
         if ($ok) {
             $cp1 = $candidate;
             last;
         }
-        print "roll operations: $candidate->{host} not answering, "
+        print "roll operations: $candidate->{host} not usable, "
             . "trying next control-plane node\n";
     }
     print "roll operations via $cp1->{host}\n";
@@ -2938,14 +3039,17 @@ sub roll_cluster {
     my $vms = cluster_vms();
     my %live_kubelet;
     my %known = map { $_->{host} => 1 } @nodes;
-    my $live = eval {
-        JSON::PP->new->decode(
-            scalar kubectl_on($cp1, 'get nodes -o json')) } // {};
+    my $node_json = eval {
+        scalar kubectl_on($cp1, 'get nodes -o json') } // '';
+    my $items = live_node_items($node_json);
     my $adopted = 0;
-    for my $item ($live->{items} // []) {
-        my $lname = $item->{metadata}{name} // '';
-        $live_kubelet{$lname} =
-            $item->{status}{nodeInfo}{kubeletVersion} // '';
+    for my $item ($items->@*) {
+        my $meta = $item->{metadata};
+        $meta = {} if ref $meta ne 'HASH';
+        my $lname = $meta->{name} // '';
+        my $info = $item->{status}{nodeInfo};
+        $info = {} if ref $info ne 'HASH';
+        $live_kubelet{$lname} = $info->{kubeletVersion} // '';
         next if $known{$lname};
         my ($pool, $idx);
         if ($lname =~ /^\Q$name\E-cp(\d+)$/) {
@@ -2970,9 +3074,13 @@ sub roll_cluster {
                 . "leaving it unmanaged\n";
             next;
         }
+        my $status = $item->{status};
+        $status = {} if ref $status ne 'HASH';
+        my $addrs = $status->{addresses};
+        $addrs = [] if ref $addrs ne 'ARRAY';
         my ($ip) = map { $_->{address} }
-            grep { ($_->{type} // '') eq 'InternalIP' }
-            ($item->{status}{addresses} // [])->@*;
+            grep { ref $_ eq 'HASH'
+                && ($_->{type} // '') eq 'InternalIP' } $addrs->@*;
         my $pdef = $pdef_of{$pool} // {};
         my $node = {
             host => $lname,
@@ -3046,7 +3154,8 @@ sub roll_cluster {
     set_state($name, 'rolling');
 
     # etcd snapshot gate before any control-plane replacement
-    etcd_snapshot($cp1) if grep { $_->{role} eq 'cp' } @behind;
+    etcd_snapshot_any(\@nodes)
+        if grep { $_->{role} eq 'cp' } @behind;
 
     # cluster-info may still point at the first CP's address
     # (it is created during provisioning from the local
@@ -3188,10 +3297,16 @@ sub roll_cluster {
                 server_git_version(scalar kubectl_on($cp1,
                     'version -o json'))
             } // '';
-            if ($live ne '' && !upgrade_apply_needed($live, $kver)) {
+            if (($scfg->{'upgrade-applied'} // '') eq $kver) {
+                print "upgrade to $kver already applied "
+                    . "(record), skipping kubeadm upgrade apply\n";
+                $upgraded = 1;
+            } elsif ($live ne ''
+                && !upgrade_apply_needed($live, $kver)) {
                 print "control plane already at $live, "
                     . "skipping kubeadm upgrade apply\n";
                 $upgraded = 1;
+                set_upgrade_applied($name, $kver);
             }
             if (!$upgraded) {
             guest_exec($cp1->{vmid},
@@ -3224,6 +3339,7 @@ sub roll_cluster {
                 die "kubeadm upgrade apply failed on $cp1->{host}: $log\n";
             }
             $upgraded = 1;
+            set_upgrade_applied($name, $kver);
             print "control plane upgraded to $kver via $cp1->{host}\n";
             }
         }

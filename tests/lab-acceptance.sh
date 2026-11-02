@@ -226,6 +226,8 @@ stage_roll() {
 import json, sys
 print(",".join(sorted(n["vmid"] for n in
     json.loads(json.load(sys.stdin)["nodes"]))))')
+    rev_before=$(cluster_json | python3 -c \
+        'import json,sys; print(json.load(sys.stdin)["template-rev"])')
     closed=$(python3 -c '
 import datetime
 now = datetime.datetime.now() + datetime.timedelta(hours=3)
@@ -238,7 +240,8 @@ print(now.strftime("%H:00") + "-" + now.strftime("%H:30"))')
         || die "roll was not refused outside its window"
     rev0=$(cluster_json | python3 -c \
         'import json,sys; print(json.load(sys.stdin)["template-rev"])')
-    [ "$rev0" = 1 ] || die "a roll ran despite the closed window"
+    [ "$rev0" = "$rev_before" ] \
+        || die "a roll ran despite the closed window"
     say "roll correctly refused outside window $closed"
     pvesh set "/cluster/k8s/$NAME" \
         --maintenance-window "00:00-23:59" >/dev/null
@@ -255,9 +258,10 @@ print(",".join(sorted(n["vmid"] for n in
     [ "$(nodes_ready)" = 5 ] || die "not 5 Ready after roll"
     rev=$(cluster_json | python3 -c \
         'import json,sys; print(json.load(sys.stdin)["template-rev"])')
-    [ "$rev" = 2 ] || die "cluster not on template r2 (rev=$rev)"
+    [ "$rev" = $((rev_before + 1)) ] \
+        || die "cluster not on template r$((rev_before + 1)) (rev=$rev)"
     KCP "get pods -n kube-system -l component=etcd --no-headers"
-    echo "S3 PASS (all nodes replaced onto template r2, "
+    echo "S3 PASS (all nodes replaced onto template r$rev, "
     echo "    window gate enforced, etcd pods healthy)"
 }
 
@@ -290,8 +294,15 @@ spec:
     done
     [ "$(nodes_ready)" = 6 ] || die "scaler did not add a node"
     [ "$p" = Running ] || die "big pod not Running on new node"
-    grep -q "scale: pool default" /tmp/$NAME-scale.log \
-        || die "scale log lacks the grow decision"
+    # The grow decision lives in the record (only the scaler
+    # writes pool size); the per-pass task log is truncated
+    # by every later pass, so asserting on it races the
+    # loop's own next iteration.
+    size=$(cluster_json | python3 -c '
+import json, sys
+pools = json.loads(json.load(sys.stdin)["pools"])
+print([p["size"] for p in pools if p["name"] == "default"][0])')
+    [ "$size" = 3 ] || die "pool did not grow to 3 (size=$size)"
     # pool now at max (3 workers): another big pod cannot be
     # hosted and the pass must say so instead of scaling
     KCP "delete pod acc-big"
@@ -358,6 +369,50 @@ stage_delete() {
         | grep -q "$NAME" && die "orphan SDN VNet remains"
     echo "S6 PASS (no orphan VMs, disks, users, or SDN objects)"
 }
+
+# Preflight gate: refuse to start a stage on an incoherent
+# lab. A wedged host, dead fabric or mismatched etcd must
+# abort cleanly here, never corrupt a stage mid-run (T4.1
+# lab findings L1-L3, tasks.md). Cluster-level checks apply
+# only when the cluster already exists (not before create).
+preflight() {
+    say "preflight: corosync, fabric, swap, cluster coherence"
+    pvecm status 2>/dev/null | grep -q "Quorate:.*Yes" \
+        || die "preflight: corosync not quorate"
+    if command -v vtysh >/dev/null; then
+        vtysh -c "show bgp summary" 2>/dev/null \
+            | grep -qE "Established" \
+            || die "preflight: no BGP peer Established"
+        vtysh -c "show bgp summary" 2>/dev/null \
+            | grep -qE " (Idle|Active) " \
+            && die "preflight: BGP peer Idle/Active (FRR/BFD?)"
+    fi
+    swap_used=$(awk '/SwapTotal:/ {t=$2} /SwapFree:/ {f=$2}
+        END { if (t > 0) printf "%d", (t - f) * 100 / t;
+              else print 0 }' /proc/meminfo)
+    [ "$swap_used" -lt 80 ] \
+        || die "preflight: swap ${swap_used}% used (host thrashing)"
+    pvesh get "/cluster/k8s/$NAME" --output-format json \
+        >/dev/null 2>&1 || return 0
+    # VIP must answer from the first CP, and etcd membership
+    # must match the recorded control-plane count.
+    vip=$(CP "grep -o 'server: https://[0-9.]*' \
+        /etc/kubernetes/admin.conf | cut -d/ -f3")
+    [ -n "$vip" ] || die "preflight: no VIP in admin.conf"
+    CP "curl -sk --max-time 20 https://$vip:6443/readyz" \
+        | grep -q '^ok' || die "preflight: VIP $vip not ready"
+    cps=$(cluster_json | python3 -c '
+import json, sys
+nodes = json.loads(json.load(sys.stdin)["nodes"])
+print(len([n for n in nodes if n["pool"] == "control-plane"]))')
+    first_cp=$(KCP "get nodes -l node-role.kubernetes.io/control-plane --no-headers" | awk 'NR==1 {print $1}')
+    members=$(KCP "exec -n kube-system etcd-$first_cp -- etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/server.crt --key /etc/kubernetes/pki/etcd/server.key member list 2>/dev/null | grep -c started" || true)
+    [ "$members" = "$cps" ] \
+        || die "preflight: etcd members $members != recorded CPs $cps"
+    say "preflight ok (VIP $vip, etcd $members members)"
+}
+
+preflight
 
 case "$STAGE" in
     create) stage_create ;;

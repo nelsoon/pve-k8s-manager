@@ -184,6 +184,11 @@ my $defaultData = {
             description => "Template image revision the nodes should run.",
             optional => 1,
         },
+        'upgrade-applied' => {
+            type => 'string',
+            description => "kubeadm version whose upgrade apply already ran.",
+            optional => 1,
+        },
         'maintenance-window' => {
             type => 'string',
             description => "Rolling window HH:MM-HH:MM (local time).",
@@ -251,6 +256,7 @@ sub options {
         'lb-range' => { optional => 1 },
         nodes => { optional => 1 },
         'template-rev' => { optional => 1 },
+        'upgrade-applied' => { optional => 1 },
         'maintenance-window' => { optional => 1 },
         'scaler-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },

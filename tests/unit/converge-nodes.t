@@ -113,4 +113,45 @@ sub rec {
         'canonical worker names not resurrected');
 }
 
+# 7. converge-reachable steps must not use the init-only
+# kubeconfig: /root/local-super-admin.conf exists solely on
+# the bootstrap node, so any use outside an `if $fresh`
+# line dies on a converged cluster whose init node is long
+# rolled away (lab, 2026-10-28: post-roll scale died on
+# localhost:8080). /etc/kubernetes/admin.conf is on every
+# CP and is cluster-admin after the init binding.
+{
+    open(my $fh, '<', 'PVE/K8s/Provision.pm') or die $!;
+    local $/;
+    my $src = <$fh>;
+    my @bad;
+    for my $sub (qw(provision_cluster install_file_tier)) {
+        my ($body) = $src =~ /^sub $sub \{(.*?)^sub /ms;
+        push @bad, "$sub: $_" for grep {
+            /local-super-admin\.conf/ && !/if \$fresh/ }
+            split /\n/, ($body // '');
+    }
+    is(scalar @bad, 0,
+        'no unguarded init-only kubeconfig in provision_cluster')
+        or diag explain \@bad;
+}
+
+# 8. reusing a running VM must not stop it: the converge
+# loop rebuilds every record node, and a stop/start there
+# bounces healthy members (lab, 2026-10-28: cp6 stopped,
+# restart flaked, etcd at 2/3).
+{
+    open(my $fh, '<', 'PVE/K8s/Provision.pm') or die $!;
+    local $/;
+    my $src = <$fh>;
+    like($src, qr/qm_on\(\$target, 'status', \$vmid\)/,
+        'reuse path checks whether the VM is running');
+    like($src, qr/leaving it alone/,
+        'a running reused VM is left alone, not stopped');
+    like($src, qr/echo JOINED; else echo ABSENT/,
+        'join probe reports state instead of overloading exit status');
+    like($src, qr/cannot probe join state/,
+        'an unreadable node fails the run instead of a reset cycle');
+}
+
 done_testing();
