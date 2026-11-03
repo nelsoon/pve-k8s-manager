@@ -2694,17 +2694,28 @@ sub scale_reconcile {
     my $inventory = JSON::PP->new->decode($scfg->{nodes});
     my @nodes;
     for my $item ($inventory->@*) {
-        my ($idx) = $item->{name} =~ /(\d+)$/;
+        # Launder through regex captures like cluster_vms:
+        # JSON-decoded values are tainted under the daemon's
+        # -T, and passing them to exec (ssh/qm) dies with
+        # "Insecure dependency".
+        my ($host) = ($item->{name} // '') =~ /^([a-zA-Z0-9._-]+)$/
+            or die "bad node name in inventory\n";
+        my ($idx) = $host =~ /(\d+)$/;
+        my ($vmid) = ($item->{vmid} // '') =~ /^(\d+)$/
+            or die "bad vmid for node '$host'\n";
+        my ($pvehost) = ($item->{pvehost} // '') =~ /^([a-zA-Z0-9._-]+)$/
+            or die "bad pvehost for node '$host'\n";
+        my ($ip) = ($item->{ip} // '') =~ /^(\d+\.\d+\.\d+\.\d+)$/;
         my $pool = $item->{pool} // 'default';
         push @nodes, {
-            host => $item->{name},
+            host => $host,
             role => $pool eq 'control-plane' ? 'cp' : 'worker',
-            pool => $pool, idx => $idx // 1, ip => $item->{ip},
-            vmid => $item->{vmid}, pvehost => $item->{pvehost},
+            pool => $pool, idx => $idx // 1, ip => $ip,
+            vmid => $vmid, pvehost => $pvehost,
             labels => ($pool_by_name{$pool} // {})->{labels},
             taints => ($pool_by_name{$pool} // {})->{taints},
         };
-        $VM_HOST{$item->{vmid}} = $item->{pvehost};
+        $VM_HOST{$vmid} = $pvehost;
     }
 
     my ($cp) = grep { $_->{role} eq 'cp' } @nodes;
@@ -3441,17 +3452,29 @@ my sub load_nodes {
     my $inventory = JSON::PP->new->decode($scfg->{nodes});
     my @nodes;
     for my $item ($inventory->@*) {
-        my ($idx) = $item->{name} =~ /(\d+)$/;
+        # Launder through regex captures like cluster_vms:
+        # JSON-decoded values are tainted under the daemon's
+        # -T, and passing them to exec (ssh/qm) dies with
+        # "Insecure dependency", which ops_cp would report
+        # as "no control-plane node answers".
+        my ($host) = ($item->{name} // '') =~ /^([a-zA-Z0-9._-]+)$/
+            or die "bad node name in inventory\n";
+        my ($idx) = $host =~ /(\d+)$/;
+        my ($vmid) = ($item->{vmid} // '') =~ /^(\d+)$/
+            or die "bad vmid for node '$host'\n";
+        my ($pvehost) = ($item->{pvehost} // '') =~ /^([a-zA-Z0-9._-]+)$/
+            or die "bad pvehost for node '$host'\n";
+        my ($ip) = ($item->{ip} // '') =~ /^(\d+\.\d+\.\d+\.\d+)$/;
         my $pool = $item->{pool} // 'default';
         push @nodes, {
-            host => $item->{name},
+            host => $host,
             role => $pool eq 'control-plane' ? 'cp' : 'worker',
-            pool => $pool, idx => $idx // 1, ip => $item->{ip},
-            vmid => $item->{vmid}, pvehost => $item->{pvehost},
+            pool => $pool, idx => $idx // 1, ip => $ip,
+            vmid => $vmid, pvehost => $pvehost,
             labels => ($pool_by_name{$pool} // {})->{labels},
             taints => ($pool_by_name{$pool} // {})->{taints},
         };
-        $VM_HOST{$item->{vmid}} = $item->{pvehost};
+        $VM_HOST{$vmid} = $pvehost;
     }
     return \@nodes;
 }

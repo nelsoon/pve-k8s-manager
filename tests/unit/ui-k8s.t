@@ -84,13 +84,22 @@ like($provsrc, qr/etcdutl snapshot restore/,
 like($provsrc, qr/if \(!\$destroyed\) \{\n            my \$retired/,
     'ghost marker only kept when the destroy failed');
 
-# Tree workspace (SDN-style subtree): clusters as tree
-# nodes with per-cluster panels, read-only workloads and
-# metrics backed by their API endpoints.
+# Specific clusters are selected in Proxmox's first/left
+# resource panel and opened as PVE.k8s.Config. That page
+# fixes the selected cluster and uses horizontal top tabs;
+# the Datacenter view retains a combobox for convenience.
+like($js, qr/Ext\.define\('PVE\.k8s\.Config'/,
+    'specific-cluster page is defined');
+like($js, qr/tabPosition: 'top'/,
+    'specific-cluster panels use horizontal top tabs');
+like($js, qr/fixedClusterName/,
+    'resource-selected cluster is fixed in its page');
+like($js, qr/reloadClusters\(true\)/,
+    'manual reload rebuilds the selected cluster panels');
 like($js, qr/Ext\.form\.field\.ComboBox/,
-    'workspace selects clusters via a combobox (no 3rd sidebar)');
+    'Datacenter workspace selects clusters via a combobox');
 like($js, qr/Ext\.tab\.Panel/, 'cluster panels are tabs');
-unlike($js, qr/Ext\.tree\.Panel/, 'no tree panel (no 3rd sidebar)');
+unlike($js, qr/Ext\.tree\.Panel/, 'no plugin tree panel (no 3rd sidebar)');
 like($js, qr/'pool-min'/, 'create composes pool bounds from fields');
 for my $panel (qw(overview nodes workloads metrics addons
     events backups settings)) {

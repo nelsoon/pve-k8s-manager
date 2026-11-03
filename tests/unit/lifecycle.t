@@ -132,6 +132,13 @@ like($api, qr{path => '\{name\}/workloads'},
     'workloads endpoint registered');
 like($api, qr{path => '\{name\}/metrics'},
     'metrics endpoint registered');
+# Read endpoints that reach kubectl through qm guest exec
+# must run protected: unprotected GETs are served with
+# dropped privileges and qm/ssh refuse to run there.
+for my $ep (qw(events certificates workloads metrics)) {
+    like($api, qr{path => '\{name\}/$ep',\n    method => 'GET',\n    protected => 1},
+        "$ep endpoint runs protected (root)");
+}
 like($api, qr{addons/\{addon\}/disable'},
     'addon disable endpoint registered');
 like($src, qr/sub disable_addon/, 'disable_addon exists');

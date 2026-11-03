@@ -114,6 +114,64 @@ run_patch({
     },
 });
 
+my $k8s_resources_code = "\n"
+    . "\tif (!\$param->{type} || \$param->{type} eq 'k8s') {\n"
+    . "\t    if (\$rpcenv->check(\$authuser, \"/cluster\", "
+    . "['Sys.Audit'], 1)) {\n"
+    . "\t\tmy \$k8s_cfg = eval { PVE::K8s::Config->config() } || {};\n"
+    . "\t\tpush \@\$res, "
+    . "PVE::K8s::Config::resource_entries(\$k8s_cfg)->\@*;\n"
+    . "\t    }\n"
+    . "\t}\n";
+my $k8s_property = "\t\tk8s => {\n"
+    . "\t\t    description => \"The Kubernetes cluster name "
+    . "(for type 'k8s').\",\n"
+    . "\t\t    type => 'string',\n"
+    . "\t\t    optional => 1,\n"
+    . "\t\t},\n";
+run_patch({
+    file => "$pm/PVE/API2/Cluster.pm",
+    marker => 'PVE::K8s::Config::resource_entries',
+    apply => sub {
+        my ($src) = @_;
+        my $start = index($src, "    name => 'resources',");
+        return undef if $start < 0;
+        my $code_start = index($src, "\n    code => sub {", $start);
+        return undef if $code_start < 0;
+
+        my $head = substr($src, $start, $code_start - $start);
+        my $changed = $head;
+        $changed =~ s/(enum => \[[^\]]*'sdn')(\])/$1, 'k8s'$2/g;
+        return undef if $changed eq $head;
+        $head = $changed;
+
+        my $property = index($head, "\t\tplugintype => {");
+        return undef if $property < 0;
+        substr($head, $property, 0) = $k8s_property;
+        $src = substr($src, 0, $start) . $head
+            . substr($src, $code_start);
+
+        $code_start = index($src, "\n    code => sub {", $start);
+        my $return = index($src, "\n\treturn \$res;", $code_start);
+        return undef if $return < 0;
+        substr($src, $return, 0) = $k8s_resources_code;
+        return $src;
+    },
+    remove => sub {
+        my ($src) = @_;
+        $src =~ s/\Q$k8s_resources_code\E//;
+        $src =~ s/\Q$k8s_property\E//;
+        my $start = index($src, "    name => 'resources',");
+        return $src if $start < 0;
+        my $code_start = index($src, "\n    code => sub {", $start);
+        return $src if $code_start < 0;
+        my $head = substr($src, $start, $code_start - $start);
+        $head =~ s/, 'k8s'(\])/$1/g;
+        return substr($src, 0, $start) . $head
+            . substr($src, $code_start);
+    },
+});
+
 my $cfs_line = "    'k8s/clusters.cfg' => 1,\n";
 run_patch({
     file => "$pm/PVE/Cluster.pm",
@@ -181,6 +239,73 @@ run_patch({
     remove => sub {
         my ($src) = @_;
         $src =~ s/\Q$dc_block\E//;
+        return $src;
+    },
+});
+
+my $resource_type = "\t    k8s: {\n"
+    . "\t\ticonCls: 'fa fa-cubes',\n"
+    . "\t\ttext: gettext('Kubernetes'),\n"
+    . "\t    },\n";
+run_patch({
+    file => "$js/pvemanagerlib.js",
+    marker => "\t    k8s: {\n\t\ticonCls: 'fa fa-cubes',",
+    apply => sub {
+        my ($src) = @_;
+        my $anchor = "\t    sdn: {\n"
+            . "\t\ticonCls: 'fa fa-th',\n"
+            . "\t\ttext: gettext('SDN'),\n"
+            . "\t    },\n";
+        return undef if index($src, $anchor) < 0;
+        $src =~ s/\Q$anchor\E/$anchor$resource_type/;
+        return $src;
+    },
+    remove => sub {
+        my ($src) = @_;
+        $src =~ s/\Q$resource_type\E//;
+        return $src;
+    },
+});
+
+my $resource_order = "\t    case 'k8s': return 5;\n";
+run_patch({
+    file => "$js/pvemanagerlib.js",
+    marker => "case 'k8s': return 5;",
+    apply => sub {
+        my ($src) = @_;
+        my $anchor = "\t    case 'sdn': return 3;\n";
+        return undef if index($src, $anchor) < 0;
+        $src =~ s/\Q$anchor\E/$anchor$resource_order/;
+        return $src;
+    },
+    remove => sub {
+        my ($src) = @_;
+        $src =~ s/\Q$resource_order\E//;
+        return $src;
+    },
+});
+
+my $resource_route = "\t\t\t    k8s: 'pveK8sConfig',\n";
+run_patch({
+    file => "$js/pvemanagerlib.js",
+    marker => "k8s: 'pveK8sConfig'",
+    apply => sub {
+        my ($src) = @_;
+        # An earlier build routed to the class name, which
+        # Ext tries to load as /widget/PVE/k8s/Config.js.
+        my $legacy = "\t\t\t    k8s: 'PVE.k8s.Config',\n";
+        if (index($src, $legacy) >= 0) {
+            $src =~ s/\Q$legacy\E/$resource_route/;
+            return $src;
+        }
+        my $anchor = "\t\t\t    sdn: 'PVE.sdn.Browser',\n";
+        return undef if index($src, $anchor) < 0;
+        $src =~ s/\Q$anchor\E/$anchor$resource_route/;
+        return $src;
+    },
+    remove => sub {
+        my ($src) = @_;
+        $src =~ s/\Q$resource_route\E//;
         return $src;
     },
 });

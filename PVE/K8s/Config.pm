@@ -306,6 +306,25 @@ sub store_config {
     cfs_write_file($FILENAME, $cfg);
 }
 
+# Logical datacenter-wide resources for the Proxmox resource
+# tree. A Kubernetes cluster is not owned by one PVE node, so
+# entries deliberately have no node or VMID.
+sub resource_entries {
+    my ($cfg) = @_;
+
+    my $ids = ($cfg // {})->{ids} // {};
+    return [map {
+        my $cluster = $ids->{$_} // {};
+        +{
+            id => "k8s/$_",
+            type => 'k8s',
+            name => $_,
+            k8s => $_,
+            status => $cluster->{state} // 'unknown',
+        }
+    } sort keys $ids->%*];
+}
+
 __PACKAGE__->register();
 __PACKAGE__->init();
 

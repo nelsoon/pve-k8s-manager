@@ -77,8 +77,12 @@ hosts that need them).
 
 ## Usage
 
-In the UI: Datacenter → Kubernetes (clusters, nodes,
-add-ons, events, backups). Over the API, for example:
+In the UI: create and manage clusters under
+Datacenter → Kubernetes. Each cluster also appears as a
+datacenter-wide resource in the left resource panel;
+selecting it opens its Overview, Nodes, Workloads, Metrics,
+Add-ons, Events, Backups and Settings as horizontal tabs.
+Over the API, for example:
 
 ```sh
 pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \

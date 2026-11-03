@@ -263,8 +263,24 @@ Ext.define('PVE.dc.K8sView', {
 
     title: gettext('Kubernetes'),
 
+    // Set when the view is opened for one resource-tree
+    // cluster (PVE.k8s.Config); then the selector is hidden
+    // and the selected cluster is fixed.
+    fixedClusterName: undefined,
+    pveSelNode: undefined,
+
     initComponent: function() {
         let me = this;
+        let fixedClusterName = me.fixedClusterName;
+        if (!fixedClusterName && me.pveSelNode && me.pveSelNode.data
+            && me.pveSelNode.data.type === 'k8s') {
+            fixedClusterName = me.pveSelNode.data.name
+                || me.pveSelNode.data.k8s;
+        }
+        me.fixedClusterName = fixedClusterName;
+        if (fixedClusterName) {
+            me.title = gettext('Kubernetes') + ': ' + fixedClusterName;
+        }
 
         let api = function(opts) {
             Proxmox.Utils.API2Request(Ext.apply({
@@ -1008,8 +1024,8 @@ Ext.define('PVE.dc.K8sView', {
             return p;
         };
 
-        let showCluster = function(name) {
-            if (me.currentCluster === name && outer
+        let showCluster = function(name, force) {
+            if (!force && me.currentCluster === name && outer
                 && outer.items.getCount() > 1) {
                 return;
             }
@@ -1031,6 +1047,11 @@ Ext.define('PVE.dc.K8sView', {
             while (outer.items.getCount() > 1) {
                 outer.remove(outer.items.getAt(1), false);
             }
+            if (force) {
+                defs.forEach(function(d) {
+                    delete panels[name + ':' + d[0]];
+                });
+            }
             defs.forEach(function(d) {
                 let p = panelFor(name, d[0], rec);
                 p.title = d[1];
@@ -1042,6 +1063,9 @@ Ext.define('PVE.dc.K8sView', {
             });
             outer.setActiveTab(keep || outer.items.getAt(1));
             destroyBtn.setDisabled(false);
+            if (fixedClusterName) {
+                me.setTitle(gettext('Kubernetes') + ': ' + name);
+            }
         };
 
         let selector = Ext.create('Ext.form.field.ComboBox', {
@@ -1054,6 +1078,7 @@ Ext.define('PVE.dc.K8sView', {
             displayField: 'label',
             valueField: 'name',
             editable: false,
+            hidden: !!fixedClusterName,
             listeners: {
                 change: function(field, value) {
                     if (value) { showCluster(value); }
@@ -1079,7 +1104,11 @@ Ext.define('PVE.dc.K8sView', {
                             success: function(r) {
                                 task(r.result.data);
                                 me.currentCluster = null;
-                                me.reloadClusters();
+                                if (fixedClusterName && me.workspace) {
+                                    me.workspace.selectById('root');
+                                } else {
+                                    me.reloadClusters();
+                                }
                             },
                         });
                     });
@@ -1089,6 +1118,7 @@ Ext.define('PVE.dc.K8sView', {
         let home = Ext.create('Ext.grid.Panel', {
             title: gettext('Clusters'),
             itemId: 'k8s-home',
+            hidden: !!fixedClusterName,
             border: false,
             store: clusterStore,
             columns: [
@@ -1118,12 +1148,13 @@ Ext.define('PVE.dc.K8sView', {
 
         outer = Ext.create('Ext.tab.Panel', {
             border: false,
+            tabPosition: 'top',
             items: [home],
         });
 
         me.clusterIndex = {};
-        me.currentCluster = null;
-        me.reloadClusters = function() {
+        me.currentCluster = fixedClusterName || null;
+        me.reloadClusters = function(force) {
             clusterStore.load({
                 callback: function(records) {
                     me.clusterIndex = {};
@@ -1137,11 +1168,23 @@ Ext.define('PVE.dc.K8sView', {
                     });
                     let store = selector.getStore();
                     store.loadData(rows);
+                    if (fixedClusterName
+                        && !me.clusterIndex[fixedClusterName]) {
+                        me.currentCluster = null;
+                        destroyBtn.setDisabled(true);
+                        while (outer.items.getCount() > 1) {
+                            outer.remove(outer.items.getAt(1), false);
+                        }
+                        if (me.workspace) {
+                            me.workspace.selectById('root');
+                        }
+                        return;
+                    }
                     let keep = me.currentCluster
                         && me.clusterIndex[me.currentCluster];
                     if (keep) {
                         selector.setValue(me.currentCluster, false);
-                        showCluster(me.currentCluster);
+                        showCluster(me.currentCluster, force);
                     } else if (rows.length) {
                         selector.setValue(rows[0].name);
                     } else {
@@ -1164,6 +1207,7 @@ Ext.define('PVE.dc.K8sView', {
                     {
                         text: gettext('Create'),
                         iconCls: 'fa fa-fw fa-plus-circle',
+                        hidden: !!fixedClusterName,
                         handler: function() {
                             Ext.create('PVE.dc.K8sCreateWindow', {
                                 onDone: function() { me.reloadClusters(); },
@@ -1175,7 +1219,7 @@ Ext.define('PVE.dc.K8sView', {
                     {
                         text: gettext('Reload'),
                         iconCls: 'fa fa-fw fa-refresh',
-                        handler: function() { me.reloadClusters(); },
+                        handler: function() { me.reloadClusters(true); },
                     },
                 ],
             }, Ext.apply(outer, { flex: 1 })],
@@ -1195,6 +1239,25 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
+        me.callParent();
+    },
+});
+
+// Specific-cluster page opened from the first/left Proxmox
+// resource panel. The resource tree has already selected the
+// cluster, so this view fixes that selection and presents the
+// same panels as horizontal top tabs, without a selector or
+// another navigation column.
+Ext.define('PVE.k8s.Config', {
+    extend: 'PVE.dc.K8sView',
+    alias: 'widget.pveK8sConfig',
+
+    initComponent: function() {
+        let me = this;
+        if (!me.fixedClusterName && me.pveSelNode && me.pveSelNode.data) {
+            me.fixedClusterName = me.pveSelNode.data.name
+                || me.pveSelNode.data.k8s;
+        }
         me.callParent();
     },
 });

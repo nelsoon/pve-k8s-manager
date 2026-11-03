@@ -43,6 +43,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/packaging.t
 	@perl -I. -Itests/stubs tests/unit/upgrade-apply-skip.t
 	@perl -I. -Itests/stubs tests/unit/lifecycle.t
+	@perl -I. -Itests/stubs tests/unit/resource-tree.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 
 # Packaging: stage the payload and build with dpkg-deb.

@@ -22,12 +22,17 @@ are simply part of the tree.
    registration in `PVE/API2/Cluster.pm`. Endpoints follow
    the existing API conventions (worker tasks for long
    operations: `k8sprovision`, `k8sroll`, `k8supgrade`,
-   `k8sscale`).
+   `k8sscale`). The cluster-resources endpoint also returns
+   each managed cluster as a datacenter-wide `k8s` resource.
 
-4. **pve-manager: Datacenter Kubernetes UI**
+4. **pve-manager: Datacenter and resource-tree Kubernetes UI**
    `www/manager6/PVEK8sWorkspace.js` (new file), one view
    entry in the Datacenter view list, one script tag in
-   `index.html.tpl`. The UI is a thin client of the API.
+   `index.html.tpl`, a `k8s` type in the resource tree, and
+   routing from that resource type to `PVE.k8s.Config`.
+   The Datacenter view lists and creates clusters; selecting
+   a cluster in the left resource panel opens its page with
+   horizontal top tabs. The UI is a thin client of the API.
 
 5. **pve-manager: tools and units**
    `tools/pve-k8s-scaler`, `tools/pve-k8s-backup`, and their

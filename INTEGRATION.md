@@ -48,9 +48,38 @@ non-issue.
    (upstream, the file would simply be part of the manager's
    concatenated JS).
 
+5. Resource index — in the `resources` endpoint of
+   `PVE/API2/Cluster.pm`, return one datacenter-wide entry
+   per managed Kubernetes cluster for users with
+   `Sys.Audit` on `/cluster`:
+
+   ```perl
+   {
+       id => "k8s/$name",
+       type => 'k8s',
+       name => $name,
+       k8s => $name,
+       status => $state,
+   }
+   ```
+
+   The endpoint's type enums and return schema also learn
+   the `k8s` type. A Kubernetes cluster has no owning PVE
+   node and no VMID.
+
+6. Resource-tree type — in `PVE.tree.ResourceTree`
+   (`pvemanagerlib.js`), add a `k8s` type default (Kubernetes
+   label and cubes icon) and its type ordering.
+
+7. Workspace routing — in `PVE.StdWorkspace`
+   (`pvemanagerlib.js`), route resource type `k8s` to
+   `PVE.k8s.Config`, which shows the selected cluster with
+   horizontal top tabs.
+
 Everything else is new files only: `PVE/K8s/Config.pm`,
 `PVE/API2/Cluster/K8s.pm`, UI files, and this package's own
-data. No existing behaviour is modified.
+data. Existing behaviour is unchanged apart from the
+additional resource type above.
 
 Note: `/etc/pve/k8s/` must exist before the first write
 (pmxcfs writes a temp file next to `clusters.cfg`). The

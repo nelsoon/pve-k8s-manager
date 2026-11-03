@@ -467,6 +467,7 @@ __PACKAGE__->register_method({
     name => 'events',
     path => '{name}/events',
     method => 'GET',
+    protected => 1, # kubectl via qm guest exec needs root
     description => "Recent Kubernetes events for the cluster.",
     permissions => {
         check => ['perm', '/cluster', ['Sys.Audit']],
@@ -495,6 +496,7 @@ __PACKAGE__->register_method({
     name => 'certificates',
     path => '{name}/certificates',
     method => 'GET',
+    protected => 1, # kubectl via qm guest exec needs root
     description => "kubeadm certificate expiry for the cluster "
         . "(control-plane PKI expires after one year).",
     permissions => {
@@ -1045,6 +1047,7 @@ __PACKAGE__->register_method({
     name => 'workloads',
     path => '{name}/workloads',
     method => 'GET',
+    protected => 1, # kubectl via qm guest exec needs root
     description => "Read-only workload listing (deployments, "
         . "pods, services) for the cluster.",
     permissions => {
@@ -1072,6 +1075,7 @@ __PACKAGE__->register_method({
     name => 'metrics',
     path => '{name}/metrics',
     method => 'GET',
+    protected => 1, # kubectl via qm guest exec needs root
     description => "Node VM metrics (PVE RRD) and, when the "
         . "metrics-server add-on is enabled, pod CPU/memory.",
     permissions => {

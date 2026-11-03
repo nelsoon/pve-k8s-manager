@@ -38,7 +38,34 @@ my %stock = (
         "use PVE::API2::Cluster::Ceph;\n\n"
         . "__PACKAGE__->register_method ({\n"
         . "    subclass => \"PVE::API2::Cluster::Ceph\",\n"
-        . "    path => 'ceph',\n});\n\n1;\n",
+        . "    path => 'ceph',\n});\n\n"
+        . "__PACKAGE__->register_method({\n"
+        . "    name => 'resources',\n"
+        . "    path => 'resources',\n"
+        . "    method => 'GET',\n"
+        . "    parameters => {\n"
+        . "        properties => {\n"
+        . "            type => {\n"
+        . "                enum => ['vm', 'storage', 'node', 'sdn'],\n"
+        . "            },\n"
+        . "        },\n"
+        . "    },\n"
+        . "    returns => {\n"
+        . "        items => {\n"
+        . "            properties => {\n"
+        . "                type => {\n"
+        . "                    enum => ['node', 'storage', 'pool', 'qemu', 'lxc', 'openvz', 'sdn'],\n"
+        . "                },\n"
+        . "\t\tplugintype => {\n"
+        . "\t\t    type => 'string',\n"
+        . "\t\t},\n"
+        . "            },\n"
+        . "        },\n"
+        . "    },\n"
+        . "    code => sub {\n"
+        . "        my \$res = [];\n"
+        . "\treturn \$res;\n"
+        . "    }});\n\n1;\n",
     'usr/share/perl5/PVE/Cluster.pm' =>
         "my \$observed = {\n    'vzdump.cron' => 1,\n"
         . "    'mapping/usb.cfg' => 1,\n};\n\n1;\n",
@@ -49,7 +76,11 @@ my %stock = (
     'usr/share/pve-manager/js/pvemanagerlib.js' =>
         "\t    {\n\t\ttitle: 'Ceph',\n\t\titemId: 'ceph',\n"
         . "\t\ticonCls: 'fa fa-ceph',\n"
-        . "\t\txtype: 'pveNodeCephStatus',\n\t    },\n",
+        . "\t\txtype: 'pveNodeCephStatus',\n\t    },\n"
+        . "\t    sdn: {\n\t\ticonCls: 'fa fa-th',\n"
+        . "\t\ttext: gettext('SDN'),\n\t    },\n"
+        . "\t    case 'sdn': return 3;\n"
+        . "\t\t\t    sdn: 'PVE.sdn.Browser',\n",
 );
 put($_, $stock{$_}) for keys %stock;
 
@@ -68,6 +99,20 @@ like(get('usr/share/pve-manager/index.html.tpl'),
 like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
     qr/itemId: 'ceph',\n\t\ticonCls: 'fa fa-ceph',\n\t\txtype: 'pveNodeCephStatus',\n\t    \},\n\t    \{\n\t\txtype: 'pveDcK8sView',/,
     'Kubernetes view listed after the Ceph view');
+like(get('usr/share/perl5/PVE/API2/Cluster.pm'),
+    qr/PVE::K8s::Config::resource_entries/,
+    'resources endpoint returns Kubernetes clusters');
+like(get('usr/share/perl5/PVE/API2/Cluster.pm'),
+    qr/'sdn', 'k8s'/, 'resources endpoint accepts the k8s type');
+like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
+    qr/k8s: \{\n\t\ticonCls: 'fa fa-cubes',/,
+    'resource tree knows the Kubernetes type');
+like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
+    qr/case 'k8s': return 5;/,
+    'resource tree ordering knows Kubernetes');
+like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
+    qr/k8s: 'pveK8sConfig'/,
+    'Kubernetes resources route to the cluster page');
 ok(-e "$dir/usr/share/perl5/PVE/Cluster.pm.pve-k8s.bak",
     'stock file backed up before patching');
 
