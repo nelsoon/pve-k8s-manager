@@ -93,6 +93,28 @@ beyond a group's declared size are drained and retired
 (highest index first), missing nodes are created. This
 is the pass that makes group edits take effect.
 
+=== One action at a time
+
+Mutating actions (provision, roll, upgrade, scale, power,
+node drain/replace/force-retire, volume move, backup,
+restore, evacuate, add-on enable/disable, delete, and
+settings edits) are serialized per cluster by a claim
+recorded in the cluster record and visible on every PVE
+host. Starting the *same* action again while it runs -
+for example clicking Provision twice because it is slow -
+does not fork a second worker: the request returns the
+running task's UPID, so the UI simply shows that task.
+Starting a *different* action, or editing settings, while
+one runs is refused with an error naming the running
+action; wait for it to finish. Actions are never queued
+with stale parameters. The claim is heartbeated by its
+worker; if a worker is killed, the claim goes stale after
+30 minutes and the action can be started again (provision
+then resumes and adopts live nodes). The Overview panel
+shows the running action while one is live. The scaler
+and backup timers stand down quietly while a user action
+holds the cluster.
+
 === Roll
 
 `pvesh create /cluster/k8s/c1/roll` replaces every node,

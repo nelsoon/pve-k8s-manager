@@ -47,7 +47,7 @@ my $api = do {
     <$fh>;
 };
 like($api, qr/name => 'evacuate'/, 'evacuate endpoint exists');
-like($api, qr/fork_worker\('k8sevacuate'/,
+like($api, qr/fork_cluster_worker\('k8sevacuate'/,
     'evacuation runs as a k8sevacuate PVE task');
 
 my $prov = do {

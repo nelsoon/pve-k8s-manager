@@ -36,18 +36,18 @@ my $api = do {
     local $/;
     <$fh>;
 };
-like($api, qr/fork_worker\('k8sprovision'/,
+like($api, qr/fork_cluster_worker\('k8sprovision'/,
     'provision endpoint runs as a k8sprovision PVE task (UPID)');
 like($js, qr/method: 'DELETE'/,
     'grid Remove button deletes through the REST API');
-like($api, qr/fork_worker\('k8sdelete'/,
+like($api, qr/fork_cluster_worker\('k8sdelete'/,
     'delete endpoint runs as a k8sdelete PVE task (UPID)');
 
 
 # T2.5 day-2 ops: kubeconfig, events, per-node drain/replace
-like($api, qr/fork_worker\('k8snodedrain'/,
+like($api, qr/fork_cluster_worker\('k8snodedrain'/,
     'node drain endpoint runs as a k8snodedrain task');
-like($api, qr/fork_worker\('k8snodereplace'/,
+like($api, qr/fork_cluster_worker\('k8snodereplace'/,
     'node replace endpoint runs as a k8snodereplace task');
 like($api, qr/name => 'kubeconfig'/,
     'kubeconfig endpoint exists');
@@ -62,11 +62,11 @@ like($js, qr/create token|a\.download = name \+ '\.kubeconfig'/,
 
 
 # T2.6 force-retire and T3.1 backup/restore endpoints
-like($api, qr/fork_worker\('k8snodeforceretire'/,
+like($api, qr/fork_cluster_worker\('k8snodeforceretire'/,
     'force-retire endpoint runs as a k8snodeforceretire task');
-like($api, qr/fork_worker\('k8sbackup'/,
+like($api, qr/fork_cluster_worker\('k8sbackup'/,
     'backup endpoint runs as a k8sbackup task');
-like($api, qr/fork_worker\('k8srestore'/,
+like($api, qr/fork_cluster_worker\('k8srestore'/,
     'restore endpoint runs as a k8srestore task');
 like($js, qr|'/force-retire'|,
     'UI node actions include force-retire');

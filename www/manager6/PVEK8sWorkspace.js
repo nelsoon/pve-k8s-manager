@@ -294,7 +294,7 @@ Ext.define('PVE.dc.K8sView', {
             fields: ['name', 'state', 'k8s-version', 'template-rev',
                 'cp', 'workers', 'node-subnet', 'gateway', 'lb-range',
                 'storage', 'sdn-zone', 'public-subnet',
-                'maintenance-window', 'pools'],
+                'maintenance-window', 'pools', 'action-state'],
             proxy: { type: 'proxmox', url: '/api2/json/cluster/k8s' },
         });
 
@@ -334,9 +334,18 @@ Ext.define('PVE.dc.K8sView', {
             } catch (e) {
                 poolsText = rec.pools || '';
             }
+            let actionText = '';
+            try {
+                let act = Ext.decode(rec['action-state'] || 'null');
+                if (act && act.key) {
+                    actionText = act.key + (act.node
+                        ? ' on ' + act.node : '');
+                }
+            } catch (e) { /* recorded by the backend */ }
             let rows = [
                 ['Name', name],
                 ['State', rec.state || ''],
+                ['Running Action', actionText],
                 ['Kubernetes', rec['k8s-version'] || ''],
                 ['Template Rev', rec['template-rev'] || ''],
                 ['Control Plane', rec.cp || ''],

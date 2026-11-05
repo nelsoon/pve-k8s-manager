@@ -610,6 +610,192 @@ my sub set_state {
     });
 }
 
+# --- per-cluster action mutual exclusion -------------------
+# A slow provision started twice from the UI used to fork two
+# workers racing the same VMs, inventory and etcd membership.
+# Every mutating action now claims 'action-state' in pmxcfs
+# (atomic under the config lock, visible on all PVE hosts)
+# before its task forks. An identical repeat coalesces to the
+# live task's UPID; a different action is refused as busy. The
+# worker heartbeats the claim, so a killed worker's claim goes
+# stale after the timeout and provisioning can be resumed
+# instead of locking the cluster forever.
+my $ACTION_STALE_AFTER = 1800;
+my %ACTIVE_ACTION;   # cluster name => claim token, this process
+
+sub cluster_action_decision {
+    my ($record, $key, $now) = @_;
+
+    return 'start' if !$record || !($record->{key} // '');
+    my $last = $record->{at} // $record->{started} // 0;
+    return 'start' if (($now // time()) - $last) > $ACTION_STALE_AFTER;
+    return ($record->{key} eq ($key // '')) ? 'coalesce' : 'busy';
+}
+
+sub cluster_action_record {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name} or return undef;
+    my $record = eval {
+        JSON::PP->new->decode($scfg->{'action-state'} // '{}') } // {};
+    return ($record->{key} // '') ne '' ? $record : undef;
+}
+
+sub cluster_action_describe {
+    my ($name, $record) = @_;
+
+    return "no action" if !$record;
+    my $what = $record->{key} // $record->{task} // 'action';
+    my $where = $record->{node} ? " on $record->{node}" : '';
+    my $upid = $record->{upid} ? " (task $record->{upid})" : '';
+    return "$what$upid$where";
+}
+
+sub claim_cluster_action {
+    my ($name, $key, $task, $user) = @_;
+
+    my $me = local_node_name();
+    my $now = time();
+    my $token = sprintf '%d-%d-%08x', $now, $$, int(rand(0xffffffff));
+    my $result;
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name}
+            or die "cluster '$name' does not exist\n";
+        my $record = eval {
+            JSON::PP->new->decode($scfg->{'action-state'} // '{}') } // {};
+        my $decision = cluster_action_decision($record, $key, $now);
+        if ($decision ne 'start') {
+            $result = { status => $decision, record => $record };
+            return;
+        }
+        $record = {
+            key => $key, task => $task, node => $me,
+            user => $user, token => $token,
+            started => $now, at => $now,
+        };
+        $scfg->{'action-state'} =
+            JSON::PP->new->canonical->encode($record);
+        PVE::K8s::Config::store_config($cfg);
+        $result = { status => 'claimed', token => $token,
+            record => $record };
+    });
+    return $result;
+}
+
+sub attach_cluster_action_upid {
+    my ($name, $token, $upid) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $record = eval {
+            JSON::PP->new->decode($scfg->{'action-state'} // '{}') } // {};
+        return if ($record->{token} // '') ne $token;
+        $record->{upid} = $upid;
+        $record->{at} = time();
+        $scfg->{'action-state'} =
+            JSON::PP->new->canonical->encode($record);
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+sub release_cluster_action {
+    my ($name, $token) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $record = eval {
+            JSON::PP->new->decode($scfg->{'action-state'} // '{}') } // {};
+        return if ($record->{token} // '') ne $token;
+        delete $scfg->{'action-state'};
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+my sub touch_cluster_action {
+    my ($name, $token) = @_;
+
+    my $alive = 0;
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $record = eval {
+            JSON::PP->new->decode($scfg->{'action-state'} // '{}') } // {};
+        return if ($record->{token} // '') ne $token;
+        $record->{at} = time();
+        $scfg->{'action-state'} =
+            JSON::PP->new->canonical->encode($record);
+        PVE::K8s::Config::store_config($cfg);
+        $alive = 1;
+    });
+    return $alive;
+}
+
+# Runs $code as the holder of the claim taken by
+# claim_cluster_action: verifies the token was not reclaimed,
+# heartbeats while the (possibly hour-long) action runs, and
+# always releases. Nested calls in the same process (scaler ->
+# provision) see %ACTIVE_ACTION and run directly.
+sub run_cluster_action {
+    my ($name, $token, $code) = @_;
+
+    my $record = cluster_action_record($name);
+    die "cluster '$name' action was superseded by another task; "
+        . "aborting before it changes anything\n"
+        if !$record || ($record->{token} // '') ne $token;
+    local $ACTIVE_ACTION{$name} = $token;
+
+    my $worker_pid = $$;
+    my $heartbeat = fork();
+    if (defined $heartbeat && $heartbeat == 0) {
+        # heartbeat child: refresh the claim until the worker
+        # exits or the claim is taken over
+        while (kill(0, $worker_pid) && getppid() == $worker_pid) {
+            sleep 30;
+            last if !kill(0, $worker_pid) || getppid() != $worker_pid;
+            # A failed touch (pmxcfs busy while a peer host is
+            # wedged) must not kill the heartbeat: retry next
+            # cycle. Only a taken-over claim (touch returns 0)
+            # ends it.
+            my $alive = eval { touch_cluster_action($name, $token) };
+            last if defined $alive && !$alive;
+        }
+        require POSIX;
+        POSIX::_exit(0);
+    }
+
+    my $result;
+    my $ok = eval { $result = $code->(); 1 };
+    my $err = $@;
+    if ($heartbeat) {
+        kill 'TERM', $heartbeat;
+        waitpid $heartbeat, 0;
+    }
+    eval { release_cluster_action($name, $token) };
+    die $err if !$ok;
+    return $result;
+}
+
+# Entry point for non-API callers (scaler/backup timers):
+# claim the action, or stand down quietly when a user action
+# (or another timer pass) already holds the cluster.
+sub with_cluster_action {
+    my ($name, $key, $task, $code) = @_;
+
+    return $code->() if $ACTIVE_ACTION{$name};
+    my $claim = claim_cluster_action($name, $key, $task, undef);
+    if ($claim->{status} ne 'claimed') {
+        print "cluster '$name': "
+            . cluster_action_describe($name, $claim->{record})
+            . " already running, standing down\n";
+        return undef;
+    }
+    return run_cluster_action($name, $claim->{token}, $code);
+}
+
 my sub write_snippet {
     my ($file, $content) = @_;
 
@@ -2407,6 +2593,20 @@ sub assert_maintenance_window {
 sub set_cluster_options {
     my ($name, $opts) = @_;
 
+    # Desired-state edits must not race a live action: the
+    # running worker may have already read the old pools or
+    # options, so the edit would silently take effect only
+    # halfway through (or not at all).
+    if (!$ACTIVE_ACTION{$name}) {
+        my $record = cluster_action_record($name);
+        die "cluster '$name' already running: "
+            . cluster_action_describe($name, $record)
+            . "; wait for it to finish before changing "
+            . "cluster settings\n"
+            if cluster_action_decision($record, '__settings__',
+                time()) ne 'start';
+    }
+
     PVE::K8s::Config::lock_config(sub {
         my $cfg = PVE::K8s::Config->config();
         my $scfg = $cfg->{ids}->{$name}
@@ -2738,6 +2938,14 @@ my sub release_scaler_leadership {
 
 sub scale_cluster {
     my ($name) = @_;
+
+    # Timer passes claim the cluster action like API tasks
+    # do; when a user action holds it, stand down quietly.
+    if (!$ACTIVE_ACTION{$name}) {
+        my $acted = with_cluster_action($name, 'scale',
+            'k8sscale', sub { scale_cluster($name) });
+        return $acted // 0;
+    }
 
     return 0 if !claim_scaler_leadership($name);
     my $acted = eval { scale_reconcile($name) };
@@ -4137,6 +4345,12 @@ my sub backup_dir_for {
 sub backup_cluster {
     my ($name) = @_;
 
+    if (!$ACTIVE_ACTION{$name}) {
+        my $done = with_cluster_action($name, 'backup',
+            'k8sbackup', sub { backup_cluster($name) });
+        return $done // 0;
+    }
+
     return 0 if !claim_scaler_leadership($name);
     my $done = eval {
         my $cfg = PVE::K8s::Config->config();
@@ -4408,6 +4622,22 @@ sub evacuate_host {
 
     ($host) = $host =~ /^([a-zA-Z0-9._-]+)$/
         or die "invalid PVE host name '$host'\n";
+
+    # Evacuation migrates VMs of every managed cluster; it
+    # must not race a live action on any of them (the caller
+    # already holds the context cluster's claim).
+    {
+        my $cfg0 = PVE::K8s::Config->config();
+        for my $other (sort keys $cfg0->{ids}->%*) {
+            next if $ACTIVE_ACTION{$other};
+            my $record = cluster_action_record($other);
+            die "cluster '$other' already running: "
+                . cluster_action_describe($other, $record)
+                . "; wait for it to finish before evacuating\n"
+                if cluster_action_decision($record,
+                    '__evacuate__', time()) ne 'start';
+        }
+    }
 
     my $hosts = pve_online_nodes();
     die "PVE host '$host' is not online\n"

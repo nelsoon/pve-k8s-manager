@@ -207,6 +207,14 @@ my $defaultData = {
             description => "Scaler leader/action state JSON (T2.4).",
             optional => 1,
         },
+        'action-state' => {
+            type => 'string',
+            description => "Live mutating action claim JSON "
+                . "(key, task, UPID, node, started, heartbeat). "
+                . "Serializes provisioning and day-2 actions "
+                . "per cluster.",
+            optional => 1,
+        },
         'retired-nodes' => {
             type => 'string',
             description => "Force-retired node ghosts JSON (T2.6).",
@@ -268,6 +276,7 @@ sub options {
         'upgrade-applied' => { optional => 1 },
         'maintenance-window' => { optional => 1 },
         'scaler-state' => { optional => 1 },
+        'action-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },
         addons => { optional => 1 },
         'file-backend' => { optional => 1 },

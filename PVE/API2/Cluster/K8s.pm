@@ -15,6 +15,70 @@ use base qw(PVE::RESTHandler);
 # creating a cluster here records desired state, nothing is
 # built yet (state stays 'config-only' until the FSM exists).
 
+# Every mutating task goes through here so one cluster can
+# never run two actions at once (a slow provision started
+# twice forked racing workers). The claim is taken in pmxcfs
+# before the task forks: an identical repeat returns the live
+# task's UPID (the UI then just shows that task), any other
+# action is refused with a busy error. Nothing is queued -
+# queued parameters could be stale by the time they ran.
+my sub fork_cluster_worker {
+    my ($type, $name, $key, $code) = @_;
+
+    my $rpcenv = PVE::RPCEnvironment::get();
+    my $authuser = $rpcenv->get_user();
+
+    my $claim = PVE::K8s::Provision::claim_cluster_action(
+        $name, $key, $type, $authuser);
+    if ($claim->{status} eq 'coalesce') {
+        # The first request may still be attaching its UPID;
+        # wait briefly for it rather than forking a duplicate.
+        for (1 .. 10) {
+            my $record = PVE::K8s::Provision::cluster_action_record($name);
+            return $record->{upid}
+                if $record && ($record->{token} // '')
+                    eq ($claim->{record}->{token} // '')
+                    && $record->{upid};
+            sleep 1;
+        }
+        die "cluster '$name' already running: "
+            . PVE::K8s::Provision::cluster_action_describe(
+                $name, $claim->{record})
+            . "; open its task from the task log instead\n";
+    }
+    die "cluster '$name' already running: "
+        . PVE::K8s::Provision::cluster_action_describe(
+            $name, $claim->{record})
+        . "; wait for it to finish before starting another "
+        . "action on this cluster\n"
+        if $claim->{status} ne 'claimed';
+
+    my $token = $claim->{token};
+    my $upid = eval {
+        $rpcenv->fork_worker($type, $name, $authuser, sub {
+            PVE::K8s::Provision::run_cluster_action(
+                $name, $token, $code);
+        });
+    };
+    if (my $err = $@) {
+        eval { PVE::K8s::Provision::release_cluster_action(
+            $name, $token) };
+        die $err;
+    }
+    # Attaching can collide with the worker's first config
+    # writes; retry briefly - without the UPID a duplicate
+    # request cannot be coalesced onto this task.
+    for (1 .. 5) {
+        eval { PVE::K8s::Provision::attach_cluster_action_upid(
+            $name, $token, $upid) };
+        my $record = eval {
+            PVE::K8s::Provision::cluster_action_record($name) };
+        last if $record && ($record->{upid} // '') eq $upid;
+        sleep 1;
+    }
+    return $upid;
+}
+
 __PACKAGE__->register_method({
     name => 'index',
     path => '',
@@ -248,14 +312,13 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $name = $param->{name};
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
 
         # Provisioning takes minutes; run it as a PVE task so the
         # UI can show progress in the task log like other actions.
-        return $rpcenv->fork_worker('k8sprovision', $name, $authuser, sub {
-            PVE::K8s::Provision::provision_cluster($name);
-        });
+        return fork_cluster_worker('k8sprovision', $name,
+            'provision', sub {
+                PVE::K8s::Provision::provision_cluster($name);
+            });
     }});
 
 __PACKAGE__->register_method({
@@ -288,10 +351,8 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $name = $param->{name};
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
 
-        return $rpcenv->fork_worker('k8sroll', $name, $authuser, sub {
+        return fork_cluster_worker('k8sroll', $name, 'roll', sub {
             PVE::K8s::Provision::roll_cluster(
                 $name, force => $param->{force} // 0);
         });
@@ -332,13 +393,13 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $name = $param->{name};
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
 
-        return $rpcenv->fork_worker('k8supgrade', $name, $authuser, sub {
-            PVE::K8s::Provision::upgrade_cluster(
-                $name, $param->{to}, force => $param->{force} // 0);
-        });
+        return fork_cluster_worker('k8supgrade', $name,
+            "upgrade:$param->{to}", sub {
+                PVE::K8s::Provision::upgrade_cluster(
+                    $name, $param->{to},
+                    force => $param->{force} // 0);
+            });
     }});
 
 __PACKAGE__->register_method({
@@ -366,10 +427,8 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $name = $param->{name};
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
 
-        return $rpcenv->fork_worker('k8sscale', $name, $authuser, sub {
+        return fork_cluster_worker('k8sscale', $name, 'scale', sub {
             PVE::K8s::Provision::scale_cluster($name);
         });
     }});
@@ -589,15 +648,12 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
         # task type carries the action so the task log
         # reads "Start VMs"/"Stop VMs", not "k8spower"
         my $type = ($param->{action} // '') eq 'stop'
             ? 'k8spowerstop' : 'k8spowerstart';
-        return $rpcenv->fork_worker($type,
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker($type, $param->{name},
+            "power:$param->{action}", sub {
                 PVE::K8s::Provision::set_cluster_power(
                     $param->{name}, $param->{action});
             });
@@ -631,11 +687,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8snodedrain',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8snodedrain',
+            $param->{name}, "node-drain:$param->{node}", sub {
                 PVE::K8s::Provision::drain_node(
                     $param->{name}, $param->{node});
             });
@@ -669,11 +722,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8snodereplace',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8snodereplace',
+            $param->{name}, "node-replace:$param->{node}", sub {
                 PVE::K8s::Provision::replace_node(
                     $param->{name}, $param->{node});
             });
@@ -720,11 +770,9 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8snodeforceretire',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8snodeforceretire',
+            $param->{name},
+            "node-force-retire:$param->{node}", sub {
                 PVE::K8s::Provision::force_retire_node(
                     $param->{name}, $param->{node},
                     force => $param->{force} // 0,
@@ -772,11 +820,9 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8svolumemove',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8svolumemove',
+            $param->{name},
+            "volume-move:$param->{namespace}/$param->{pvc}", sub {
                 PVE::K8s::Provision::move_local_pvc(
                     $param->{name}, $param->{namespace},
                     $param->{pvc}, $param->{'target-host'});
@@ -807,11 +853,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8sbackup',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8sbackup',
+            $param->{name}, 'backup', sub {
                 PVE::K8s::Provision::backup_cluster($param->{name});
             });
     }});
@@ -877,11 +920,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8srestore',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8srestore',
+            $param->{name}, "restore:$param->{backup}", sub {
                 PVE::K8s::Provision::restore_cluster(
                     $param->{name}, $param->{backup},
                     force => $param->{force} // 0);
@@ -922,11 +962,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8sevacuate',
-            $param->{host}, $authuser, sub {
+        return fork_cluster_worker('k8sevacuate',
+            $param->{name}, "evacuate:$param->{host}", sub {
                 PVE::K8s::Provision::evacuate_host(
                     $param->{host});
             });
@@ -1032,16 +1069,14 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
         my $addon = $param->{addon};
         my %opts = map { $_ => $param->{$_} }
             grep { defined $param->{$_} }
             qw(issuer email acme-server provider
                 pdns-url pdns-api-key zone);
 
-        return $rpcenv->fork_worker('k8saddonenable',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8saddonenable',
+            $param->{name}, "addon-enable:$addon", sub {
                 PVE::K8s::Provision::enable_addon(
                     $param->{name}, $addon, \%opts);
             });
@@ -1075,11 +1110,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $rpcenv->fork_worker('k8saddondisable',
-            $param->{name}, $authuser, sub {
+        return fork_cluster_worker('k8saddondisable',
+            $param->{name}, "addon-disable:$param->{addon}", sub {
                 PVE::K8s::Provision::disable_addon(
                     $param->{name}, $param->{addon});
             });
@@ -1167,12 +1199,11 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $name = $param->{name};
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
 
-        return $rpcenv->fork_worker('k8sdelete', $name, $authuser, sub {
-            PVE::K8s::Provision::delete_cluster($name);
-        });
+        return fork_cluster_worker('k8sdelete', $name,
+            'delete', sub {
+                PVE::K8s::Provision::delete_cluster($name);
+            });
     }});
 
 1;

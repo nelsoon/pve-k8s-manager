@@ -35,8 +35,8 @@ ok(!eval { PVE::K8s::Provision::assert_minor_upgrade('1.31', '1.30'); 1 },
     'a downgrade is blocked');
 
 my $api = do { open my $fh, '<', 'PVE/API2/Cluster/K8s.pm' or die $!; local $/; <$fh> };
-like($api, qr/fork_worker\('k8sroll'/, 'roll endpoint runs as a k8sroll task');
-like($api, qr/fork_worker\('k8supgrade'/, 'upgrade endpoint runs as a k8supgrade task');
+like($api, qr/fork_cluster_worker\('k8sroll'/, 'roll endpoint runs as a k8sroll task');
+like($api, qr/fork_cluster_worker\('k8supgrade'/, 'upgrade endpoint runs as a k8supgrade task');
 
 # etcd operations must not depend on crictl (absent from
 # current Kubernetes images); they run via ctr instead.
@@ -54,7 +54,7 @@ like($prov, qr/they host nodes of cluster/,
     'only hosts carrying its nodes block provisioning');
 like($prov, qr/placement will skip them/,
     'other offline hosts are skipped, not fatal');
-like($api, qr/fork_worker\('k8sscale'/,
+like($api, qr/fork_cluster_worker\('k8sscale'/,
     'scale endpoint runs as a k8sscale task');
 
 done_testing();
