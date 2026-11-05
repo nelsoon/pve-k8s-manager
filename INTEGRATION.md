@@ -73,8 +73,14 @@ non-issue.
 
 7. Workspace routing — in `PVE.StdWorkspace`
    (`pvemanagerlib.js`), route resource type `k8s` to
-   `PVE.k8s.Config`, which shows the selected cluster with
-   horizontal top tabs.
+   `PVE.k8s.Config`, the cluster's own page (stock pve-nav
+   treelist as second sidebar).
+
+8. Task descriptions — in `PVE.Utils`
+   (`pvemanagerlib.js`), register `[subject, verb]`
+   descriptions for the `k8s*` task types, so the task log
+   reads "Kubernetes Cluster ui1 - Start VMs" instead of
+   the raw type `k8spowerstart`.
 
 Everything else is new files only: `PVE/K8s/Config.pm`,
 `PVE/API2/Cluster/K8s.pm`, UI files, and this package's own

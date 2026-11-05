@@ -90,20 +90,25 @@ like($provsrc, qr/if \(!\$destroyed\) \{\n            my \$retired/,
 # Specific clusters are selected in Proxmox's first/left
 # resource panel and opened as PVE.k8s.Config. That page
 # fixes the selected cluster and navigates VM-style: a
-# second-sidebar menu (west tree) switching a card panel.
-# The Datacenter view retains a combobox for convenience.
+# stock pve-nav treelist (the PVE.panel.Config look) as
+# second sidebar switching a card panel. The Datacenter
+# view is only the cluster list with Create/Destroy.
 like($js, qr/Ext\.define\('PVE\.k8s\.Config'/,
     'specific-cluster page is defined');
 like($js, qr/layout: 'card'/,
     'cluster panels are cards switched by the menu');
 like($js, qr/region: 'west'/,
     'second sidebar sits in the west region');
+like($js, qr/ui: 'pve-nav'/,
+    'second sidebar uses the stock pve-nav treelist style');
+like($js, qr/Ext\.list\.Tree/,
+    'second sidebar is a treelist like VM pages');
 like($js, qr/fixedClusterName/,
     'resource-selected cluster is fixed in its page');
 like($js, qr/reloadClusters\(true\)/,
     'manual reload rebuilds the selected cluster panels');
-like($js, qr/Ext\.form\.field\.ComboBox/,
-    'Datacenter workspace selects clusters via a combobox');
+like($js, qr/if \(!fixedClusterName\) \{\n            \/\/ Datacenter/,
+    'Datacenter view is the list-only branch');
 unlike($js, qr/tabPosition/,
     'no tab strip on the cluster page');
 unlike($js, qr/'pool-min'/, 'create has no pool bounds fields');

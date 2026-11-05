@@ -73,8 +73,12 @@ my $api = do {
 };
 like($api, qr/name => 'addons'/, 'addons list endpoint exists');
 like($api, qr/name => 'addon_enable'/, 'addon enable endpoint exists');
-like($api, qr/fork_worker\('k8saddon'/,
-    'addon enable runs as a k8saddon PVE task');
+like($api, qr/fork_worker\('k8saddonenable'/,
+    'addon enable runs as a k8saddonenable PVE task');
+like($api, qr/fork_worker\('k8saddondisable'/,
+    'addon disable runs as a k8saddondisable PVE task');
+like($api, qr/k8spowerstart|k8spowerstop/,
+    'power task type carries the action for the task log');
 like($api, qr/pattern => '\^\(cert-manager\|external-dns\|metrics-server\)\$'/,
     'only cert-manager, external-dns, metrics-server enable');
 

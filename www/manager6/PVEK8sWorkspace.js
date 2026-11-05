@@ -227,13 +227,11 @@ Ext.define('PVE.dc.K8sCreateWindow', {
 });
 
 
-// Kubernetes workspace: SDN-style subtree. The Kubernetes
-// entry sits at Datacenter level next to SDN/Ceph; inside,
-// a left tree lists clusters, and each cluster expands to
-// its panels (Overview, Nodes, Workloads, Metrics, Add-ons,
-// Events, Backups, Settings). Create/Destroy live on the
-// Clusters root and on each cluster node. Read-only
-// workload/metrics panels; actions reuse the same API.
+// Kubernetes views. At Datacenter level the entry is just
+// the cluster list with Create/Destroy; all detail lives
+// on each cluster's own page (PVE.k8s.Config, opened from
+// the left resource panel), which navigates VM-style with
+// a stock pve-nav treelist as its second sidebar.
 Ext.define('PVE.dc.K8sView', {
     extend: 'Ext.panel.Panel',
     alias: 'widget.pveDcK8sView',
@@ -1308,6 +1306,8 @@ Ext.define('PVE.dc.K8sView', {
         // view's own toolbar (the SDN-view pattern).
         let outer;
         let menu;
+        let navList;
+        let navStore;
         let panelFor = function(clusterName, key, rec) {
             let id = clusterName + ':' + key;
             if (panels[id]) { return panels[id]; }
@@ -1332,36 +1332,29 @@ Ext.define('PVE.dc.K8sView', {
         // a VM's Summary/Console/Hardware list.)
         let setActivePanel = function(key) {
             me.activePanelKey = key;
-            let target = key === 'clusters'
-                ? home
-                : outer.items.findBy(function(c) {
-                    return c.panelKey === key;
-                });
+            let target = outer.items.findBy(function(c) {
+                return c.panelKey === key;
+            });
             if (target) {
                 outer.getLayout().setActiveItem(target);
-                let node = menu.getStore().getNodeById('k8snav-' + key);
-                if (node && menu.getSelection()[0] !== node) {
-                    menu.getSelectionModel().select(node, false, true);
+                let node = navStore.getNodeById('k8snav-' + key);
+                if (node && navList.getSelection() !== node) {
+                    me._navSync = true;
+                    navList.setSelection(node);
+                    me._navSync = false;
                 }
             }
         };
 
         let setMenu = function(defs) {
             let children = [];
-            if (!fixedClusterName) {
-                children.push({
-                    id: 'k8snav-clusters', text: gettext('Clusters'),
-                    panelKey: 'clusters', leaf: true,
-                    iconCls: 'fa fa-cubes',
-                });
-            }
             (defs || []).forEach(function(d) {
                 children.push({
                     id: 'k8snav-' + d[0], text: d[1],
                     panelKey: d[0], leaf: true, iconCls: d[2],
                 });
             });
-            menu.setRootNode({ expanded: true, children: children });
+            navStore.setRootNode({ expanded: true, children: children });
         };
 
         let showCluster = function(name, force) {
@@ -1480,27 +1473,44 @@ Ext.define('PVE.dc.K8sView', {
             ],
             listeners: {
                 itemdblclick: function(view, rec) {
-                    selector.setValue(rec.data.name);
+                    // cluster details live on the cluster's
+                    // own page (left resource panel), not here
+                    if (me.workspace && me.workspace.selectById) {
+                        me.workspace.selectById('k8s/' + rec.data.name);
+                    }
                 },
             },
         });
 
-        menu = Ext.create('Ext.tree.Panel', {
-            region: 'west',
-            width: 190,
-            split: true,
-            rootVisible: false,
-            lines: false,
-            store: Ext.create('Ext.data.TreeStore', {
-                root: { expanded: true, children: [] },
-            }),
+        // Stock VM-page navigation style: a treelist with
+        // the pve-nav UI in a left toolbar strip, exactly
+        // like PVE.panel.Config builds it.
+        navStore = Ext.create('Ext.data.TreeStore', {
+            fields: ['panelKey'],
+            root: { expanded: true, children: [] },
+        });
+        navList = Ext.create('Ext.list.Tree', {
+            ui: 'pve-nav',
+            expanderOnly: true,
+            expanderFirst: false,
+            animation: false,
+            store: navStore,
             listeners: {
-                select: function(tree, rec) {
-                    if (rec.data.panelKey) {
-                        setActivePanel(rec.data.panelKey);
+                selectionchange: function(treelist, node) {
+                    if (!me._navSync && node && node.data.panelKey) {
+                        setActivePanel(node.data.panelKey);
                     }
                 },
             },
+        });
+        menu = Ext.create('Ext.panel.Panel', {
+            region: 'west',
+            width: 210,
+            split: true,
+            border: false,
+            cls: 'pve-toolbar-bg',
+            layout: 'fit',
+            items: [navList],
         });
 
         outer = Ext.create('Ext.panel.Panel', {
@@ -1564,6 +1574,87 @@ Ext.define('PVE.dc.K8sView', {
                 },
             });
         };
+
+        if (!fixedClusterName) {
+            // Datacenter -> Kubernetes: just the cluster
+            // list with Create/Destroy. Every detail lives
+            // on the cluster's own page, opened from the
+            // left resource panel (double-click a row to
+            // jump there).
+            let listDestroy = Ext.create('Ext.button.Button', {
+                text: gettext('Destroy'),
+                iconCls: 'fa fa-fw fa-trash-o',
+                disabled: true,
+                handler: function() {
+                    let sel = home.getSelection();
+                    if (!sel || !sel.length) { return; }
+                    let name = sel[0].data.name;
+                    Ext.Msg.confirm(gettext('Confirm'),
+                        Ext.String.format(gettext(
+                            'Delete cluster {0} and all its VMs?'), name),
+                        function(answer) {
+                            if (answer !== 'yes') { return; }
+                            api({
+                                url: '/cluster/k8s/' + name,
+                                method: 'DELETE',
+                                success: function(r) {
+                                    task(r.result.data);
+                                    clusterStore.load();
+                                },
+                            });
+                        });
+                },
+            });
+            home.getSelectionModel().on('selectionchange',
+                function(sm, selected) {
+                    listDestroy.setDisabled(!selected || !selected.length);
+                });
+            me.reloadClusters = function() {
+                clusterStore.load();
+            };
+            Ext.apply(me, {
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [{
+                    xtype: 'toolbar',
+                    items: [
+                        {
+                            text: gettext('Create'),
+                            iconCls: 'fa fa-fw fa-plus-circle',
+                            handler: function() {
+                                Ext.create('PVE.dc.K8sCreateWindow', {
+                                    onDone: function() {
+                                        clusterStore.load();
+                                    },
+                                }).show();
+                            },
+                        },
+                        listDestroy,
+                        '->',
+                        {
+                            text: gettext('Reload'),
+                            iconCls: 'fa fa-fw fa-refresh',
+                            handler: function() { clusterStore.load(); },
+                        },
+                    ],
+                }, Ext.apply(home, { flex: 1 })],
+                listeners: {
+                    afterrender: function() {
+                        clusterStore.load();
+                        me.pollTask = Ext.util.TaskManager.start({
+                            run: function() { clusterStore.load(); },
+                            interval: 30000,
+                        });
+                    },
+                    beforedestroy: function() {
+                        if (me.pollTask) {
+                            Ext.util.TaskManager.stop(me.pollTask);
+                        }
+                    },
+                },
+            });
+            me.callParent();
+            return;
+        }
 
         Ext.apply(me, {
             layout: { type: 'vbox', align: 'stretch' },

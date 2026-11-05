@@ -80,6 +80,7 @@ my %stock = (
         . "\t    sdn: {\n\t\ticonCls: 'fa fa-th',\n"
         . "\t\ttext: gettext('SDN'),\n\t    },\n"
         . "\t    case 'sdn': return 3;\n"
+        . "\t    acmedeactivate: ['ACME Account', gettext('Deactivate')],\n"
         . "\t\t\t    sdn: 'PVE.sdn.Browser',\n",
 );
 put($_, $stock{$_}) for keys %stock;
@@ -96,6 +97,9 @@ like(get('usr/share/perl5/PVE/Cluster.pm'),
 like(get('usr/share/pve-manager/index.html.tpl'),
     qr/pvemanagerlib\.js.*\n.*PVEK8sWorkspace\.js/s,
     'UI script loads after the manager library');
+like(get('usr/share/pve-manager/index.html.tpl'),
+    qr/PVEK8sWorkspace\.js\?ver=\[% version %\]-pvek8s-/,
+    'UI script URL carries the plugin version (cache-busts on upgrade)');
 like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
     qr/itemId: 'ceph',\n\t\ticonCls: 'fa fa-ceph',\n\t\txtype: 'pveNodeCephStatus',\n\t    \},\n\t    \{\n\t\txtype: 'pveDcK8sView',/,
     'Kubernetes view listed after the Ceph view');
@@ -113,6 +117,12 @@ like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
 like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
     qr/k8s: 'pveK8sConfig'/,
     'Kubernetes resources route to the cluster page');
+like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
+    qr/k8spowerstart: \['Kubernetes Cluster', gettext\('Start VMs'\)\]/,
+    'task log gets a human description for k8s power tasks');
+like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
+    qr/k8sdelete: \['Kubernetes Cluster', gettext\('Destroy'\)\]/,
+    'task log gets a human description for k8s destroy');
 ok(-e "$dir/usr/share/perl5/PVE/Cluster.pm.pve-k8s.bak",
     'stock file backed up before patching');
 

@@ -193,14 +193,31 @@ run_patch({
     },
 });
 
+# The ver parameter must carry OUR version too: with only
+# the stock [% version %] (the PVE release), browsers keep
+# serving the previous plugin JS after a deb upgrade and
+# the UI looks unchanged (seen live, 2026-11-04). Bump
+# PLUGIN_VER with every release.
+my $PLUGIN_VER = '0.1.0-1';
 my $script_tag = '    <script type="text/javascript" '
-    . 'src="/pve2/js/PVEK8sWorkspace.js?ver=[% version %]">'
+    . 'src="/pve2/js/PVEK8sWorkspace.js?ver=[% version %]'
+    . "-pvek8s-$PLUGIN_VER\">"
     . "</script>\n";
 run_patch({
     file => $tpl,
-    marker => 'PVEK8sWorkspace.js',
+    # marker is the versioned tag: installs carrying the
+    # legacy (unversioned) tag do not match it, so apply
+    # runs and rewrites the tag in place below
+    marker => '-pvek8s-',
     apply => sub {
         my ($src) = @_;
+        my $legacy = '    <script type="text/javascript" '
+            . 'src="/pve2/js/PVEK8sWorkspace.js?ver=[% version %]">'
+            . "</script>\n";
+        if (index($src, $legacy) >= 0) {
+            $src =~ s/\Q$legacy\E/$script_tag/;
+            return $src;
+        }
         my $anchor = '/pve2/js/pvemanagerlib.js';
         my $pos = index($src, $anchor);
         return undef if $pos < 0;
@@ -281,6 +298,44 @@ run_patch({
     remove => sub {
         my ($src) = @_;
         $src =~ s/\Q$resource_order\E//;
+        return $src;
+    },
+});
+
+# Meaningful task-log descriptions: without these, the
+# bottom task log shows raw types ("k8spower"). Register
+# [subject, verb] pairs like every stock task type, so a
+# power action reads "Kubernetes Cluster ui1 - Start VMs".
+my $k8s_task_desc =
+    "\t    k8sprovision: ['Kubernetes Cluster', gettext('Provision')],\n"
+    . "\t    k8sroll: ['Kubernetes Cluster', gettext('Roll')],\n"
+    . "\t    k8supgrade: ['Kubernetes Cluster', gettext('Upgrade')],\n"
+    . "\t    k8sscale: ['Kubernetes Cluster', gettext('Scale')],\n"
+    . "\t    k8spowerstart: ['Kubernetes Cluster', gettext('Start VMs')],\n"
+    . "\t    k8spowerstop: ['Kubernetes Cluster', gettext('Stop VMs')],\n"
+    . "\t    k8snodedrain: ['Kubernetes Cluster', gettext('Drain Node')],\n"
+    . "\t    k8snodereplace: ['Kubernetes Cluster', gettext('Replace Node')],\n"
+    . "\t    k8snodeforceretire: ['Kubernetes Cluster', gettext('Force Retire Node')],\n"
+    . "\t    k8svolumemove: ['Kubernetes Cluster', gettext('Move Volume')],\n"
+    . "\t    k8sbackup: ['Kubernetes Cluster', gettext('Backup')],\n"
+    . "\t    k8srestore: ['Kubernetes Cluster', gettext('Restore')],\n"
+    . "\t    k8sevacuate: ['PVE Host', gettext('Evacuate')],\n"
+    . "\t    k8saddonenable: ['Kubernetes Cluster', gettext('Enable Add-on')],\n"
+    . "\t    k8saddondisable: ['Kubernetes Cluster', gettext('Disable Add-on')],\n"
+    . "\t    k8sdelete: ['Kubernetes Cluster', gettext('Destroy')],\n";
+run_patch({
+    file => "$js/pvemanagerlib.js",
+    marker => "k8sprovision: ['Kubernetes Cluster'",
+    apply => sub {
+        my ($src) = @_;
+        my $anchor = "\t    acmedeactivate: ['ACME Account', gettext('Deactivate')],\n";
+        return undef if index($src, $anchor) < 0;
+        $src =~ s/\Q$anchor\E/$k8s_task_desc$anchor/;
+        return $src;
+    },
+    remove => sub {
+        my ($src) = @_;
+        $src =~ s/\Q$k8s_task_desc\E//;
         return $src;
     },
 });

@@ -592,7 +592,11 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        return $rpcenv->fork_worker('k8spower',
+        # task type carries the action so the task log
+        # reads "Start VMs"/"Stop VMs", not "k8spower"
+        my $type = ($param->{action} // '') eq 'stop'
+            ? 'k8spowerstop' : 'k8spowerstart';
+        return $rpcenv->fork_worker($type,
             $param->{name}, $authuser, sub {
                 PVE::K8s::Provision::set_cluster_power(
                     $param->{name}, $param->{action});
@@ -1036,7 +1040,7 @@ __PACKAGE__->register_method({
             qw(issuer email acme-server provider
                 pdns-url pdns-api-key zone);
 
-        return $rpcenv->fork_worker('k8saddon',
+        return $rpcenv->fork_worker('k8saddonenable',
             $param->{name}, $authuser, sub {
                 PVE::K8s::Provision::enable_addon(
                     $param->{name}, $addon, \%opts);
@@ -1074,7 +1078,7 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        return $rpcenv->fork_worker('k8saddon',
+        return $rpcenv->fork_worker('k8saddondisable',
             $param->{name}, $authuser, sub {
                 PVE::K8s::Provision::disable_addon(
                     $param->{name}, $param->{addon});
