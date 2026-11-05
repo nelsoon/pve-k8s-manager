@@ -124,6 +124,8 @@ like($js, qr{/api2/json/cluster/sdn/zones},
 like($js, qr{'cp-arch'}, 'create offers control-plane architecture');
 like($js, qr{method: 'PUT',\n                    params: \{ pools:},
     'node groups save through the pools update');
+like($js, qr{url: '/cluster/k8s/' \+ name \+ '/provision',\n                            method: 'POST'},
+    'group save converges membership via provision');
 like($js, qr{Node Groups}, 'nodes view manages node groups');
 unlike($js, qr/title: gettext\('Node Groups'\)/,
     'no blue title bar over the node groups grid');

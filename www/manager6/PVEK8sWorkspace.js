@@ -607,8 +607,8 @@ Ext.define('PVE.dc.K8sView', {
                 },
             });
             // --- node groups (pools): create/edit/delete
-            // over the same record; saving converges via
-            // a scale pass.
+            // over the same record; saving stores the new
+            // groups and converges membership to them.
             let groupStore = Ext.create('Ext.data.Store', {
                 fields: ['name', 'size', 'min', 'max', 'labels',
                     'taints', 'hosts', 'storage', 'arch', 'count'],
@@ -633,8 +633,14 @@ Ext.define('PVE.dc.K8sView', {
                     url: '/cluster/k8s/' + name, method: 'PUT',
                     params: { pools: Ext.encode(groups) },
                     success: function() {
+                        // converge membership to the declared
+                        // group sizes: provision adds missing
+                        // nodes and drains+retires excess ones.
+                        // (The scaler only reacts to pending
+                        // pods / idle nodes between min and
+                        // max - it does not enforce Nodes.)
                         api({
-                            url: '/cluster/k8s/' + name + '/scale',
+                            url: '/cluster/k8s/' + name + '/provision',
                             method: 'POST',
                             success: function(r) {
                                 task(r.result.data);
@@ -791,7 +797,7 @@ Ext.define('PVE.dc.K8sView', {
                         Ext.Msg.confirm(gettext('Confirm'),
                             Ext.String.format(gettext(
                                 'Delete node group {0}? Its nodes are '
-                                + 'retired by the next scale pass.'), data.name),
+                                + 'drained and retired on save.'), data.name),
                             function(answer) {
                                 if (answer !== 'yes') { return; }
                                 saveGroups(currentGroups().filter(
