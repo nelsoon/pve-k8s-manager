@@ -283,14 +283,51 @@ my sub wait_agent {
     die "guest agent on $vmid never came up\n";
 }
 
-# Templates are named k8s-node-<minor>-r<rev>; pick highest rev.
+# CPU architecture names: PVE/uname spellings mapped to
+# the Kubernetes/Debian spelling (amd64 | arm64).
+sub normalize_arch {
+    my ($uname) = @_;
+
+    return 'arm64' if ($uname // '') =~ /aarch64|arm64/;
+    return 'amd64' if ($uname // '') =~ /x86_64|amd64/;
+    return undef;
+}
+
+my %HOST_ARCH;
+
+# Architecture of a PVE host, probed once per process.
+sub host_arch {
+    my ($host) = @_;
+
+    return $HOST_ARCH{$host} if exists $HOST_ARCH{$host};
+    my $out = eval { host_run_on($host, 'uname', '-m') } // '';
+    return $HOST_ARCH{$host} = normalize_arch($out);
+}
+
+# Templates are named k8s-node-<minor>-r<rev>; arm64
+# templates carry an -arm64 suffix, amd64 keeps the
+# historical unsuffixed name. Pick highest rev.
+sub template_name_for {
+    my ($k8s_version, $rev, $arch) = @_;
+
+    my $name = "k8s-node-$k8s_version-r$rev";
+    $name .= "-$arch" if $arch && $arch ne 'amd64';
+    return $name;
+}
+
 sub find_template_in_list {
-    my ($list, $k8s_version) = @_;
+    my ($list, $k8s_version, $arch) = @_;
 
     my ($best_id, $best_rev) = (undef, -1);
     for my $line (split /\n/, $list // '') {
-        next if $line !~ /^\s*(\d+)\s+k8s-node-\Q$k8s_version\E-r(\d+)\s/;
-        my ($id, $rev) = ($1, $2);
+        my ($id, $rev);
+        if ($arch && $arch eq 'arm64') {
+            next if $line !~ /^\s*(\d+)\s+k8s-node-\Q$k8s_version\E-r(\d+)-arm64\s/;
+            ($id, $rev) = ($1, $2);
+        } else {
+            next if $line !~ /^\s*(\d+)\s+k8s-node-\Q$k8s_version\E-r(\d+)\s/;
+            ($id, $rev) = ($1, $2);
+        }
         ($best_id, $best_rev) = ($id, $rev) if $rev > $best_rev;
     }
     return ($best_id, $best_rev);
@@ -475,11 +512,11 @@ sub roll_plan {
 # the local best). Dies when the revision exists nowhere:
 # failing closed beats rolling to the wrong revision.
 my sub ensure_template_rev_on {
-    my ($host, $k8s_version, $rev) = @_;
+    my ($host, $k8s_version, $rev, $arch) = @_;
 
     die "no template k8s-node-$k8s_version-r* found; build one first (images/)\n"
         if !defined $rev || $rev < 0;
-    my $tpl_name = "k8s-node-$k8s_version-r$rev";
+    my $tpl_name = template_name_for($k8s_version, $rev, $arch);
     my $on = sub {
         my ($h) = @_;
         my $list = $h eq local_node_name()
@@ -519,14 +556,15 @@ my sub ensure_template_rev_on {
 # a node is placed (clone locally, migrate the copy, mark it
 # template there); shared storage needs no copies at all.
 my sub ensure_template_on {
-    my ($host, $k8s_version, $canon_id) = @_;
+    my ($host, $k8s_version, $canon_id, $arch) = @_;
 
     return $canon_id if $host eq local_node_name();
-    my ($canon_rev) = (find_template_in_list(qm('list'), $k8s_version))[1];
+    my ($canon_rev) = (find_template_in_list(
+        qm('list'), $k8s_version, $arch))[1];
     my ($existing, $existing_rev) = find_template_in_list(
-        qm_on($host, 'list'), $k8s_version);
+        qm_on($host, 'list'), $k8s_version, $arch);
     return $existing if defined $existing && $existing_rev >= $canon_rev;
-    my $tpl_name = "k8s-node-$k8s_version-r$canon_rev";
+    my $tpl_name = template_name_for($k8s_version, $canon_rev, $arch);
     # a previous distribution that died mid-migrate leaves a
     # local copy behind; remove it before making a fresh one
     for my $line (split /\n/, qm('list')) {
@@ -1340,6 +1378,7 @@ sub cluster_nodes {
     for my $i (1 .. ($scfg->{cp} // 3)) {
         push @nodes, {
             host => "$name-cp$i", role => 'cp', pool => 'control-plane',
+            arch => $scfg->{'cp-arch'},
             ip => "$prefix." . (59 + $i), idx => $i
         };
     }
@@ -1352,6 +1391,7 @@ sub cluster_nodes {
             push @nodes, {
                 host => $vmname, role => 'worker', pool => $pool->{name},
                 pool_hosts => $pool->{hosts},
+                arch => $pool->{arch},
                 labels => $pool->{labels}, taints => $pool->{taints},
                 pool_storage => $pool->{storage},
                 ip => "$prefix." . (++$worker_ip), idx => $i,
@@ -1410,6 +1450,7 @@ sub converge_nodes {
                 rev => $item->{rev},
                 labels => $pdef->{labels}, taints => $pdef->{taints},
                 pool_hosts => $pdef->{hosts},
+                arch => $pdef->{arch} // $item->{arch},
                 pool_storage => $pdef->{storage},
             };
         }
@@ -1458,7 +1499,8 @@ my sub store_inventory {
 
     my @inventory = map {
         { name => $_->{host}, vmid => $_->{vmid}, pvehost => $_->{pvehost},
-          pool => $_->{pool}, ip => $_->{ip}, rev => $_->{rev} // $rev }
+          pool => $_->{pool}, ip => $_->{ip}, rev => $_->{rev} // $rev,
+          arch => $_->{arch} }
     } $nodes->@*;
     PVE::K8s::Config::lock_config(sub {
         my $cfg = PVE::K8s::Config->config();
@@ -1519,7 +1561,10 @@ sub create_node_vm {
         $node->{pvehost} = $target;
     }
     if (!$vmid) {
-        my $tpl = ensure_template_on($target, $version, $template);
+        my $want = $ctx->{template_by_arch}{$node->{arch} // 'amd64'}
+            // $template;
+        my $tpl = ensure_template_on($target, $version, $want,
+            $node->{arch});
         $vmid = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
         $vmid =~ s/\D//g;
         $VM_HOST{$vmid} = $target;
@@ -1901,7 +1946,9 @@ sub provision_cluster {
     # missed the newest template copy must distribute it,
     # never clone its stale local copy while recording the
     # newer revision.
-    my (undef, $local_tpl_rev) = find_template_in_list(qm('list'), $version);
+    my $cp_arch = $scfg->{'cp-arch'} // 'amd64';
+    my (undef, $local_tpl_rev) = find_template_in_list(
+        qm('list'), $version, $cp_arch);
     # No template anywhere yet and the cluster recorded a
     # builder address: the plugin builds its own template
     # instead of dying "build one first" (fresh installs
@@ -1910,16 +1957,35 @@ sub provision_cluster {
         print "no template for $version; building one\n";
         build_template($version,
             builder_ip => $scfg->{'builder-ip'},
-            gateway => $gateway, storage => $storage);
+            gateway => $gateway, storage => $storage,
+            arch => $cp_arch);
         (undef, $local_tpl_rev) = find_template_in_list(
-            qm('list'), $version);
+            qm('list'), $version, $cp_arch);
     }
     my $want_tpl_rev = wanted_roll_rev(
         $scfg->{'template-rev'}, $local_tpl_rev, 0);
     my $template = ensure_template_rev_on(
-        local_node_name(), $version, $want_tpl_rev);
+        local_node_name(), $version, $want_tpl_rev, $cp_arch);
     print "using template vmid $template for Kubernetes $version\n";
+    # Per-arch templates for arch-pinned worker groups:
+    # each arch needs its own template on this host before
+    # a node of that group can be cloned here.
+    my %tpl_by_arch = ($cp_arch => $template);
+    my $pool_defs = PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2);
+    for my $arch (sort grep { $_ ne $cp_arch }
+            map { $_->{arch} // $cp_arch } $pool_defs->@*) {
+        next if $tpl_by_arch{$arch};
+        my (undef, $arch_rev) = find_template_in_list(
+            qm('list'), $version, $arch);
+        die "no $arch template for $version on this host; "
+            . "build one first (images/, --arch $arch)\n"
+            if $arch_rev < 0;
+        $tpl_by_arch{$arch} = ensure_template_rev_on(
+            local_node_name(), $version, $arch_rev, $arch);
+    }
     my $ctx = { version => $version, template => $template,
+        template_by_arch => \%tpl_by_arch,
         gateway => $gateway, storage => $storage,
         bridge => $bridge };
 
@@ -1968,6 +2034,13 @@ sub provision_cluster {
                 $candidates = [grep { $allowed{$_} } $hosts->@*];
                 die "pool '$node->{pool}' placement hosts match no online "
                     . "PVE node\n" if !$candidates->@*;
+            }
+            if ($node->{arch}) {
+                $candidates = [grep {
+                    (host_arch($_) // 'amd64') eq $node->{arch}
+                } $candidates->@*];
+                die "pool '$node->{pool}' needs a $node->{arch} host; "
+                    . "none online\n" if !$candidates->@*;
             }
             my %pool_counts = map { ("pool:$_" => $counts{"pool:$node->{pool}:$_"} // 0) }
                 $candidates->@*;
@@ -2342,6 +2415,22 @@ sub set_cluster_options {
             $scfg->{'maintenance-window'} = assert_maintenance_window(
                 $opts->{'maintenance-window'});
         }
+        if (defined $opts->{pools}) {
+            # validate eagerly; the next scale/provision
+            # pass converges membership to the new groups
+            PVE::K8s::Config::parse_pools(
+                $opts->{pools}, $scfg->{workers} // 2);
+            $scfg->{pools} = $opts->{pools};
+        }
+        if (defined $opts->{'backup-retention'}) {
+            my $ret = $opts->{'backup-retention'};
+            die "backup-retention must be 1..100\n"
+                if "$ret" !~ /^\d+$/ || $ret < 1 || $ret > 100;
+            $scfg->{'backup-retention'} = int $ret;
+        }
+        if (defined $opts->{description}) {
+            $scfg->{description} = $opts->{description};
+        }
         PVE::K8s::Config::store_config($cfg);
     });
     return undef;
@@ -2712,6 +2801,8 @@ sub scale_reconcile {
             role => $pool eq 'control-plane' ? 'cp' : 'worker',
             pool => $pool, idx => $idx // 1, ip => $ip,
             vmid => $vmid, pvehost => $pvehost,
+            arch => $pool eq 'control-plane' ? $scfg->{'cp-arch'}
+                : ($pool_by_name{$pool} // {})->{arch},
             labels => ($pool_by_name{$pool} // {})->{labels},
             taints => ($pool_by_name{$pool} // {})->{taints},
         };
@@ -3003,6 +3094,8 @@ sub roll_cluster {
                 rev => $item->{rev},
                 labels => $pdef->{labels}, taints => $pdef->{taints},
                 pool_hosts => $pdef->{hosts},
+                arch => $pool eq 'control-plane' ? $scfg->{'cp-arch'}
+                    : ($pdef->{arch} // $item->{arch}),
                 pool_storage => $pdef->{storage},
             };
         }
@@ -3273,6 +3366,12 @@ sub roll_cluster {
                 split /\s*,\s*/, $new->{pool_hosts};
             @candidates = grep { $allowed{$_} } @candidates;
         }
+        if ($new->{arch}) {
+            my @arch_ok = grep {
+                (host_arch($_) // 'amd64') eq $new->{arch}
+            } @candidates;
+            @candidates = @arch_ok if @arch_ok;
+        }
         my %pool_counts = map {
             ("pool:$_" => $counts{"pool:$new->{pool}:$_"} // 0) } @candidates;
         $new->{pvehost} = choose_host(\@candidates, $group_of,
@@ -3345,8 +3444,9 @@ sub roll_cluster {
             }
             if (!$upgraded) {
             guest_exec($cp1->{vmid},
-                "curl -sL https://dl.k8s.io/release/$kver/bin/linux/"
-                . 'amd64/kubeadm -o /tmp/kubeadm && chmod +x /tmp/kubeadm');
+                'KA=$(uname -m); [ "$KA" = aarch64 ] && KA=arm64 || KA=amd64; '
+                . "curl -sL https://dl.k8s.io/release/$kver/bin/linux/"
+                . '$KA/kubeadm -o /tmp/kubeadm && chmod +x /tmp/kubeadm');
             # upgrade apply pulls all control-plane images and
             # can outrun any exec transport timeout on slow
             # hosts, so it runs detached in the guest and is
@@ -3471,6 +3571,8 @@ my sub load_nodes {
             role => $pool eq 'control-plane' ? 'cp' : 'worker',
             pool => $pool, idx => $idx // 1, ip => $ip,
             vmid => $vmid, pvehost => $pvehost,
+            arch => $pool eq 'control-plane' ? $scfg->{'cp-arch'}
+                : ($pool_by_name{$pool} // {})->{arch},
             labels => ($pool_by_name{$pool} // {})->{labels},
             taints => ($pool_by_name{$pool} // {})->{taints},
         };
@@ -5181,13 +5283,14 @@ sub build_template {
             . "on the host network (builder_ip)\n";
     my $gw = $opts{gateway}
         or die "build_template needs the host gateway (gateway)\n";
+    my $arch = $opts{arch} // 'amd64';
     my $out = run(['sh', '-c',
         "cd $dir && BUILDER_IP=$ip BUILDER_GW=$gw "
         . "./build-template.sh --k8s-version $version "
-        . "--storage $storage --vmid $vmid"],
+        . "--arch $arch --storage $storage --vmid $vmid"],
         timeout => 3600);
     print $out if $out;
-    my ($found) = find_template_in_list(qm('list'), $version);
+    my ($found) = find_template_in_list(qm('list'), $version, $arch);
     die "template build finished but no k8s-node-$version "
         . "template appeared\n" if !$found;
     print "template k8s-node-$version built (vmid $found)\n";

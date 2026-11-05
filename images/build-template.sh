@@ -16,16 +16,26 @@ cd "$(dirname "$0")"
 STORAGE=local-zfs
 VMID=9000
 BRIDGE=vmbr0
+ARCH=amd64
 K8S_VERSION=${K8S_VERSION:-}
 while [ $# -gt 0 ]; do
     case "$1" in
         --storage) STORAGE=$2; shift 2 ;;
         --vmid) VMID=$2; shift 2 ;;
         --bridge) BRIDGE=$2; shift 2 ;;
+        --arch) ARCH=$2; shift 2 ;;
         --k8s-version) K8S_VERSION=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+case "$ARCH" in
+    amd64) ;;
+    arm64)
+        DEBIAN_IMAGE_URL=$DEBIAN_IMAGE_URL_ARM64
+        DEBIAN_IMAGE_NAME=$DEBIAN_IMAGE_NAME_ARM64
+        ;;
+    *) echo "unknown --arch: $ARCH (amd64|arm64)" >&2; exit 2 ;;
+esac
 
 [ -n "$K8S_VERSION" ] || { echo "set --k8s-version <minor> (see versions/)" >&2; exit 2; }
 [ -f "versions/$K8S_VERSION.env" ] || { echo "no pin file versions/$K8S_VERSION.env" >&2; exit 2; }
@@ -37,6 +47,7 @@ done
 CACHE_DIR=/var/lib/vz/template/cache
 IMAGE=$CACHE_DIR/$DEBIAN_IMAGE_NAME
 NAME="k8s-node-$K8S_MINOR-r$IMAGE_REVISION"
+[ "$ARCH" = "arm64" ] && NAME="$NAME-arm64"
 
 mkdir -p "$CACHE_DIR" /var/lib/vz/snippets
 if [ ! -f "$IMAGE" ]; then

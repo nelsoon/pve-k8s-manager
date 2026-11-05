@@ -373,6 +373,15 @@ sub parse_pools {
             die "pool '$name' $key must be a string\n"
                 if ref $pool->{$key};
         }
+        # A node group's architecture: its VMs only ever
+        # run on PVE hosts of this arch (PVE clusters may
+        # mix amd64 and arm64 hosts; a VM never moves
+        # between them). Unset = unconstrained (single-arch
+        # PVE clusters, the common case).
+        if (defined $pool->{arch}) {
+            die "pool '$name' arch must be amd64 or arm64\n"
+                if $pool->{arch} !~ /^(amd64|arm64)$/;
+        }
     }
     return $pools;
 }

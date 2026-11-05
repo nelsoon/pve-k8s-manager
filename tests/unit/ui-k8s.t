@@ -18,8 +18,11 @@ like($js, qr/alias: 'widget\.pveDcK8sView'/,
     'view registers the pveDcK8sView xtype used by the dc.Config tab');
 like($js, qr|url: '/api2/json/cluster/k8s'|,
     'grid reads the cluster list from the REST API');
-for my $field (qw(name k8s-version cp workers pools node-subnet gateway lb-range storage)) {
+for my $field (qw(name k8s-version cp node-subnet gateway lb-range storage sdn-zone cp-arch)) {
     like($js, qr/name: '\Q$field\E'/, "create wizard has the $field field");
+}
+for my $field (qw(workers pools)) {
+    unlike($js, qr/name: '\Q$field\E'/, "create wizard has no $field field");
 }
 like($js, qr|url: '/cluster/k8s/' \+ values\.name \+ '/provision'|,
     'wizard provisions the cluster it just created');
@@ -86,21 +89,40 @@ like($provsrc, qr/if \(!\$destroyed\) \{\n            my \$retired/,
 
 # Specific clusters are selected in Proxmox's first/left
 # resource panel and opened as PVE.k8s.Config. That page
-# fixes the selected cluster and uses horizontal top tabs;
-# the Datacenter view retains a combobox for convenience.
+# fixes the selected cluster and navigates VM-style: a
+# second-sidebar menu (west tree) switching a card panel.
+# The Datacenter view retains a combobox for convenience.
 like($js, qr/Ext\.define\('PVE\.k8s\.Config'/,
     'specific-cluster page is defined');
-like($js, qr/tabPosition: 'top'/,
-    'specific-cluster panels use horizontal top tabs');
+like($js, qr/layout: 'card'/,
+    'cluster panels are cards switched by the menu');
+like($js, qr/region: 'west'/,
+    'second sidebar sits in the west region');
 like($js, qr/fixedClusterName/,
     'resource-selected cluster is fixed in its page');
 like($js, qr/reloadClusters\(true\)/,
     'manual reload rebuilds the selected cluster panels');
 like($js, qr/Ext\.form\.field\.ComboBox/,
     'Datacenter workspace selects clusters via a combobox');
-like($js, qr/Ext\.tab\.Panel/, 'cluster panels are tabs');
-unlike($js, qr/Ext\.tree\.Panel/, 'no plugin tree panel (no 3rd sidebar)');
-like($js, qr/'pool-min'/, 'create composes pool bounds from fields');
+unlike($js, qr/tabPosition/,
+    'no tab strip on the cluster page');
+unlike($js, qr/'pool-min'/, 'create has no pool bounds fields');
+unlike($js, qr/Worker Pools \(JSON/, 'create has no pools JSON field');
+like($js, qr{/api2/json/storage},
+    'create selects storage from existing storages');
+like($js, qr{/api2/json/cluster/sdn/zones},
+    'create selects the SDN zone from existing zones');
+like($js, qr{'cp-arch'}, 'create offers control-plane architecture');
+like($js, qr{method: 'PUT',\n                    params: \{ pools:},
+    'node groups save through the pools update');
+like($js, qr{Node Groups}, 'nodes view manages node groups');
+# this Ext build drops toolbar items sharing an itemId
+# (only the last survives: Drain/Replace/Edit vanished);
+# selection-scoped buttons use a marker property instead
+unlike($js, qr/itemId: 'nodebtn'/, 'node buttons share no itemId');
+unlike($js, qr/itemId: needsSel/, 'group buttons share no itemId');
+like($js, qr/button\[nodebtn\]/, 'node buttons toggle via marker query');
+like($js, qr/button\[groupbtn\]/, 'group buttons toggle via marker query');
 for my $panel (qw(overview nodes workloads metrics addons
     events backups settings)) {
     like($js, qr/'\Q$panel\E'/, "tree offers the $panel panel");

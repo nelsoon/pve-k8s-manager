@@ -85,7 +85,15 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "Worker pools as JSON: [{name, size, labels, "
-                    . "taints, hosts, storage, device-profile}].",
+                    . "taints, hosts, storage, device-profile, arch}].",
+            },
+            'cp-arch' => {
+                type => 'string',
+                pattern => '^(amd64|arm64)$',
+                optional => 1,
+                description => "Control-plane architecture; only "
+                    . "meaningful on mixed-arch PVE clusters "
+                    . "(default: amd64 templates).",
             },
             'node-subnet' => {
                 type => 'string',
@@ -206,7 +214,7 @@ __PACKAGE__->register_method({
                     qw(node-subnet gateway lb-range pools storage
                         maintenance-window backup-dir sdn-zone
                         public-subnet file-backend file-server
-                        file-share
+                        file-share cp-arch
                         backup-retention description)),
             };
 
@@ -399,6 +407,7 @@ __PACKAGE__->register_method({
     name => 'update',
     path => '{name}',
     method => 'PUT',
+    protected => 1, # writes the cluster config (pmxcfs lock needs root)
     description => "Update mutable rollout options of a managed "
         . "Kubernetes cluster (used by the S3 scenario to narrow "
         . "and open the maintenance window around a roll).",
@@ -419,17 +428,46 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Rolling window HH:MM-HH:MM (local time).",
             },
+            pools => {
+                type => 'string',
+                optional => 1,
+                description => "Worker node groups as JSON: "
+                    . "[{name, size, min, max, labels, taints, "
+                    . "hosts, storage, arch}]. The next scale "
+                    . "pass converges membership; removing a "
+                    . "group retires its nodes.",
+            },
+            'backup-retention' => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 100,
+                optional => 1,
+                description => "Etcd backups to keep.",
+            },
+            description => {
+                type => 'string',
+                maxLength => 4096,
+                optional => 1,
+                description => "Description of the cluster.",
+            },
         },
     },
     returns => { type => 'null' },
     code => sub {
         my ($param) = @_;
 
-        die "nothing to update: pass maintenance-window\n"
-            if !defined $param->{'maintenance-window'};
+        die "nothing to update: pass maintenance-window, pools, "
+            . "backup-retention or description\n"
+            if !defined $param->{'maintenance-window'}
+            && !defined $param->{pools}
+            && !defined $param->{'backup-retention'}
+            && !defined $param->{description};
 
         PVE::K8s::Provision::set_cluster_options($param->{name}, {
             'maintenance-window' => $param->{'maintenance-window'},
+            pools => $param->{pools},
+            'backup-retention' => $param->{'backup-retention'},
+            description => $param->{description},
         });
 
         return undef;

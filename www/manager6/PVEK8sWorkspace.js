@@ -60,28 +60,60 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             editable: false,
                         },
                         {
-                            xtype: 'numberfield',
-                            name: 'workers',
-                            fieldLabel: gettext('Worker Nodes'),
-                            value: 2,
-                            minValue: 0,
-                            maxValue: 50,
+                            // select from existing storages,
+                            // never free text
+                            xtype: 'combobox',
+                            name: 'storage',
+                            fieldLabel: gettext('Storage'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['storage'],
+                                proxy: {
+                                    type: 'proxmox',
+                                    url: '/api2/json/storage',
+                                },
+                                autoLoad: true,
+                            }),
+                            displayField: 'storage',
+                            valueField: 'storage',
+                            queryMode: 'local',
+                            editable: false,
+                            emptyText: gettext('Proxmox storage for node disks'),
+                        },
+                        {
+                            // select from existing SDN zones
+                            xtype: 'combobox',
+                            name: 'sdn-zone',
+                            fieldLabel: gettext('SDN Zone'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['zone'],
+                                proxy: {
+                                    type: 'proxmox',
+                                    url: '/api2/json/cluster/sdn/zones',
+                                },
+                                autoLoad: true,
+                            }),
+                            displayField: 'zone',
+                            valueField: 'zone',
+                            queryMode: 'local',
+                            editable: false,
+                            emptyText: gettext('dedicated VNet mode (with Public Subnet)'),
+                        },
+                        {
+                            xtype: 'displayfield',
+                            value: gettext('A default worker group '
+                                + '(2 nodes) is created with the cluster. '
+                                + 'Add, edit or remove worker groups later '
+                                + 'under Nodes.'),
                         },
                     ],
                 },
                 {
                     xtype: 'fieldset',
-                    title: gettext('Advanced (network, storage, pools)'),
+                    title: gettext('Advanced (network, architecture)'),
                     collapsible: true,
                     collapsed: true,
                     defaults: { anchor: '100%', labelWidth: 160 },
                     items: [
-                        {
-                            xtype: 'textfield',
-                            name: 'sdn-zone',
-                            fieldLabel: gettext('SDN EVPN Zone'),
-                            emptyText: gettext('dedicated VNet mode (with Public Subnet)'),
-                        },
                         {
                             xtype: 'textfield',
                             name: 'public-subnet',
@@ -108,58 +140,17 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                         },
                         {
                             xtype: 'textfield',
-                            name: 'storage',
-                            fieldLabel: gettext('Storage'),
-                            emptyText: gettext('Proxmox storage for node disks'),
-                        },
-                        {
-                            xtype: 'textfield',
                             name: 'builder-ip',
                             fieldLabel: gettext('Template Builder IP'),
                             emptyText: gettext('free IP; plugin builds a missing template itself'),
                         },
                         {
-                            xtype: 'numberfield',
-                            name: 'pool-min',
-                            fieldLabel: gettext('Default Pool Min'),
-                            emptyText: gettext('scaler floor (default 1)'),
-                            minValue: 0,
-                            maxValue: 50,
-                        },
-                        {
-                            xtype: 'numberfield',
-                            name: 'pool-max',
-                            fieldLabel: gettext('Default Pool Max'),
-                            emptyText: gettext('scaler ceiling (default = workers)'),
-                            minValue: 0,
-                            maxValue: 50,
-                        },
-                        {
-                            xtype: 'textarea',
-                            name: 'pools',
-                            fieldLabel: gettext('Worker Pools (JSON, overrides)'),
-                            emptyText: '[{"name":"default","size":2,"min":1,"max":3}]',
-                            height: 60,
-                        },
-                        {
                             xtype: 'combobox',
-                            name: 'file-backend',
-                            fieldLabel: gettext('Shared-File (RWX) Backend'),
-                            store: ['', 'nfs'],
-                            value: '',
+                            name: 'cp-arch',
+                            fieldLabel: gettext('Control Plane Architecture'),
+                            store: ['amd64', 'arm64'],
+                            value: 'amd64',
                             editable: false,
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'file-server',
-                            fieldLabel: gettext('NFS Server'),
-                            emptyText: gettext('only for Shared-File nfs'),
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'file-share',
-                            fieldLabel: gettext('NFS Export Path'),
-                            emptyText: '/srv/k8s',
                         },
                     ],
                 },
@@ -182,23 +173,9 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                                 delete values[key];
                             }
                         });
-                        // structured pool bounds compose the
-                        // default pool unless raw JSON overrides
-                        if (!values.pools
-                            && (values['pool-min'] !== undefined
-                                || values['pool-max'] !== undefined)) {
-                            let size = parseInt(values.workers, 10) || 2;
-                            values.pools = Ext.encode([{
-                                name: 'default',
-                                size: size,
-                                min: values['pool-min'] !== undefined
-                                    ? parseInt(values['pool-min'], 10) : 1,
-                                max: values['pool-max'] !== undefined
-                                    ? parseInt(values['pool-max'], 10) : size,
-                            }]);
-                        }
-                        delete values['pool-min'];
-                        delete values['pool-max'];
+                        // worker groups are managed after
+                        // creation, under Nodes; the backend
+                        // default (one group of 2) applies
                         me.setLoading(true);
                         Proxmox.Utils.API2Request({
                             url: '/cluster/k8s',
@@ -336,6 +313,24 @@ Ext.define('PVE.dc.K8sView', {
 
         let overviewPanel = function(rec) {
             let name = rec.name;
+            let poolsText = '';
+            try {
+                let groups = Ext.decode(rec.pools || 'null');
+                if (groups) {
+                    poolsText = groups.map(function(gr) {
+                        let s = gr.name + ': ' + gr.size
+                            + gettext(' nodes');
+                        if (gr.min !== undefined || gr.max !== undefined) {
+                            s += ' (min ' + (gr.min !== undefined ? gr.min : gr.size)
+                                + ', max ' + (gr.max !== undefined ? gr.max : gr.size) + ')';
+                        }
+                        if (gr.arch) { s += ', ' + gr.arch; }
+                        return s;
+                    }).join('; ');
+                }
+            } catch (e) {
+                poolsText = rec.pools || '';
+            }
             let rows = [
                 ['Name', name],
                 ['State', rec.state || ''],
@@ -350,8 +345,10 @@ Ext.define('PVE.dc.K8sView', {
                 ['LB Range', rec['lb-range'] || ''],
                 ['Storage', rec.storage || ''],
                 ['Maintenance Window', rec['maintenance-window'] || ''],
-                ['Pools', rec.pools || ''],
-            ];
+                ['Node Groups', poolsText],
+            ].filter(function(row) {
+                return row[1] !== '' && row[1] !== undefined;
+            });
             let certInfo = Ext.create('Ext.form.field.Display', {
                 fieldLabel: gettext('Certificates'),
                 value: gettext('loading...'),
@@ -516,7 +513,11 @@ Ext.define('PVE.dc.K8sView', {
                 return {
                     text: label,
                     disabled: true,
-                    itemId: 'nodebtn',
+                    // a shared marker property, NOT itemId:
+                    // this Ext build drops toolbar items that
+                    // share an itemId (only the last survives,
+                    // which ate Drain and Replace)
+                    nodebtn: true,
                     handler: function() {
                         let sel = g.getSelection();
                         if (!sel || !sel.length) { return; }
@@ -585,23 +586,256 @@ Ext.define('PVE.dc.K8sView', {
                 listeners: {
                     selectionchange: function(model, selected) {
                         let dis = !selected || !selected.length;
-                        g.query('#nodebtn').forEach(function(b) {
+                        g.query('button[nodebtn]').forEach(function(b) {
                             b.setDisabled(dis);
                         });
                     },
                 },
             });
+            // --- node groups (pools): create/edit/delete
+            // over the same record; saving converges via
+            // a scale pass.
+            let groupStore = Ext.create('Ext.data.Store', {
+                fields: ['name', 'size', 'min', 'max', 'labels',
+                    'taints', 'hosts', 'storage', 'arch', 'count'],
+            });
+            let groupsGrid;
+            let currentGroups = function() {
+                return groupStore.getRange().map(function(r) {
+                    let d = {
+                        name: r.data.name,
+                        size: r.data.size, min: r.data.min,
+                        max: r.data.max,
+                    };
+                    ['labels', 'taints', 'hosts', 'storage', 'arch']
+                        .forEach(function(k) {
+                            if (r.data[k]) { d[k] = r.data[k]; }
+                        });
+                    return d;
+                });
+            };
+            let saveGroups = function(groups) {
+                api({
+                    url: '/cluster/k8s/' + name, method: 'PUT',
+                    params: { pools: Ext.encode(groups) },
+                    success: function() {
+                        api({
+                            url: '/cluster/k8s/' + name + '/scale',
+                            method: 'POST',
+                            success: function(r) {
+                                task(r.result.data);
+                                loadNodes();
+                            },
+                        });
+                    },
+                });
+            };
+            let groupWindow = function(existing) {
+                let isNew = !existing;
+                let win;
+                let gform = Ext.create('Ext.form.Panel', {
+                    bodyPadding: 10, border: false,
+                    fieldDefaults: { labelWidth: 130, anchor: '100%' },
+                    items: [
+                        {
+                            xtype: 'textfield', name: 'name',
+                            fieldLabel: gettext('Name'),
+                            value: existing ? existing.name : '',
+                            readOnly: !isNew, allowBlank: false,
+                        },
+                        {
+                            xtype: 'numberfield', name: 'size',
+                            fieldLabel: gettext('Nodes'),
+                            value: existing ? existing.size : 2,
+                            minValue: 0, maxValue: 50, allowBlank: false,
+                        },
+                        {
+                            xtype: 'numberfield', name: 'min',
+                            fieldLabel: gettext('Min (scaler)'),
+                            value: existing ? existing.min : 1,
+                            minValue: 0, maxValue: 50, allowBlank: false,
+                        },
+                        {
+                            xtype: 'numberfield', name: 'max',
+                            fieldLabel: gettext('Max (scaler)'),
+                            value: existing ? existing.max : 3,
+                            minValue: 0, maxValue: 50, allowBlank: false,
+                        },
+                        {
+                            xtype: 'combobox', name: 'arch',
+                            fieldLabel: gettext('Architecture'),
+                            store: ['', 'amd64', 'arm64'],
+                            value: existing ? (existing.arch || '') : '',
+                            editable: false,
+                        },
+                        {
+                            xtype: 'textfield', name: 'labels',
+                            fieldLabel: gettext('Labels'),
+                            value: existing ? (existing.labels || '') : '',
+                            emptyText: 'key=value,...',
+                        },
+                        {
+                            xtype: 'textfield', name: 'taints',
+                            fieldLabel: gettext('Taints'),
+                            value: existing ? (existing.taints || '') : '',
+                            emptyText: 'key=value:NoSchedule,...',
+                        },
+                        {
+                            xtype: 'textfield', name: 'hosts',
+                            fieldLabel: gettext('PVE Hosts'),
+                            value: existing ? (existing.hosts || '') : '',
+                            emptyText: gettext('any (comma-separated to pin)'),
+                        },
+                        {
+                            xtype: 'textfield', name: 'storage',
+                            fieldLabel: gettext('Storage'),
+                            value: existing ? (existing.storage || '') : '',
+                            emptyText: gettext('cluster default'),
+                        },
+                    ],
+                });
+                win = Ext.create('Ext.window.Window', {
+                    title: isNew ? gettext('Create Node Group')
+                        : gettext('Edit Node Group'),
+                    modal: true, width: 460, layout: 'fit',
+                    items: [gform],
+                    buttons: [
+                        {
+                            text: gettext('Save'),
+                            handler: function() {
+                                if (!gform.isValid()) { return; }
+                                let v = gform.getValues();
+                                if (!(v.min <= v.size && v.size <= v.max)) {
+                                    Ext.Msg.alert(gettext('Error'),
+                                        gettext('Min <= Nodes <= Max required'));
+                                    return;
+                                }
+                                let entry = {
+                                    name: v.name,
+                                    size: parseInt(v.size, 10),
+                                    min: parseInt(v.min, 10),
+                                    max: parseInt(v.max, 10),
+                                };
+                                ['labels', 'taints', 'hosts',
+                                    'storage', 'arch'].forEach(function(k) {
+                                    if (v[k]) { entry[k] = v[k]; }
+                                });
+                                let groups = currentGroups().filter(
+                                    function(gr) {
+                                        return gr.name !== entry.name;
+                                    });
+                                groups.push(entry);
+                                win.close();
+                                saveGroups(groups);
+                            },
+                        },
+                        {
+                            text: gettext('Cancel'),
+                            handler: function() { win.close(); },
+                        },
+                    ],
+                });
+                win.show();
+            };
+            let groupBtn = function(text, fn, needsSel) {
+                return {
+                    text: text,
+                    disabled: !!needsSel,
+                    groupbtn: !!needsSel,
+                    handler: function() {
+                        let sel = groupsGrid.getSelection();
+                        fn(sel && sel.length ? sel[0].data : null);
+                    },
+                };
+            };
+            groupsGrid = Ext.create('Ext.grid.Panel', {
+                title: gettext('Node Groups'),
+                height: 190,
+                border: false,
+                store: groupStore,
+                columns: [
+                    { text: gettext('Group'), dataIndex: 'name', flex: 1 },
+                    { text: gettext('Nodes'), dataIndex: 'size', width: 60 },
+                    { text: gettext('Current'), dataIndex: 'count', width: 70 },
+                    { text: 'Min', dataIndex: 'min', width: 50 },
+                    { text: 'Max', dataIndex: 'max', width: 50 },
+                    { text: gettext('Arch'), dataIndex: 'arch', width: 70 },
+                    { text: gettext('Labels'), dataIndex: 'labels', flex: 1 },
+                    { text: gettext('Taints'), dataIndex: 'taints', flex: 1 },
+                    { text: gettext('Hosts'), dataIndex: 'hosts', flex: 1 },
+                    { text: gettext('Storage'), dataIndex: 'storage', flex: 1 },
+                ],
+                tbar: [
+                    groupBtn(gettext('Create'), function() {
+                        groupWindow(null);
+                    }),
+                    groupBtn(gettext('Edit'), function(data) {
+                        if (data) { groupWindow(data); }
+                    }, true),
+                    groupBtn(gettext('Delete'), function(data) {
+                        if (!data) { return; }
+                        Ext.Msg.confirm(gettext('Confirm'),
+                            Ext.String.format(gettext(
+                                'Delete node group {0}? Its nodes are '
+                                + 'retired by the next scale pass.'), data.name),
+                            function(answer) {
+                                if (answer !== 'yes') { return; }
+                                saveGroups(currentGroups().filter(
+                                    function(gr) {
+                                        return gr.name !== data.name;
+                                    }));
+                            });
+                    }, true),
+                ],
+                listeners: {
+                    selectionchange: function(model, selected) {
+                        let dis = !selected || !selected.length;
+                        groupsGrid.query('button[groupbtn]').forEach(function(b) {
+                            b.setDisabled(dis);
+                        });
+                    },
+                },
+            });
+
             let loadNodes = function() {
                 api({
                     url: '/cluster/k8s/' + name, method: 'GET',
                     success: function(r) {
-                        store.loadData(Ext.decode(
-                            r.result.data.nodes || '[]'));
+                        let rec = r.result.data || {};
+                        let nodes = Ext.decode(rec.nodes || '[]');
+                        store.loadData(nodes);
+                        let groups;
+                        try {
+                            groups = Ext.decode(rec.pools || 'null');
+                        } catch (e) {
+                            groups = null;
+                        }
+                        if (!groups) {
+                            let size = parseInt(rec.workers, 10) || 2;
+                            groups = [{
+                                name: 'default', size: size,
+                                min: size, max: size,
+                            }];
+                        }
+                        let counts = {};
+                        nodes.forEach(function(n) {
+                            counts[n.pool] = (counts[n.pool] || 0) + 1;
+                        });
+                        groups.forEach(function(gr) {
+                            gr.count = counts[gr.name] || 0;
+                            if (gr.min === undefined) { gr.min = gr.size; }
+                            if (gr.max === undefined) { gr.max = gr.size; }
+                        });
+                        groupStore.loadData(groups);
                     },
                 });
             };
             loadNodes();
-            return g;
+            return Ext.create('Ext.panel.Panel', {
+                layout: { type: 'vbox', align: 'stretch' },
+                border: false,
+                items: [groupsGrid, Ext.apply(g, { flex: 1 })],
+            });
         };
 
         let workloadsPanel = function(name) {
@@ -985,10 +1219,63 @@ Ext.define('PVE.dc.K8sView', {
         };
 
         let settingsPanel = function(rec) {
-            let skip = { name: 1, nodes: 1, addons: 1 };
-            let items = Object.keys(rec).filter(function(k) {
-                return !skip[k] && typeof rec[k] !== 'object';
-            }).sort().map(function(k) {
+            let name = rec.name;
+            let form = Ext.create('Ext.form.Panel', {
+                border: false,
+                fieldDefaults: { labelWidth: 200, anchor: '100%' },
+                items: [
+                    {
+                        xtype: 'textfield',
+                        name: 'maintenance-window',
+                        fieldLabel: gettext('Maintenance Window'),
+                        value: rec['maintenance-window'] || '',
+                        emptyText: 'HH:MM-HH:MM (empty = always)',
+                    },
+                    {
+                        xtype: 'numberfield',
+                        name: 'backup-retention',
+                        fieldLabel: gettext('Backup Retention'),
+                        value: rec['backup-retention'] || '',
+                        minValue: 1, maxValue: 100,
+                        emptyText: gettext('etcd backups to keep'),
+                    },
+                    {
+                        xtype: 'textfield',
+                        name: 'description',
+                        fieldLabel: gettext('Description'),
+                        value: rec.description || '',
+                    },
+                ],
+                buttons: [{
+                    text: gettext('Save'),
+                    handler: function() {
+                        if (!form.isValid()) { return; }
+                        let values = form.getValues();
+                        let params = {};
+                        Object.keys(values).forEach(function(k) {
+                            if (values[k] !== '') {
+                                params[k] = values[k];
+                            }
+                        });
+                        if (!Object.keys(params).length) { return; }
+                        api({
+                            url: '/cluster/k8s/' + name, method: 'PUT',
+                            params: params,
+                            success: function() {
+                                Ext.Msg.alert(gettext('Settings'),
+                                    gettext('Saved.'));
+                                me.reloadClusters();
+                            },
+                        });
+                    },
+                }],
+            });
+            let infoKeys = ['state', 'k8s-version', 'cp', 'workers',
+                'node-subnet', 'public-subnet', 'sdn-zone', 'sdn-vnet',
+                'storage', 'template-rev', 'cp-arch'];
+            let info = infoKeys.filter(function(k) {
+                return rec[k] !== undefined && rec[k] !== '';
+            }).map(function(k) {
                 return {
                     xtype: 'displayfield',
                     fieldLabel: k,
@@ -998,15 +1285,29 @@ Ext.define('PVE.dc.K8sView', {
             });
             return Ext.create('Ext.panel.Panel', {
                 border: false, bodyPadding: 10, scrollable: true,
-                items: [{ xtype: 'form', border: false, items: items }],
+                items: [
+                    {
+                        xtype: 'fieldset',
+                        title: gettext('Cluster Settings'),
+                        items: [form],
+                    },
+                    {
+                        xtype: 'fieldset',
+                        title: gettext('Details (read-only)'),
+                        items: [{
+                            xtype: 'form', border: false, items: info,
+                        }],
+                    },
+                ],
             });
         };
 
-        // One tab strip: "Clusters" grid first, then the
-        // selected cluster's panels as sibling tabs. No
-        // third navigation column: the selector sits in
-        // this view's own toolbar (the SDN-view pattern).
+        // The "Clusters" grid is card 0; the selected
+        // cluster's panels are sibling cards switched by
+        // the west menu tree. The selector sits in this
+        // view's own toolbar (the SDN-view pattern).
         let outer;
+        let menu;
         let panelFor = function(clusterName, key, rec) {
             let id = clusterName + ':' + key;
             if (panels[id]) { return panels[id]; }
@@ -1024,6 +1325,45 @@ Ext.define('PVE.dc.K8sView', {
             return p;
         };
 
+        // Second-sidebar navigation, VM-style: a menu tree
+        // in the west region switches the card in the center.
+        // (The cluster itself lives in the first, stock,
+        // resource panel; this is the page's own menu, like
+        // a VM's Summary/Console/Hardware list.)
+        let setActivePanel = function(key) {
+            me.activePanelKey = key;
+            let target = key === 'clusters'
+                ? home
+                : outer.items.findBy(function(c) {
+                    return c.panelKey === key;
+                });
+            if (target) {
+                outer.getLayout().setActiveItem(target);
+                let node = menu.getStore().getNodeById('k8snav-' + key);
+                if (node && menu.getSelection()[0] !== node) {
+                    menu.getSelectionModel().select(node, false, true);
+                }
+            }
+        };
+
+        let setMenu = function(defs) {
+            let children = [];
+            if (!fixedClusterName) {
+                children.push({
+                    id: 'k8snav-clusters', text: gettext('Clusters'),
+                    panelKey: 'clusters', leaf: true,
+                    iconCls: 'fa fa-cubes',
+                });
+            }
+            (defs || []).forEach(function(d) {
+                children.push({
+                    id: 'k8snav-' + d[0], text: d[1],
+                    panelKey: d[0], leaf: true, iconCls: d[2],
+                });
+            });
+            menu.setRootNode({ expanded: true, children: children });
+        };
+
         let showCluster = function(name, force) {
             if (!force && me.currentCluster === name && outer
                 && outer.items.getCount() > 1) {
@@ -1032,18 +1372,17 @@ Ext.define('PVE.dc.K8sView', {
             me.currentCluster = name;
             let rec = me.clusterIndex[name] || {};
             let defs = [
-                ['overview', gettext('Overview')],
-                ['nodes', gettext('Nodes')],
-                ['workloads', gettext('Workloads')],
-                ['metrics', gettext('Metrics')],
-                ['addons', gettext('Add-ons')],
-                ['events', gettext('Events')],
-                ['backups', gettext('Backups')],
-                ['settings', gettext('Settings')],
+                ['overview', gettext('Overview'), 'fa fa-info-circle'],
+                ['nodes', gettext('Nodes'), 'fa fa-server'],
+                ['workloads', gettext('Workloads'), 'fa fa-cubes'],
+                ['metrics', gettext('Metrics'), 'fa fa-line-chart'],
+                ['addons', gettext('Add-ons'), 'fa fa-puzzle-piece'],
+                ['events', gettext('Events'), 'fa fa-list'],
+                ['backups', gettext('Backups'), 'fa fa-archive'],
+                ['settings', gettext('Settings'), 'fa fa-cog'],
             ];
-            let active = outer.getActiveTab();
-            let activeKey = active ? active.panelKey : 'overview';
-            // drop previous cluster tabs, keep the grid (index 0)
+            let activeKey = me.activePanelKey || 'overview';
+            // drop previous cluster panels, keep the grid (index 0)
             while (outer.items.getCount() > 1) {
                 outer.remove(outer.items.getAt(1), false);
             }
@@ -1058,10 +1397,10 @@ Ext.define('PVE.dc.K8sView', {
                 p.panelKey = d[0];
                 outer.add(p);
             });
-            let keep = outer.items.findBy(function(c) {
-                return c.panelKey === activeKey;
-            });
-            outer.setActiveTab(keep || outer.items.getAt(1));
+            setMenu(defs);
+            let keep = defs.some(function(d) { return d[0] === activeKey; })
+                ? activeKey : 'overview';
+            setActivePanel(keep);
             destroyBtn.setDisabled(false);
             if (fixedClusterName) {
                 me.setTitle(gettext('Kubernetes') + ': ' + name);
@@ -1146,10 +1485,35 @@ Ext.define('PVE.dc.K8sView', {
             },
         });
 
-        outer = Ext.create('Ext.tab.Panel', {
+        menu = Ext.create('Ext.tree.Panel', {
+            region: 'west',
+            width: 190,
+            split: true,
+            rootVisible: false,
+            lines: false,
+            store: Ext.create('Ext.data.TreeStore', {
+                root: { expanded: true, children: [] },
+            }),
+            listeners: {
+                select: function(tree, rec) {
+                    if (rec.data.panelKey) {
+                        setActivePanel(rec.data.panelKey);
+                    }
+                },
+            },
+        });
+
+        outer = Ext.create('Ext.panel.Panel', {
+            region: 'center',
+            layout: 'card',
             border: false,
-            tabPosition: 'top',
             items: [home],
+        });
+
+        let navWrap = Ext.create('Ext.panel.Panel', {
+            layout: 'border',
+            border: false,
+            items: [menu, outer],
         });
 
         me.clusterIndex = {};
@@ -1175,6 +1539,7 @@ Ext.define('PVE.dc.K8sView', {
                         while (outer.items.getCount() > 1) {
                             outer.remove(outer.items.getAt(1), false);
                         }
+                        setMenu([]);
                         if (me.workspace) {
                             me.workspace.selectById('root');
                         }
@@ -1193,6 +1558,8 @@ Ext.define('PVE.dc.K8sView', {
                         while (outer.items.getCount() > 1) {
                             outer.remove(outer.items.getAt(1), false);
                         }
+                        setMenu([]);
+                        setActivePanel('clusters');
                     }
                 },
             });
@@ -1222,7 +1589,7 @@ Ext.define('PVE.dc.K8sView', {
                         handler: function() { me.reloadClusters(true); },
                     },
                 ],
-            }, Ext.apply(outer, { flex: 1 })],
+            }, Ext.apply(navWrap, { flex: 1 })],
             listeners: {
                 afterrender: function() {
                     me.reloadClusters();
@@ -1246,8 +1613,8 @@ Ext.define('PVE.dc.K8sView', {
 // Specific-cluster page opened from the first/left Proxmox
 // resource panel. The resource tree has already selected the
 // cluster, so this view fixes that selection and presents the
-// same panels as horizontal top tabs, without a selector or
-// another navigation column.
+// same panels behind a VM-style second-sidebar menu, without
+// a selector.
 Ext.define('PVE.k8s.Config', {
     extend: 'PVE.dc.K8sView',
     alias: 'widget.pveK8sConfig',

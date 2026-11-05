@@ -55,10 +55,11 @@ EOF
 my sub helm_ensure_cmd {
     return sprintf(<<'EOF', $HELM_VERSION);
 if [ ! -x /usr/local/bin/helm ]; then
-    curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-v%s-linux-amd64.tar.gz
+    HA=$(uname -m); [ "$HA" = aarch64 ] && HA=arm64 || HA=amd64
+    curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-v%s-linux-$HA.tar.gz
     tar -xzf /tmp/helm.tgz -C /tmp
-    install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
-    rm -rf /tmp/helm.tgz /tmp/linux-amd64
+    install -m 0755 /tmp/linux-$HA/helm /usr/local/bin/helm
+    rm -rf /tmp/helm.tgz /tmp/linux-$HA
 fi
 EOF
 }
@@ -320,10 +321,11 @@ sub csi_install_cmd {
 
     return sprintf(<<'EOF', $HELM_VERSION, $kubeconfig, $values_yaml, $CSI_CHART_VERSION);
 if [ ! -x /usr/local/bin/helm ]; then
-    curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-v%s-linux-amd64.tar.gz
+    HA=$(uname -m); [ "$HA" = aarch64 ] && HA=arm64 || HA=amd64
+    curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-v%s-linux-$HA.tar.gz
     tar -xzf /tmp/helm.tgz -C /tmp
-    install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
-    rm -rf /tmp/helm.tgz /tmp/linux-amd64
+    install -m 0755 /tmp/linux-$HA/helm /usr/local/bin/helm
+    rm -rf /tmp/helm.tgz /tmp/linux-$HA
 fi
 export KUBECONFIG=%s
 cat > /root/proxmox-csi-values.yaml <<'VALUES'

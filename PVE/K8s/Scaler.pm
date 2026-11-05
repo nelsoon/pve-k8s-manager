@@ -58,6 +58,11 @@ sub pool_node_labels {
     my ($pool) = @_;
 
     my %labels = ('pve-k8s.proxmox.com/pool' => $pool->{name});
+    # kubelet sets this on real nodes; simulated nodes of
+    # an arch-pinned group must carry it too, or a pending
+    # arm64-only pod would trigger amd64 scale-out (or the
+    # reverse) in simulation.
+    $labels{'kubernetes.io/arch'} = $pool->{arch} if $pool->{arch};
     for my $kv (split /\s*,\s*/, $pool->{labels} // '') {
         $labels{$1} = $2 if $kv =~ /^([^=]+)=(.*)$/;
     }

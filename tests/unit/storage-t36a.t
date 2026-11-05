@@ -145,8 +145,10 @@ my $js = do {
     local $/;
     <$fh>;
 };
-like($js, qr/name: 'file-backend'/, 'wizard has the file backend field');
-like($js, qr/name: 'file-share'/, 'wizard has the NFS export field');
+# T5.2: the wizard no longer carries RWX fields; the API
+# still accepts them at create (asserted above).
+unlike($js, qr/name: 'file-backend'/, 'wizard has no file backend field');
+unlike($js, qr/name: 'file-share'/, 'wizard has no NFS export field');
 
 # Schema consistency: every key the section config
 # offers in options() must have a propertyList entry, or

@@ -139,6 +139,11 @@ for my $ep (qw(events certificates workloads metrics)) {
     like($api, qr{path => '\{name\}/$ep',\n    method => 'GET',\n    protected => 1},
         "$ep endpoint runs protected (root)");
 }
+# The update endpoint writes the cluster config; unprotected
+# it cannot take the pmxcfs lock ("cluster filesystem not
+# online" from the www-data worker).
+like($api, qr{path => '\{name\}',\n    method => 'PUT',\n    protected => 1},
+    'update endpoint runs protected (root)');
 like($api, qr{addons/\{addon\}/disable'},
     'addon disable endpoint registered');
 like($src, qr/sub disable_addon/, 'disable_addon exists');
