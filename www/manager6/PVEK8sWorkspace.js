@@ -302,6 +302,7 @@ Ext.define('PVE.dc.K8sView', {
 
         let grid = function(fields, url, columns, tbar) {
             return Ext.create('Ext.grid.Panel', {
+                header: false,
                 border: false,
                 store: Ext.create('Ext.data.Store', {
                     fields: fields,
@@ -387,6 +388,7 @@ Ext.define('PVE.dc.K8sView', {
                 };
             };
             return Ext.create('Ext.panel.Panel', {
+                header: false,
                 border: false,
                 bodyPadding: 10,
                 scrollable: true,
@@ -495,10 +497,20 @@ Ext.define('PVE.dc.K8sView', {
                     xtype: 'form',
                     border: false,
                     items: rows.map(function(row) {
+                        let value = Ext.htmlEncode(String(row[1]));
+                        if (row[0] === 'State') {
+                            // stock state icon, like the
+                            // cluster list renders it
+                            let icon = row[1] === 'ready'
+                                ? 'fa fa-check good'
+                                : 'fa fa-exclamation-triangle warning';
+                            value = '<i class="' + icon + '"></i> '
+                                + value;
+                        }
                         return {
                             xtype: 'displayfield',
                             fieldLabel: row[0],
-                            value: Ext.htmlEncode(String(row[1])),
+                            value: value,
                             labelWidth: 160,
                         };
                     }).concat([certInfo]),
@@ -751,7 +763,7 @@ Ext.define('PVE.dc.K8sView', {
                 };
             };
             groupsGrid = Ext.create('Ext.grid.Panel', {
-                title: gettext('Node Groups'),
+                header: false,
                 height: 190,
                 border: false,
                 store: groupStore,
@@ -834,6 +846,7 @@ Ext.define('PVE.dc.K8sView', {
             };
             loadNodes();
             return Ext.create('Ext.panel.Panel', {
+                header: false,
                 layout: { type: 'vbox', align: 'stretch' },
                 border: false,
                 items: [groupsGrid, Ext.apply(g, { flex: 1 })],
@@ -850,6 +863,7 @@ Ext.define('PVE.dc.K8sView', {
                 };
             };
             let tabs = Ext.create('Ext.tab.Panel', {
+                header: false,
                 border: false,
                 items: [
                     Ext.apply(mk(
@@ -965,6 +979,7 @@ Ext.define('PVE.dc.K8sView', {
                 },
             };
             let panel = Ext.create('Ext.panel.Panel', {
+                header: false,
                 border: false,
                 layout: { type: 'vbox', align: 'stretch' },
                 tbar: [enableBtn],
@@ -1104,6 +1119,7 @@ Ext.define('PVE.dc.K8sView', {
                 },
             });
             let g = Ext.create('Ext.grid.Panel', {
+                header: false,
                 border: false,
                 store: store,
                 tbar: [enableBtn, disableBtn],
@@ -1286,6 +1302,7 @@ Ext.define('PVE.dc.K8sView', {
                 };
             });
             return Ext.create('Ext.panel.Panel', {
+                header: false,
                 border: false, bodyPadding: 10, scrollable: true,
                 items: [
                     {
@@ -1457,7 +1474,7 @@ Ext.define('PVE.dc.K8sView', {
         });
 
         let home = Ext.create('Ext.grid.Panel', {
-            title: gettext('Clusters'),
+            header: false,
             itemId: 'k8s-home',
             hidden: !!fixedClusterName,
             border: false,
@@ -1514,8 +1531,8 @@ Ext.define('PVE.dc.K8sView', {
         });
         menu = Ext.create('Ext.panel.Panel', {
             region: 'west',
-            width: 210,
-            split: true,
+            width: 200,
+            split: false,
             border: false,
             cls: 'pve-toolbar-bg',
             layout: 'fit',
@@ -1679,11 +1696,13 @@ Ext.define('PVE.dc.K8sView', {
                         baseCls: 'x-panel-header-text',
                     },
                     '->',
-                    destroyBtn,
                     {
-                        text: gettext('Reload'),
-                        iconCls: 'fa fa-fw fa-refresh',
-                        handler: function() { me.reloadClusters(true); },
+                        // Destroy lives under More, like a
+                        // VM page's Remove - not one click
+                        // away in the top bar
+                        text: gettext('More'),
+                        iconCls: 'fa fa-fw fa-bars',
+                        menu: [destroyBtn],
                     },
                 ],
             }, Ext.apply(navWrap, { flex: 1 })],

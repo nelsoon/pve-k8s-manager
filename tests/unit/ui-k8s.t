@@ -109,8 +109,8 @@ like($js, qr/Ext\.list\.Tree/,
     'second sidebar is a treelist like VM pages');
 like($js, qr/fixedClusterName/,
     'resource-selected cluster is fixed in its page');
-like($js, qr/reloadClusters\(true\)/,
-    'manual reload rebuilds the selected cluster panels');
+like($js, qr/interval: 30000/,
+    'cluster view refreshes itself on a poll (no Reload button)');
 like($js, qr/if \(!fixedClusterName\) \{\n            \/\/ Datacenter/,
     'Datacenter view is the list-only branch');
 unlike($js, qr/tabPosition/,
@@ -125,6 +125,16 @@ like($js, qr{'cp-arch'}, 'create offers control-plane architecture');
 like($js, qr{method: 'PUT',\n                    params: \{ pools:},
     'node groups save through the pools update');
 like($js, qr{Node Groups}, 'nodes view manages node groups');
+unlike($js, qr/title: gettext\('Node Groups'\)/,
+    'no blue title bar over the node groups grid');
+unlike($js, qr/title: gettext\('Clusters'\)/,
+    'no blue title bar over the cluster list');
+like($js, qr/text: gettext\('More'\)/,
+    'destroy sits under a More menu like a VM page');
+like($js, qr/fa fa-check good/,
+    'overview state carries the stock ready icon');
+ok((grep { /header: false/ } split /\n/, $js) >= 8,
+    'section panels render without header bars');
 # this Ext build drops toolbar items sharing an itemId
 # (only the last survives: Drain/Replace/Edit vanished);
 # selection-scoped buttons use a marker property instead
