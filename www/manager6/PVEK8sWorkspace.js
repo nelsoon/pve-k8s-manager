@@ -237,6 +237,10 @@ Ext.define('PVE.dc.K8sView', {
     alias: 'widget.pveDcK8sView',
 
     title: gettext('Kubernetes'),
+    // no separate title header: like a VM page
+    // (PVE.panel.Config), the title lives inside the
+    // single top toolbar as a tbtext
+    header: false,
 
     // Set when the view is opened for one resource-tree
     // cluster (PVE.k8s.Config); then the selector is hidden
@@ -1396,7 +1400,12 @@ Ext.define('PVE.dc.K8sView', {
             setActivePanel(keep);
             destroyBtn.setDisabled(false);
             if (fixedClusterName) {
-                me.setTitle(gettext('Kubernetes') + ': ' + name);
+                let title = gettext('Kubernetes') + ': ' + name;
+                me.setTitle(title);
+                let tt = me.down('#k8s-title');
+                if (tt) {
+                    tt.setText(Ext.htmlEncode(title));
+                }
             }
         };
 
@@ -1659,21 +1668,18 @@ Ext.define('PVE.dc.K8sView', {
         Ext.apply(me, {
             layout: { type: 'vbox', align: 'stretch' },
             items: [{
+                // one single top bar, VM-page style: title
+                // text on the left, actions on the right
                 xtype: 'toolbar',
                 items: [
-                    selector,
                     {
-                        text: gettext('Create'),
-                        iconCls: 'fa fa-fw fa-plus-circle',
-                        hidden: !!fixedClusterName,
-                        handler: function() {
-                            Ext.create('PVE.dc.K8sCreateWindow', {
-                                onDone: function() { me.reloadClusters(); },
-                            }).show();
-                        },
+                        xtype: 'tbtext',
+                        itemId: 'k8s-title',
+                        text: Ext.htmlEncode(me.title),
+                        baseCls: 'x-panel-header-text',
                     },
-                    destroyBtn,
                     '->',
+                    destroyBtn,
                     {
                         text: gettext('Reload'),
                         iconCls: 'fa fa-fw fa-refresh',

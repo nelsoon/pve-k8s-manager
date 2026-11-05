@@ -196,26 +196,30 @@ run_patch({
 # The ver parameter must carry OUR version too: with only
 # the stock [% version %] (the PVE release), browsers keep
 # serving the previous plugin JS after a deb upgrade and
-# the UI looks unchanged (seen live, 2026-11-04). Bump
-# PLUGIN_VER with every release.
-my $PLUGIN_VER = '0.1.0-1';
+# the UI looks unchanged (seen live, 2026-11-04). Use a
+# short content hash of the installed JS: every rebuild
+# busts the cache, no manual version bumping.
+use Digest::MD5 qw(md5_hex);
+my $jsver = 'dev';
+if (open my $jh, '<', "$prefix/usr/share/pve-manager/js/PVEK8sWorkspace.js") {
+    local $/;
+    my $data = <$jh>;
+    close $jh;
+    $jsver = substr(md5_hex($data), 0, 8) if defined $data && length $data;
+}
 my $script_tag = '    <script type="text/javascript" '
     . 'src="/pve2/js/PVEK8sWorkspace.js?ver=[% version %]'
-    . "-pvek8s-$PLUGIN_VER\">"
+    . "-pvek8s-$jsver\">"
     . "</script>\n";
 run_patch({
     file => $tpl,
-    # marker is the versioned tag: installs carrying the
-    # legacy (unversioned) tag do not match it, so apply
-    # runs and rewrites the tag in place below
-    marker => '-pvek8s-',
+    # marker is the current content-hashed tag: installs
+    # carrying an older (or legacy unversioned) tag do not
+    # match it, so apply runs and rewrites the tag below
+    marker => "-pvek8s-$jsver",
     apply => sub {
         my ($src) = @_;
-        my $legacy = '    <script type="text/javascript" '
-            . 'src="/pve2/js/PVEK8sWorkspace.js?ver=[% version %]">'
-            . "</script>\n";
-        if (index($src, $legacy) >= 0) {
-            $src =~ s/\Q$legacy\E/$script_tag/;
+        if ($src =~ s{    <script type="text/javascript" src="/pve2/js/PVEK8sWorkspace\.js\?ver=\[% version \%\](?:-pvek8s-[^"]*)?"></script>\n}{$script_tag}) {
             return $src;
         }
         my $anchor = '/pve2/js/pvemanagerlib.js';

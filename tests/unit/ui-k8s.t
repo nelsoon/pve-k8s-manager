@@ -101,6 +101,10 @@ like($js, qr/region: 'west'/,
     'second sidebar sits in the west region');
 like($js, qr/ui: 'pve-nav'/,
     'second sidebar uses the stock pve-nav treelist style');
+like($js, qr/header: false/,
+    'no separate title header (single top bar, VM-page style)');
+like($js, qr/baseCls: 'x-panel-header-text'/,
+    'title lives inside the top toolbar as tbtext');
 like($js, qr/Ext\.list\.Tree/,
     'second sidebar is a treelist like VM pages');
 like($js, qr/fixedClusterName/,
