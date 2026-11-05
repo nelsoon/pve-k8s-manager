@@ -1,50 +1,520 @@
 = Kubernetes Clusters on Proxmox VE
 :toc: left
+:sectnums:
 
-Draft administrator guide for the `pve-k8s-manager` package.
-This is a starting point for the pve-manager documentation
-tree, not finished documentation.
+Administrator and user guide for the `pve-k8s-manager`
+package. Everything described here is implemented and
+covered by the unit suite (`tests/unit/`); end-to-end
+behaviour is validated in a nested Proxmox lab
+(acceptance scenarios S1-S6, `tests/lab-acceptance.sh`,
+last full run 2026-11-02). Physical-hardware validation
+(T4.2) is still pending - see <<limitations>>.
 
-== Overview
+== Concepts
 
-The package provisions kubeadm Kubernetes clusters on
-Proxmox VMs from the web UI (Datacenter -> Kubernetes) or
-the `/cluster/k8s` API. Nodes are immutable: they are built
-from versioned Debian templates and replaced, never patched,
-for rolling changes and upgrades. Only Kubernetes 1.35 and
-1.36 are offered, matching the add-on-tested minors.
+* Clusters run on *VMs only* (no LXC, no kubeadm on the
+  PVE hosts). Node VMs are built from immutable, versioned
+  Debian templates and are *never patched in place*:
+  rolling changes and Kubernetes upgrades replace nodes
+  one at a time (surge, at most one extra node,
+  `maxSurge=1` semantics).
+* The user manages only Kubernetes-level concerns -
+  version, node groups, add-ons. Nobody SSHes into a node
+  to run `apt upgrade`; a node with a problem is replaced.
+* Control planes are 1, 3 or 5 VMs with stacked etcd and
+  a kube-vip virtual IP.
+* Workers live in *node groups* (pools) with per-group
+  size, scaler bounds, labels, taints, host placement,
+  storage and CPU architecture.
+* Cilium is the only CNI. Networking fits Proxmox SDN:
+  clusters share an EVPN zone (tenant VRF) and each
+  cluster gets its own VNet.
+* Autoscaling runs *outside* Kubernetes, on the PVE
+  hosts, leader-elected. It simulates pods against whole
+  VMs; there is no in-cluster autoscaler to babysit.
+* Written upstream-first: Perl API2 endpoints and
+  orchestration, ExtJS UI, AGPL. The integration points
+  into stock pve-manager files are listed in
+  `INTEGRATION.md`.
 
-== Prerequisites
+== Cluster lifecycle
 
-* A Proxmox VE cluster with an SDN zone (EVPN recommended)
-  to act as the tenant VRF.
-* Shared storage reachable by all hosts that run templates.
-* Node templates built with `images/build-template.sh` on a
-  builder VM for each supported Kubernetes minor.
-* Per cluster: one VNet with an internal node subnet and a
-  public subnet for load-balancer IPs and the control-plane
-  VIP. Creating or deleting a cluster needs no router or
-  fabric reconfiguration.
+=== Create
 
-== Day-2 operations
+UI: Datacenter -> Kubernetes -> Create. The form asks
+only for a name, the Kubernetes version (dropdown),
+the control-plane size (1/3/5), a storage (selector over
+existing PVE storages) and an SDN zone (selector over
+existing zones). Advanced fields (collapsed) cover the
+public/node subnets, gateway, LB range, template builder
+IP and control-plane architecture.
 
-Create, provision, roll (template revision change), upgrade
-(one minor at a time), scale pools, backup/restore etcd, and
-delete with an orphan audit (VMs, disks, SDN objects) are
-available both in the UI and under `pvesh /cluster/k8s`.
-Rolling operations honour the cluster's maintenance window
-unless forced.
+API:
 
-The autoscaler runs on the PVE hosts, outside Kubernetes:
-a leader-elected pass simulates pending pods against the
-node pools and adds or retires whole VMs, respecting PDBs,
-affinity and volume constraints. It stands down while a
-cluster is provisioning, rolling or upgrading.
+[source,sh]
+----
+pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \
+    --cp 3 --sdn-zone evpnzone \
+    --public-subnet 192.168.205.0/24 \
+    --node-subnet 192.168.206.0/24 \
+    --storage local-lvm --builder-ip 192.168.206.50
+----
+
+Creating records the cluster (`state: config-only`);
+nothing is built until provision. Only Kubernetes 1.35
+and 1.36 can be created: the version dropdown and the
+backend accept exactly the add-on-tested minors. Newer
+minors are admitted only after add-on compatibility is
+proven; 1.37 is held for that reason.
+
+=== Provision
+
+`pvesh create /cluster/k8s/c1/provision` (or the
+Provision button) converges the cluster to its record:
+networks, templates, VMs, kubeadm bootstrap, add-ons.
+It is resumable and idempotent - rerunning it after an
+interruption adopts live nodes instead of duplicating
+them, and an orphaned in-flight node is adopted, never
+double-created (proven by a kill-resume acceptance gate:
+worker killed with `kill -9` mid-surge, resume completed
+with exactly the declared membership).
+
+If no template exists for the requested version and a
+builder IP was recorded at create time, the plugin
+builds its own template on a builder VM; a fresh install
+needs no manual template work. Templates are named
+`k8s-node-<minor>-r<revision>` (`-arm64` suffixed on
+ARM64) and distributed to the hosts that need them:
+copied per host for node-local storage, one central copy
+for shared storage.
+
+Provision also *converges node-group membership*: nodes
+beyond a group's declared size are drained and retired
+(highest index first), missing nodes are created. This
+is the pass that makes group edits take effect.
+
+=== Roll
+
+`pvesh create /cluster/k8s/c1/roll` replaces every node,
+one at a time with one surge node, onto the current
+template revision - this is how OS and kubelet changes
+reach nodes. Rolls honour the cluster's maintenance
+window (`maintenance-window`, HH:MM-HH:MM) unless forced
+(`--force 1`). CP members are only ever rolled onto
+images whose revision the plugin has recorded as tested
+for the control plane.
+
+=== Upgrade
+
+`pvesh create /cluster/k8s/c1/upgrade --to 1.36`
+upgrades one minor at a time (1.35 -> 1.36 is the tested
+path): kubeadm upgrade on the control plane, then node
+replacement. The plugin records the applied version
+(`upgrade-applied`) so a resume never re-applies a
+half-finished upgrade or accumulates surge control
+planes.
+
+=== Power
+
+`pvesh create /cluster/k8s/c1/power --action start|stop`
+boots or stops all node VMs as one operation: start is
+control-plane first, stop is workers first. (Used in the
+lab to recover whole clusters after host restarts.)
+
+=== Delete
+
+`pvesh delete /cluster/k8s/c1` (Destroy in the UI)
+removes the cluster with an orphan audit: node VMs and
+their disks, the cluster VNet, plugin users/tokens and
+snippets are all removed; the acceptance suite verifies
+zero leftovers (`qm list`, resource list and VNet list
+all clean).
+
+=== Kubeconfig
+
+`pvesh get /cluster/k8s/c1/kubeconfig` returns an admin
+kubeconfig (requires `Sys.Modify`); the UI Overview
+shows it in a window with a Download button.
+
+== Node groups
+
+A group is a JSON object in the cluster's `pools`:
+
+[source,json]
+----
+[{ "name": "default", "size": 2, "min": 1, "max": 3,
+   "labels": "tier=web", "taints": "",
+   "hosts": "pve1,pve2", "storage": "local-lvm",
+   "arch": "amd64" }]
+----
+
+* `size` - declared node count. Provision converges to
+  it (adds missing, drains and retires excess).
+* `min` / `max` - bounds for the pod-driven scaler
+  (below). The scaler moves `size` only inside
+  [`min`, `max`] and only in reaction to pods.
+* `labels` / `taints` - applied to the group's nodes
+  (also used by scaler simulation).
+* `hosts` - optional placement: only these PVE hosts
+  receive the group's nodes.
+* `storage` - optional per-group disk storage override.
+* `arch` - `amd64` or `arm64`; see <<multiarch>>.
+
+UI: cluster page -> Nodes -> Node Groups (Create / Edit
+/ Delete). Saving stores the groups and immediately
+converges membership via a provision pass. Deleting a
+group drains and retires its nodes. The control plane
+is not a group: its count is fixed at creation.
+
+Groups can also be managed over the API:
+`PUT /cluster/k8s/{name}` with a `pools` JSON string
+(validated eagerly; a bad group is rejected before
+anything is stored).
+
+== Control plane
+
+* 1, 3 or 5 members, stacked etcd, kube-vip VIP on the
+  public subnet. kube-vip runs as a static pod on every
+  CP; the VIP is the API endpoint in every kubeconfig.
+* Placement spreads CPs across PVE hosts (and HA
+  groups where present) on a best-effort basis.
+  *Hard* anti-affinity (never two CPs on one host while
+  enough hosts are eligible) is follow-up P2 - today a
+  small host count can still co-locate CPs.
+* Certificates: `GET /cluster/k8s/{name}/certificates`
+  reports expiry of every kubeadm PKI certificate
+  (`admin.conf`, `apiserver`, etcd, ... days remaining
+  and a level of ok/warning/critical). The one-year
+  kubeadm PKI is renewed by rolling or upgrading the
+  control plane; the Overview shows the worst level.
+
+== Networking
+
+* One EVPN SDN zone acts as the tenant VRF for all
+  clusters. Each cluster gets a dedicated VNet
+  (`k8s` + 5 characters - PVE caps VNet ids at 8) in
+  that zone, an internal *node subnet* (node IPs, etcd,
+  kubelet) and a *public subnet* carrying the
+  control-plane VIP and LoadBalancer IPs. Creating or
+  deleting a cluster needs no router or fabric
+  reconfiguration.
+* Cilium is the CNI (eBPF, kube-proxy replacement) and
+  provides the ingress controller and Gateway API by
+  default. LoadBalancer services draw IPs from the
+  cluster's LB range (Cilium LB IPAM) and are announced
+  with L2 announcements, so a laptop on another subnet
+  can reach a service IP through the normal gateway;
+  BGP/EVPN advertisement to an external router (e.g.
+  OPNsense with FRR) is the routed alternative.
+* VXLAN zones also work; EVPN is the recommended fit
+  for externally reachable LB IPs.
+
+== Storage
+
+* The Proxmox CSI driver is installed with the cluster.
+  Two classes by default: *shared-block* (volumes on
+  shared storage, attach anywhere) and *local-block*
+  (node-local storage - faster, pinned to one fabric
+  host). Disks hot-attach; no node shutdown is needed
+  to change a volume's backing.
+* Local volumes follow their pods: if a pod with a
+  local PV is rescheduled to a node on another host,
+  the scaler detects the stuck volume and moves the
+  disk to that host (`POST /cluster/k8s/{name}/volumes/move`
+  does the same manually). Shared volumes never move.
+* Shared-file (RWX) classes are opt-in at create time:
+  NFS (`file-backend nfs` with server/share) or CephFS,
+  both via CSI, validated by a probe before the class
+  is offered.
+
+== Add-ons
+
+|===
+| Add-on | Default | Notes
+
+| Cilium (CNI, ingress, Gateway API)
+| installed with the cluster
+| not removable; provides the default ingress class
+
+| Proxmox cloud-controller-manager
+| installed
+| labels nodes with zone/region from the fabric,
+  sets providerIDs
+
+| Proxmox CSI
+| installed
+| shared-block + local-block classes (above)
+
+| cert-manager
+| deployed *unconfigured*
+| enable with an issuer: the built-in CA (`ca`,
+  default) or ACME (`acme`, with account email and
+  directory URL)
+
+| external-dns
+| deployed *unconfigured*
+| enable with the PowerDNS provider (`pdns`), API URL,
+  key and zone
+
+| metrics-server
+| opt-in
+| enable/disable in Add-ons; feeds the pod CPU/memory
+  section of the Metrics panel (0.8.0,
+  `--kubelet-insecure-tls` for the lab PKI)
+|===
+
+Enable/disable over the API:
+
+[source,sh]
+----
+pvesh create /cluster/k8s/c1/addons/cert-manager/enable \
+    --issuer acme --acme-email ops@example.com
+pvesh create /cluster/k8s/c1/addons/external-dns/enable \
+    --provider pdns --pdns-url http://dns.example:8081 \
+    --pdns-key SECRET --zone example.com
+pvesh create /cluster/k8s/c1/addons/metrics-server/enable
+pvesh create /cluster/k8s/c1/addons/metrics-server/disable
+----
+
+"Unconfigured" is deliberate: the add-ons that need
+site-specific configuration are present and visible in
+the Add-ons panel with their state, but do nothing
+until the user supplies that configuration.
+
+== Metrics and observability
+
+* Node VM CPU/memory comes from Proxmox itself (RRD):
+  always available, no in-cluster agent, and the plugin
+  never writes Kubernetes metrics into the Proxmox RRD.
+* Pod CPU/memory appears in the Metrics panel only when
+  the metrics-server add-on is enabled. Without it,
+  there is intentionally no pod-level metrics source
+  (cadvisor history is a separate, later topic).
+* The Events panel shows recent Kubernetes events;
+  Workloads shows deployments, pods and services,
+  read-only (day-2 workload management stays in
+  Kubernetes tooling).
+* Every long operation is a PVE task; the bottom task
+  log describes them in words ("Kubernetes Cluster c1 -
+  Start VMs", "- Scale", "- Destroy", ...).
+
+== The scaler
+
+One leader (elected via a pmxcfs stamp) runs a periodic
+pass per cluster - systemd `pve-k8s-scaler.timer` where
+enabled - or one pass on demand with the Scale button /
+`POST /cluster/k8s/{name}/scale`. A pass, in order:
+
+. *Repair*: a worker NotReady for more than 5 minutes
+  whose VM does not answer the guest agent is replaced.
+  A NotReady node whose VM is alive is reported and
+  left alone - the plugin never destroys a live VM on a
+  kubelet's say-so.
+. *Local-volume rescue*: pending pods pinned by a local
+  PV to a host with no schedulable node get their disk
+  moved to a host that has one.
+. *Scale out*: pending pods (older than 2 minutes) are
+  simulated against every group whose labels, taints,
+  affinity, topology and resource requests they match,
+  including `kubernetes.io/arch`. If more nodes of a
+  group would place more pods and the group is below
+  `max` (and some PVE host has 4 GiB free), `size`
+  grows and provision creates the nodes.
+. *Scale in*: a worker is removed only if it uses
+  under 30% CPU and memory, all its non-DaemonSet pods
+  fit on the survivors in simulation (affinity, PDBs
+  and topology included), the group stays above `min`,
+  and the node is over 30 minutes old. Removal drains
+  through the eviction API with a time box; a drain
+  blocked by a PodDisruptionBudget uncordons the node
+  and ends the pass - nodes are never force-drained
+  past a PDB by the scaler.
+
+The scaler stands down unless the cluster state is
+`ready` (never during provision, roll or upgrade).
+There is no VPA equivalent: right-sizing requests is
+left to Kubernetes tooling; HPA works unchanged since
+metrics-server is a normal add-on.
+
+== Backups
+
+* `POST /cluster/k8s/{name}/backup` takes an etcd
+  snapshot from a healthy control-plane member;
+  `GET /cluster/k8s/{name}/backups` lists snapshots;
+  retention is configurable in Settings
+  (`backup-retention`). A `pve-k8s-backup.timer`
+  (daily) drives scheduled backups where enabled.
+* `POST /cluster/k8s/{name}/restore` restores a snapshot
+  with `etcdutl` per member - including onto a fresh
+  control plane if the original members are gone.
+  Restore probing is exit-status based today; making
+  it fail-closed is a recorded follow-up.
+
+== Node and host operations
+
+On the Nodes panel (and under
+`/cluster/k8s/{name}/nodes/{node}/...`):
+
+* *Drain* - cordon and evict (PDB-safe) ahead of
+  maintenance.
+* *Replace* - drain, delete and recreate the node from
+  the current template.
+* *Force Retire* - for a node whose VM is dead: removes
+  the stale node record without draining (confirmation
+  required; refuses healthy nodes).
+* *Evacuate Host* (`.../hosts/{host}/evacuate`) -
+  replaces every node of the cluster living on one PVE
+  host, for host maintenance.
+
+Node identity is always verified against the live VM
+(name + host) before any reset/destroy: VMIDs are
+recycled by Proxmox, and the plugin will not touch a
+VM that merely inherited a dead node's ID.
+
+== User interface
+
+* *Datacenter -> Kubernetes*: the cluster list only
+  (Create, Destroy, Reload). Double-click a cluster to
+  open it. Nothing else lives here any more.
+* *Left resource panel*: every cluster appears as a
+  `k8s/<name>` resource at datacenter level (next to
+  the PVE hosts - a Kubernetes cluster is
+  datacenter-wide, not per-node), with a cubes icon and
+  its state.
+* *Cluster page* (click a cluster on the left), with a
+  stock second sidebar like a VM page:
+  - *Overview* - state (with ready icon), version,
+    template revision, sizes, subnets, node groups,
+    certificate level; actions Provision / Roll / Scale
+    / Upgrade / Start VMs / Stop VMs / Kubeconfig.
+    Destroy hides under the *More* menu in the top bar.
+  - *Nodes* - node groups (Create/Edit/Delete) over the
+    node list; Drain / Replace / Force Retire /
+    Evacuate Host per node.
+  - *Workloads* - Deployments / Pods / Services,
+    read-only.
+  - *Metrics* - node VMs from Proxmox; pods from
+    metrics-server when enabled.
+  - *Add-ons* - states (installed / unconfigured /
+    not installed) with Enable/Disable where supported.
+  - *Events* - recent Kubernetes events.
+  - *Backups* - snapshots with Backup / Restore.
+  - *Settings* - maintenance window, backup retention,
+    description; read-only details below.
+
+== API summary
+
+Base: `/cluster/k8s` (UI and `pvesh` share it; reads
+need `Sys.Audit` on `/cluster`, mutations and the
+kubeconfig need `Sys.Modify`).
+
+|===
+| Method | Path | Purpose
+
+| GET | `/cluster/k8s` | list clusters
+| POST | `/cluster/k8s` | create (config only)
+| GET | `/cluster/k8s/{name}` | cluster record
+| PUT | `/cluster/k8s/{name}` | maintenance window, node groups, retention, description
+| DELETE | `/cluster/k8s/{name}` | destroy with orphan audit
+| POST | `.../provision` | converge (also builds a missing template with a recorded builder IP)
+| POST | `.../roll` | surge-replace all nodes (window unless forced)
+| POST | `.../upgrade` | one minor up (`--to`)
+| POST | `.../scale` | one scaler pass
+| POST | `.../power` | start (CP first) / stop (workers first) all VMs
+| GET | `.../kubeconfig` | admin kubeconfig
+| GET | `.../certificates` | PKI expiry report
+| GET | `.../events` | recent events
+| GET | `.../workloads` | deployments, pods, services
+| GET | `.../metrics` | VM metrics (+ pods with metrics-server)
+| GET | `.../addons` | add-on states
+| POST | `.../addons/{addon}/enable` | cert-manager, external-dns, metrics-server
+| POST | `.../addons/{addon}/disable` | metrics-server
+| POST | `.../nodes/{node}/drain` | drain a node
+| POST | `.../nodes/{node}/replace` | replace a node
+| POST | `.../nodes/{node}/force-retire` | retire a dead node
+| POST | `.../volumes/move` | move a local volume to another host
+| POST | `.../backup` | etcd snapshot
+| GET | `.../backups` | list snapshots
+| POST | `.../restore` | restore a snapshot
+| POST | `.../hosts/{host}/evacuate` | clear one PVE host
+|===
+
+[[multiarch]]
+== Multi-arch (amd64 / arm64)
+
+Proxmox VE ships an official ARM64 build and a Proxmox
+cluster may mix architectures; a VM never changes arch,
+so architecture is a property of a *node group*, not
+of the cluster:
+
+* group `arch` (`amd64`/`arm64`) is validated at save;
+  placement only ever chooses PVE hosts of that arch,
+  and templates are per arch
+  (`k8s-node-<minor>-r<rev>-arm64`; amd64 keeps the
+  historical unsuffixed name, built from the matching
+  Debian cloud image, `--arch` on `build-template.sh`);
+* kubelet already labels nodes `kubernetes.io/arch`, so
+  pods pin architectures with ordinary nodeSelector /
+  affinity - no plugin API needed on the pod side.
+  Simulated scaler nodes carry the group's arch label,
+  so an arm64-only pending pod scales an arm64 group,
+  never an amd64 one;
+* the control plane stays homogeneous: `cp-arch` at
+  creation (the selector only matters on mixed-arch
+  Proxmox clusters);
+* kubeadm, helm and image downloads pick their arch from
+  the guest at runtime - nothing is hardcoded to amd64.
+
+Status: implemented and unit-tested; the amd64 path is
+acceptance-tested end to end. ARM64 is *untested on
+real hardware* (the validation lab is x86-only) and is
+not claimed until an ARM Proxmox host exists.
+
+== Packaging and integration
+
+`make deb` builds `pve-k8s-manager_<version>_all.deb`;
+`make test` runs lint plus the unit suite. The
+maintainer scripts apply the eight integration points
+of `INTEGRATION.md` to stock pve-manager files
+(API registration, config registry, UI view and script,
+resource entries, tree type, workspace routing, task
+descriptions), idempotently, with `<file>.pve-k8s.bak`
+backups; uninstalling reverses exactly those edits.
+Cluster configuration under `/etc/pve/k8s` is user
+data and kept. The plugin UI script URL carries a
+content hash, so package upgrades are never masked by
+a browser cache.
+
+[[limitations]]
+== Known limitations
+
+* Physical-hardware validation (T4.2) has not run: no
+  real host power-off or Ceph shared-block test yet.
+  Nested-lab proof only; do not treat as
+  production-ready.
+* Hard control-plane anti-affinity (P2) and automated
+  fencing/STONITH (P3) are open. Host-failure recovery
+  is manual: do not power off a host whose CP nodes are
+  needed for etcd quorum or hold the VIP alone.
+* Kubernetes 1.37 is held until its add-ons are tested.
+* ARM64 is untested until an ARM Proxmox host exists
+  (above).
+* A worker that dies mid-provision can leave the
+  cluster record in `provisioning` until the next
+  provision pass (state lease/resume is a recorded
+  gap); rerunning Provision converges and adopts
+  orphans.
+* Restore probing is exit-status based, not yet
+  fail-closed.
+* For fresh nested labs, LVM-thin is recommended over
+  ZFS (memory footprint); either works on hardware.
 
 == Safety notes
 
 * Control-plane VMs spread across hosts/HA groups on a
-  best-effort basis; hard anti-affinity is not yet enforced.
-* There is no automated fencing. Before powering off a host
-  manually, make sure its control-plane nodes are not needed
+  best-effort basis; hard anti-affinity is not yet
+  enforced (above).
+* There is no automated fencing. Before powering off a
+  host manually, evacuate it (Nodes -> Evacuate Host)
+  or make sure its control-plane nodes are not needed
   for etcd quorum and do not hold the VIP alone.

@@ -28,9 +28,10 @@ this as production-ready yet.
 - Cilium as the only CNI (with ingress / Gateway API).
   cert-manager and external-dns are deployed "unconfigured"
   by default; other add-ons can be added later.
-- Storage: shared file storage (NFS) and CephFS via CSI with
-  hot-attach; local block volumes can be moved by the plugin
-  when a pod is rescheduled to another node.
+- Storage: Proxmox CSI with shared-block and local-block
+  classes, hot-attach; local volumes follow their pods (the
+  plugin moves the disk to the new host), and optional
+  shared-file (RWX) classes via NFS or CephFS.
 - Networking fits Proxmox SDN: a tenant is an EVPN zone/VRF,
   each cluster gets its own VNet with an internal node
   subnet plus a public subnet for load-balancer IPs and the
@@ -62,7 +63,7 @@ Install the .deb on every PVE host of the cluster:
 apt install ./pve-k8s-manager_0.1.0-1_all.deb
 ```
 
-The maintainer scripts apply the four integration points in
+The maintainer scripts apply the eight integration points in
 stock pve-manager files listed in `INTEGRATION.md`
 (API registration, cluster-filesystem entry, UI view, UI
 script), idempotently and with `<file>.pve-k8s.bak` backups,
@@ -77,11 +78,13 @@ hosts that need them).
 
 ## Usage
 
-In the UI: create and manage clusters under
-Datacenter → Kubernetes. Each cluster also appears as a
-datacenter-wide resource in the left resource panel;
-selecting it opens its Overview, Nodes, Workloads, Metrics,
-Add-ons, Events, Backups and Settings as horizontal tabs.
+In the UI: Datacenter → Kubernetes holds the cluster list
+(Create/Destroy). Each cluster also appears as a
+datacenter-wide `k8s/<name>` resource in the left resource
+panel; selecting it opens the cluster page (Overview,
+Nodes with node groups, Workloads, Metrics, Add-ons,
+Events, Backups, Settings) behind a stock second sidebar.
+The full feature guide is `docs/pve-k8s.adoc`.
 Over the API, for example:
 
 ```sh
@@ -117,6 +120,10 @@ pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \
 - No automated fencing (STONITH) yet: host-failure recovery
   is manual. Do not automate power actions against a host
   whose nodes still hold etcd or VIP state.
+- Multi-arch node groups (amd64/arm64) are implemented but
+  ARM64 is untested until an ARM Proxmox host exists;
+  Kubernetes 1.37 is held until its add-ons are tested.
+  Full status list: `docs/pve-k8s.adoc` (Known limitations).
 - For fresh nested labs, LVM-thin storage is recommended
   over ZFS (memory footprint); either works on hardware.
 
@@ -131,8 +138,9 @@ pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \
 - `tests/unit/` — unit tests; `tests/lab-acceptance.sh` —
   the S1–S6 lab acceptance suite
 - `debian/` — packaging, maintainer scripts, changelog
-- `docs/` — administrator guide draft (AsciiDoc) and the
-  patch-series split prepared for a pve-devel submission
+- `docs/` — the full feature/administrator guide
+  (`pve-k8s.adoc`) and the patch-series split prepared
+  for a pve-devel submission
 
 License: AGPL-3.0 (see file headers). Design and task
 history live in `../specs/001-pve-k8s/`.
