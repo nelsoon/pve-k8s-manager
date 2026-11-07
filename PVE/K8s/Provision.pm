@@ -5812,7 +5812,9 @@ sub default_gateway_from_routes {
     return undef;
 }
 
-my sub host_default_gateway {
+# Plain package sub: provision_cluster calls it from far
+# above this declaration (lexical subs are invisible there).
+sub host_default_gateway {
     my $out = run(['ip', '-4', 'route', 'show', 'default'],
         timeout => 30);
     return default_gateway_from_routes($out)
