@@ -69,6 +69,8 @@ like($api, qr{path => '\{name\}/power'},
     'power endpoint registered');
 like($api, qr{'builder-ip'},
     'create accepts builder-ip for self-built templates');
+like($api, qr{cp-policy builder-ip},
+    'create stores builder-ip in the cluster record');
 like($src, qr/no template for \$version; building one/,
     'provision builds a missing template itself');
 my $cfg = do {

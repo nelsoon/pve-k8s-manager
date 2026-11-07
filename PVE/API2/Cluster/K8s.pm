@@ -293,7 +293,7 @@ __PACKAGE__->register_method({
                         maintenance-window backup-dir sdn-zone
                         public-subnet file-backend file-server
                         file-share cp-arch storage-profile
-                        cp-policy
+                        cp-policy builder-ip
                         backup-retention description)),
             };
 
