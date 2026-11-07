@@ -85,6 +85,18 @@ my sub run_patch {
     }
 }
 
+# Regex matching a block we inserted, tolerant of the
+# indentation style: stock JS used tabs in PVE 8 and spaces
+# in PVE 9, and apply() reuses the file's own indentation.
+my sub ws_pattern {
+    my ($text) = @_;
+    my @lines = map {
+        my ($ws, $rest) = /^([ \t]*)(.*)$/;
+        ($ws ne '' ? '[ \t]+' : '') . quotemeta($rest);
+    } split /\n/, $text, -1;
+    return join "\n", @lines;
+}
+
 my $pm = "$prefix/usr/share/perl5";
 my $js = "$prefix/usr/share/pve-manager/js";
 my $tpl = "$prefix/usr/share/pve-manager/index.html.tpl";
@@ -141,21 +153,24 @@ run_patch({
 
         my $head = substr($src, $start, $code_start - $start);
         my $changed = $head;
-        $changed =~ s/(enum => \[[^\]]*'sdn')(\])/$1, 'k8s'$2/g;
+        # PVE 9 formats the returns enum across lines and
+        # adds 'network' after 'sdn'; match either layout
+        $changed =~ s/(enum\s*=>\s*\[[^\]]*?)'sdn'/$1'sdn', 'k8s'/gs;
         return undef if $changed eq $head;
         $head = $changed;
 
         my $property = index($head, "\t\tplugintype => {");
+        $property = index($head, "plugintype => {") if $property < 0;
         return undef if $property < 0;
         substr($head, $property, 0) = $k8s_property;
         $src = substr($src, 0, $start) . $head
             . substr($src, $code_start);
 
         $code_start = index($src, "\n    code => sub {", $start);
-        my $return = index($src, "\n\treturn \$res;", $code_start);
-        return undef if $return < 0;
-        substr($src, $return, 0) = $k8s_resources_code;
-        return $src;
+        my $tail = substr($src, $code_start);
+        return undef if $tail !~ /\n[ \t]*return \$res;/;
+        $tail =~ s/(\n[ \t]*return \$res;)/$k8s_resources_code$1/;
+        return substr($src, 0, $code_start) . $tail;
     },
     remove => sub {
         my ($src) = @_;
@@ -250,16 +265,32 @@ run_patch({
         my ($src) = @_;
         # insert after the Ceph entry of the Datacenter
         # view list: its itemId line, then the closing brace
-        my $id = index($src, "\t\titemId: 'ceph',");
+        # of that entry, reusing the file's indentation
+        my $id = index($src, "itemId: 'ceph',");
         return undef if $id < 0;
-        my $close = index($src, "\t    },\n", $id);
-        return undef if $close < 0;
-        substr($src, $close + length("\t    },\n"), 0) = $dc_block;
+        my $eol = index($src, "\n", $id);
+        my ($field) = substr($src, rindex($src, "\n", $id) + 1,
+            $eol - rindex($src, "\n", $id) - 1) =~ /^([ \t]*)/;
+        # the entry's closing brace is the next line that
+        # is only a brace (iconCls/xtype lines may follow)
+        my $rest = substr($src, $eol + 1);
+        return undef if $rest !~ /\A.*?^([ \t]*)\},\n/ms;
+        my $open = $1;
+        my $block = "$open\{\n"
+            . "${field}xtype: 'pveDcK8sView',\n"
+            . "${field}title: gettext('Kubernetes'),\n"
+            . "${field}iconCls: 'fa fa-cubes',\n"
+            . "${field}itemId: 'k8s',\n"
+            . "$open\},\n";
+        $rest =~ /\A.*?^[ \t]*\},\n/ms;
+        my $at = $eol + 1 + $+[0];
+        substr($src, $at, 0) = $block;
         return $src;
     },
     remove => sub {
         my ($src) = @_;
-        $src =~ s/\Q$dc_block\E//;
+        my $pat = ws_pattern($dc_block);
+        $src =~ s/$pat//;
         return $src;
     },
 });
@@ -273,17 +304,20 @@ run_patch({
     marker => "\t    k8s: {\n\t\ticonCls: 'fa fa-cubes',",
     apply => sub {
         my ($src) = @_;
-        my $anchor = "\t    sdn: {\n"
-            . "\t\ticonCls: 'fa fa-th',\n"
-            . "\t\ttext: gettext('SDN'),\n"
-            . "\t    },\n";
-        return undef if index($src, $anchor) < 0;
-        $src =~ s/\Q$anchor\E/$anchor$resource_type/;
+        my $anchor_re = qr/^([ \t]*)sdn: \{\n([ \t]*)iconCls: 'fa fa-th',\n[ \t]*text: gettext\('SDN'\),\n[ \t]*\},\n/m;
+        return undef if $src !~ $anchor_re;
+        my ($open, $field) = ($1, $2);
+        my $block = "${open}k8s: {\n"
+            . "${field}iconCls: 'fa fa-cubes',\n"
+            . "${field}text: gettext('Kubernetes'),\n"
+            . "${open}\},\n";
+        $src =~ s/($anchor_re)/$1$block/;
         return $src;
     },
     remove => sub {
         my ($src) = @_;
-        $src =~ s/\Q$resource_type\E//;
+        my $pat = ws_pattern($resource_type);
+        $src =~ s/$pat//;
         return $src;
     },
 });
@@ -294,14 +328,25 @@ run_patch({
     marker => "case 'k8s': return 5;",
     apply => sub {
         my ($src) = @_;
-        my $anchor = "\t    case 'sdn': return 3;\n";
-        return undef if index($src, $anchor) < 0;
-        $src =~ s/\Q$anchor\E/$anchor$resource_order/;
-        return $src;
+        # PVE 8: one line; PVE 9: case and return split
+        # across lines in getTypeOrder
+        if ($src =~ /^([ \t]*)case 'sdn': return 3;\n/m) {
+            my $line = "${1}case 'k8s': return 5;\n";
+            $src =~ s/(^([ \t]*)case 'sdn': return 3;\n)/$1$line/m;
+            return $src;
+        }
+        if ($src =~ /^([ \t]*)case 'sdn':\n[ \t]*return 3;\n/m) {
+            my $line = "${1}case 'k8s':\n${1}    return 5;\n";
+            $src =~ s/(^([ \t]*)case 'sdn':\n[ \t]*return 3;\n)/$1$line/m;
+            return $src;
+        }
+        return undef;
     },
     remove => sub {
         my ($src) = @_;
-        $src =~ s/\Q$resource_order\E//;
+        my $pat = ws_pattern($resource_order);
+        $src =~ s/$pat//;
+        $src =~ s/[ \t]+case 'k8s':\n[ \t]+return 5;\n//;
         return $src;
     },
 });
@@ -332,14 +377,21 @@ run_patch({
     marker => "k8sprovision: ['Kubernetes Cluster'",
     apply => sub {
         my ($src) = @_;
-        my $anchor = "\t    acmedeactivate: ['ACME Account', gettext('Deactivate')],\n";
-        return undef if index($src, $anchor) < 0;
-        $src =~ s/\Q$anchor\E/$k8s_task_desc$anchor/;
+        return undef
+            if $src !~ /^([ \t]*)acmedeactivate: /m;
+        my $ind = $1;
+        # canonical lines start with tab+4 spaces; re-indent
+        # them to the file's own indentation
+        my @lines = split /\n/, $k8s_task_desc;
+        my $block = join '', map { "$ind" . substr($_, 5) . "\n" }
+            grep { length } @lines;
+        $src =~ s/(^([ \t]*)acmedeactivate: )/$block$1/m;
         return $src;
     },
     remove => sub {
         my ($src) = @_;
-        $src =~ s/\Q$k8s_task_desc\E//;
+        my $pat = ws_pattern($k8s_task_desc);
+        $src =~ s/$pat//;
         return $src;
     },
 });
@@ -357,14 +409,16 @@ run_patch({
             $src =~ s/\Q$legacy\E/$resource_route/;
             return $src;
         }
-        my $anchor = "\t\t\t    sdn: 'PVE.sdn.Browser',\n";
-        return undef if index($src, $anchor) < 0;
-        $src =~ s/\Q$anchor\E/$anchor$resource_route/;
+        return undef
+            if $src !~ /^([ \t]*)sdn: 'PVE\.sdn\.Browser',\n/m;
+        my $line = "${1}k8s: 'pveK8sConfig',\n";
+        $src =~ s/(^([ \t]*)sdn: 'PVE\.sdn\.Browser',\n)/$1$line/m;
         return $src;
     },
     remove => sub {
         my ($src) = @_;
-        $src =~ s/\Q$resource_route\E//;
+        my $pat = ws_pattern($resource_route);
+        $src =~ s/$pat//;
         return $src;
     },
 });
