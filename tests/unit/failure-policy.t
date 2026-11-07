@@ -45,6 +45,14 @@ cmp_ok(PVE::K8s::Provision::repair_grace('ha'), '>',
 cmp_ok(PVE::K8s::Provision::repair_grace('replace'), '>=', 300,
     'Replace grace keeps the historic 300s floor');
 
+is(PVE::K8s::Provision::default_gateway_from_routes(
+        "default via 10.0.2.1 dev vmbr0 proto kernel onlink\n"
+        . "10.0.2.0/24 dev vmbr0 proto kernel scope link\n"),
+    '10.0.2.1', 'builder gateway parsed from host routes');
+is(PVE::K8s::Provision::default_gateway_from_routes(
+        "10.0.2.0/24 dev vmbr0 proto kernel scope link\n"),
+    undef, 'no default route yields undef');
+
 # --- wiring (source-level) ----------------------------------
 my $prov = do {
     open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;

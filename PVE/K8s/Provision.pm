@@ -2142,9 +2142,16 @@ sub provision_cluster {
     # must not need operator shell work).
     if ($local_tpl_rev < 0 && $scfg->{'builder-ip'}) {
         print "no template for $version; building one\n";
+        # The builder lives on the host LAN (vmbr0), not in
+        # the cluster VNet: its gateway is this host's own
+        # default gateway, never the VNet gateway (a
+        # dedicated-VNet cluster would otherwise hand it an
+        # unreachable next hop and the build stalls with no
+        # internet - first physical install, 2026-11-07).
+        my $host_gw = host_default_gateway();
         build_template($version,
             builder_ip => $scfg->{'builder-ip'},
-            gateway => $gateway, storage => $storage,
+            gateway => $host_gw, storage => $storage,
             arch => $cp_arch);
         (undef, $local_tpl_rev) = find_template_in_list(
             qm('list'), $version, $cp_arch);
@@ -5794,6 +5801,25 @@ sub set_cluster_power {
 # the local host with a throwaway builder address taken from
 # the host's own subnet, so a fresh install can provision
 # without operator shell work. Supported versions only.
+# This host's default gateway (for the template builder,
+# which sits on the host LAN). Pure parse, unit-tested.
+sub default_gateway_from_routes {
+    my ($routes) = @_;
+
+    for my $line (split /\n/, $routes // '') {
+        return $1 if $line =~ /^default via (\d+\.\d+\.\d+\.\d+)/;
+    }
+    return undef;
+}
+
+my sub host_default_gateway {
+    my $out = run(['ip', '-4', 'route', 'show', 'default'],
+        timeout => 30);
+    return default_gateway_from_routes($out)
+        // die "cannot determine this host's default gateway "
+            . "for the template builder\n";
+}
+
 sub build_template {
     my ($version, %opts) = @_;
 
