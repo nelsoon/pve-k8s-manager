@@ -50,8 +50,13 @@ fi
     echo " address-family ipv4 unicast"
     for peer in $PEERS; do
         echo "  neighbor $peer activate"
+        # FRR >= 9 refuses eBGP updates without an inbound
+        # policy (RFC 8212); accept what the lab peers send
+        echo "  neighbor $peer route-map ACCEPT-ALL in"
     done
     echo " exit-address-family"
+    echo "!"
+    echo "route-map ACCEPT-ALL permit 10"
     echo "!"
 } > /etc/frr/frr.conf
 
