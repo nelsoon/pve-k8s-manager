@@ -249,6 +249,39 @@ anything is stored).
   both via CSI, validated by a probe before the class
   is offered.
 
+=== Storage profiles and failure policies
+
+At creation you pick one storage profile: *shared*
+(Ceph RBD node disks, shared pod volumes) or *local*
+(node-local disks and volumes). Each node group may
+override its disk storage (under its advanced fields).
+
+What happens when a node or its host fails is a
+per-group *failure policy* (control plane: `cp-policy`;
+worker groups: `policy` in the group editor):
+
+* *replace* (default) - the plugin rebuilds the node:
+  workers with a fresh VM, control-plane members
+  remove-then-add under a fresh name when the old member
+  is confirmed dead (surge add-then-remove when it is
+  still alive). If no eligible host exists, the pool
+  *parks* - shown in the Overview - and resumes when one
+  returns.
+* *ha* - Proxmox HA reboots the VM on a peer host. Only
+  selectable when that group's disk storage is shared
+  (worker groups also need shared pod storage): on local
+  disks HA would relocate the service without its disk.
+
+In both modes, node VMs are registered with
+pve-ha-manager and the datacenter shutdown policy is
+set to `migrate`, so a planned host shutdown
+live-migrates node VMs away first - local disks
+included. HA mode leaves failure restarts to Proxmox;
+Replace mode disables restarts (`max_restart=0`,
+`max_relocate=0`) and the scaler waits a grace period
+(15 min for HA groups, 5 min otherwise) before it
+replaces anything itself.
+
 == Add-ons
 
 |===

@@ -1435,6 +1435,7 @@ sub delete_cluster {
         or die "cluster '$name' does not exist\n";
 
     set_state($name, 'deleting');
+    eval { remove_ha_resources($name) };
 
     my $vmids = find_cluster_vmids($name);
     for my $vmname (sort keys $vmids->%*) {
@@ -2557,9 +2558,164 @@ sub provision_cluster {
     }
 
     store_inventory($name, \@nodes, $want_tpl_rev);
+    eval { sync_ha_resources($name, $scfg, \@nodes) };
+    print "warning: HA resource sync failed: $@" if $@;
     set_state($name, 'ready');
     print "cluster '$name' ready: $ready/$total nodes\n";
     return $total;
+}
+
+# --- Increment 6: failure policies and Proxmox HA ---------
+# HA is only honourable when the VM can actually boot on a
+# peer: its disk storage must be shared. Worker pools also
+# need shared PV storage, or their pods' volumes strand on
+# the dead host (proven live on PVE 9.2: HA relocated a
+# local-disk VM and the service landed in error). Pure and
+# unit-tested.
+sub ha_allowed {
+    my ($is_cp, $vm_shared, $pv_shared) = @_;
+
+    return $vm_shared ? 1 : 0 if $is_cp;
+    return ($vm_shared && $pv_shared) ? 1 : 0;
+}
+
+# How long the scaler waits before replacing a NotReady
+# node whose VM is silent. HA pools get longer: Proxmox may
+# be mid-fence/reboot of that same VM.
+sub repair_grace {
+    my ($policy) = @_;
+    return ($policy // '') eq 'ha' ? 900 : 300;
+}
+
+my sub ha_resource_list {
+    my $out = eval {
+        run(['pvesh', 'get', '/cluster/ha/resources',
+            '--output-format', 'json'], timeout => 60) } // '';
+    my $list = eval { decode_pvesh_json($out) } // [];
+    return ref $list eq 'ARRAY' ? $list : [];
+}
+
+# Register every node VM with pve-ha-manager, marked with a
+# pve-k8s:<cluster>:<node> comment so we only ever touch our
+# own resources. Policy ha -> a normal HA resource; policy
+# replace (or ha that shared storage cannot honour) -> the
+# same registration with restarts disabled, which still
+# buys live migration on planned host shutdown (datacenter
+# shutdown_policy=migrate, ensured here). Never fatal: a
+# cluster must not fail to converge because HA bookkeeping
+# hiccuped.
+sub sync_ha_resources {
+    my ($name, $scfg, $nodes) = @_;
+
+    my $pools = PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2);
+    my %pool_by_name = map { $_->{name} => $_ } $pools->@*;
+
+    my $storages = eval {
+        decode_pvesh_json(run(['pvesh', 'get', '/storage',
+            '--output-format', 'json'], timeout => 60)) } // [];
+    my %shared = map {
+        ($_->{storage} // '') => ($_->{shared} // 0)
+    } $storages->@*;
+    my $pv_shared = $shared{$scfg->{storage} // ''} // 0;
+
+    eval {
+        my $opts = decode_pvesh_json(run(['pvesh', 'get',
+            '/cluster/options', '--output-format', 'json'],
+            timeout => 60)) // {};
+        if (($opts->{ha} // '') !~ /shutdown_policy=migrate/) {
+            run(['pvesh', 'set', '/cluster/options',
+                '--ha', 'shutdown_policy=migrate'],
+                timeout => 60);
+            print "ha: datacenter shutdown_policy set to "
+                . "migrate (planned host shutdowns now "
+                . "live-migrate node VMs)\n";
+        }
+    };
+    print "warning: cannot ensure HA shutdown policy: $@" if $@;
+
+    my %want;
+    for my $node ($nodes->@*) {
+        my ($vmid) = ($node->{vmid} // '') =~ /^(\d+)$/ or next;
+        my $is_cp = ($node->{pool} // '') eq 'control-plane';
+        my $policy = $is_cp
+            ? ($scfg->{'cp-policy'} // 'replace')
+            : (($pool_by_name{$node->{pool} // ''} // {})
+                ->{policy} // 'replace');
+        my $sid_store = $node->{pool_storage}
+            // $scfg->{storage} // '';
+        my $vm_shared = $shared{$sid_store} // 0;
+        my $use_ha = $policy eq 'ha'
+            && ha_allowed($is_cp, $vm_shared, $pv_shared);
+        if ($policy eq 'ha' && !$use_ha) {
+            print "ha: $node->{host}: policy 'ha' refused - "
+                . ($vm_shared ? "PV storage is not shared"
+                    : "storage '$sid_store' is not shared")
+                . "; registering as replace instead\n";
+        }
+        $want{"vm:$vmid"} = {
+            ha => $use_ha,
+            comment => "pve-k8s:$name:$node->{host}",
+        };
+    }
+
+    my %existing = map {
+        ($_->{sid} // '') => $_
+    } ha_resource_list()->@*;
+    for my $sid (sort keys %existing) {
+        my $comment = $existing{$sid}{comment} // '';
+        next if $comment !~ /^\Qpve-k8s:$name:\E/;
+        next if $want{$sid};
+        eval { run(['pvesh', 'delete',
+            "/cluster/ha/resources/$sid"], timeout => 60) };
+        print "ha: removed stale resource $sid\n" if !$@;
+    }
+    for my $sid (sort keys %want) {
+        my $w = $want{$sid};
+        my @limits = $w->{ha}
+            ? () : ('--max_restart', 0, '--max_relocate', 0);
+        eval {
+            if ($existing{$sid}) {
+                run(['pvesh', 'set',
+                    "/cluster/ha/resources/$sid",
+                    '--comment', $w->{comment}], timeout => 60);
+                if ($w->{ha}) {
+                    run(['pvesh', 'set',
+                        "/cluster/ha/resources/$sid",
+                        '--delete', 'max_restart,max_relocate'],
+                        timeout => 60);
+                } else {
+                    run(['pvesh', 'set',
+                        "/cluster/ha/resources/$sid",
+                        @limits], timeout => 60);
+                }
+            } else {
+                run(['pvesh', 'create', '/cluster/ha/resources',
+                    '--sid', $sid, '--comment', $w->{comment},
+                    @limits], timeout => 60);
+            }
+        };
+        print "ha: $sid registered ("
+            . ($w->{ha} ? 'HA restart' : 'replace/no-restart')
+            . ")\n" if !$@;
+        print "warning: HA registration of $sid failed: $@"
+            if $@;
+    }
+    return 1;
+}
+
+# Drop this cluster's HA resources (cluster deletion).
+sub remove_ha_resources {
+    my ($name) = @_;
+
+    for my $res (ha_resource_list()->@*) {
+        my $comment = $res->{comment} // '';
+        next if $comment !~ /^\Qpve-k8s:$name:\E/;
+        my $sid = $res->{sid} or next;
+        eval { run(['pvesh', 'delete',
+            "/cluster/ha/resources/$sid"], timeout => 60) };
+    }
+    return 1;
 }
 
 # --- Rolling engine (T2.2) and minor upgrades (T2.3) --------
@@ -2630,6 +2786,16 @@ sub set_cluster_options {
         }
         if (defined $opts->{description}) {
             $scfg->{description} = $opts->{description};
+        }
+        if (defined $opts->{'cp-policy'}) {
+            die "cp-policy must be ha or replace\n"
+                if $opts->{'cp-policy'} !~ /^(ha|replace)$/;
+            $scfg->{'cp-policy'} = $opts->{'cp-policy'};
+        }
+        if (defined $opts->{'storage-profile'}) {
+            die "storage-profile must be shared or local\n"
+                if $opts->{'storage-profile'} !~ /^(shared|local)$/;
+            $scfg->{'storage-profile'} = $opts->{'storage-profile'};
         }
         PVE::K8s::Config::store_config($cfg);
     });
@@ -2903,6 +3069,56 @@ my sub claim_scaler_leadership {
     return $claimed;
 }
 
+# Record a node VM that could not be destroyed (its host
+# is down) as a retired ghost: if the host returns with the
+# VM still on it, check_retired_ghosts stops provisioning
+# until an operator wipes it.
+my sub record_retired_ghost {
+    my ($name, $node) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $retired = eval {
+            JSON::PP->new->decode($scfg->{'retired-nodes'} // '[]')
+        } // [];
+        push $retired->@*, { name => $node->{host},
+            vmid => $node->{vmid},
+            pvehost => $node->{pvehost}, at => time() };
+        $scfg->{'retired-nodes'} =
+            JSON::PP->new->canonical->encode($retired);
+        PVE::K8s::Config::store_config($cfg);
+    });
+    print "recorded retired ghost $node->{host} "
+        . "(vmid $node->{vmid} on $node->{pvehost})\n";
+}
+
+# Record (or clear) a parked Replace/scale-out: the pool
+# wants nodes but placement cannot satisfy it right now.
+# Kept in scaler-state so the UI/API can show it; the next
+# successful pass clears it.
+my sub set_parked_state {
+    my ($name, $msg) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $state = eval {
+            JSON::PP->new->decode($scfg->{'scaler-state'} // '{}')
+        } // {};
+        if (defined $msg) {
+            $state->{parked} = $msg;
+            $state->{'parked-at'} = time();
+        } else {
+            delete $state->{parked};
+            delete $state->{'parked-at'};
+        }
+        $scfg->{'scaler-state'} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
 my sub set_pool_size {
     my ($name, $pool_name, $size) = @_;
 
@@ -3028,6 +3244,71 @@ sub scale_reconcile {
     my $kpods = kubectl_json($cp, 'get pods -A')->{items} // [];
     my %k8s_node = map { $_->{metadata}{name} => $_ } $knodes->@*;
 
+    # CP repair (Increment 6): a control-plane node that is
+    # NotReady past its policy grace AND whose VM is silent
+    # is replaced remove-then-add: etcd member removed
+    # first (revoking any returning ghost), fresh name, new
+    # member joined by the provision pass. Only ever with
+    # a healthy quorum - without one this is restore-from-
+    # backup territory and stays manual. Policy 'ha' leaves
+    # the node to Proxmox HA entirely.
+    if (($scfg->{'cp-policy'} // 'replace') ne 'ha') {
+        my $cp_total = $scfg->{cp} // 3;
+        my $cp_ready = grep {
+            my $kn = $k8s_node{$_->{host}} or next;
+            my ($r) = grep { ($_->{type} // '') eq 'Ready' }
+                ($kn->{status}{conditions} // [])->@*;
+            $r && ($r->{status} // '') eq 'True';
+        } grep { $_->{role} eq 'cp' } @nodes;
+        for my $node (grep { $_->{role} eq 'cp' } @nodes) {
+            my $kn = $k8s_node{$node->{host}} or next;
+            my ($ready) = grep { ($_->{type} // '') eq 'Ready' }
+                ($kn->{status}{conditions} // [])->@*;
+            next if !$ready || ($ready->{status} // '') eq 'True';
+            my $since = time()
+                - iso_epoch($ready->{lastTransitionTime});
+            next if $since < repair_grace(
+                $scfg->{'cp-policy'} // 'replace');
+            my $vm_alive = eval {
+                qm_on($node->{pvehost}, 'agent',
+                    $node->{vmid}, 'ping'); 1 } // 0;
+            if ($vm_alive) {
+                print "cp-repair: $node->{host} NotReady for "
+                    . "${since}s but its VM answers; leaving "
+                    . "it alone\n";
+                next;
+            }
+            if ($cp_ready < int($cp_total / 2) + 1) {
+                print "cp-repair: $node->{host} is dead but "
+                    . "etcd quorum is not healthy ($cp_ready/"
+                    . "$cp_total CPs Ready); refusing to "
+                    . "remove a member - restore from backup "
+                    . "instead\n";
+                next;
+            }
+            print "cp-repair: replacing dead CP $node->{host} "
+                . "(NotReady ${since}s, VM silent)\n";
+            etcd_snapshot_any(\@nodes);
+            remove_node($cp, $node, \@nodes);
+            # If the host is down the VM could not be
+            # destroyed; if it is up but the VM still
+            # exists, same. Either way record the ghost so
+            # a returning host cannot rejoin it silently.
+            my ($ghost_vmid) = verify_node_vm($node);
+            my $host_online = grep {
+                $_ eq $node->{pvehost} } pve_online_nodes()->@*;
+            record_retired_ghost($name, $node)
+                if $ghost_vmid || !$host_online;
+            @nodes = grep { $_->{host} ne $node->{host} }
+                @nodes;
+            store_inventory($name, \@nodes,
+                $scfg->{'template-rev'});
+            provision_cluster($name);
+            print "cp-repair: $node->{host} replaced\n";
+            return 1;
+        }
+    }
+
     # Repair first: a worker whose kubelet is gone AND whose
     # VM does not answer is replaced; a merely unhappy
     # kubelet on a live VM is reported, never destroyed.
@@ -3037,7 +3318,9 @@ sub scale_reconcile {
             ($kn->{status}{conditions} // [])->@*;
         next if !$ready || ($ready->{status} // '') eq 'True';
         my $since = time() - iso_epoch($ready->{lastTransitionTime});
-        next if $since < 300;
+        my $grace = repair_grace(
+            ($pool_by_name{$node->{pool}} // {})->{policy});
+        next if $since < $grace;
         my $vm_alive = eval {
             qm_on($node->{pvehost}, 'agent', $node->{vmid}, 'ping'); 1
         } // 0;
@@ -3181,7 +3464,20 @@ sub scale_reconcile {
                 . " for " . scalar(@pending) . " pending pod(s)\n";
             set_pool_size($name, $pool->{name},
                 $pool->{size} + $needed);
-            provision_cluster($name);
+            my $ok = eval { provision_cluster($name); 1 } // 0;
+            if (!$ok) {
+                # Replace parks instead of spinning: the
+                # failure (no eligible host, offline pool
+                # host, template missing) is recorded and
+                # the next pass retries when it may succeed.
+                my $err = $@ // 'unknown';
+                $err =~ s/\s+/ /g;
+                set_parked_state($name,
+                    "pool $pool->{name}: $err");
+                print "scale: pool $pool->{name} parked: $err\n";
+                return 0;
+            }
+            set_parked_state($name, undef);
             return 1;
         }
         print "scale: pending pods exist but no pool can host "

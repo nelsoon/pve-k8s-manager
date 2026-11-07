@@ -66,7 +66,7 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             name: 'storage',
                             fieldLabel: gettext('Storage'),
                             store: Ext.create('Ext.data.Store', {
-                                fields: ['storage'],
+                                fields: ['storage', 'shared'],
                                 proxy: {
                                     type: 'proxmox',
                                     url: '/api2/json/storage',
@@ -78,6 +78,33 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             queryMode: 'local',
                             editable: false,
                             emptyText: gettext('Proxmox storage for node disks'),
+                        },
+                        {
+                            xtype: 'combobox',
+                            name: 'storage-profile',
+                            fieldLabel: gettext('Storage Profile'),
+                            store: [
+                                ['shared', gettext('Shared (Ceph)')],
+                                ['local', gettext('Local disks')],
+                            ],
+                            value: 'shared',
+                            editable: false,
+                        },
+                        {
+                            // HA is refused by the backend when
+                            // the disk storage is not shared;
+                            // the submit handler checks first
+                            // so the user hears it here, not
+                            // mid-provision
+                            xtype: 'combobox',
+                            name: 'cp-policy',
+                            fieldLabel: gettext('Control Plane Failure Policy'),
+                            store: [
+                                ['replace', gettext('Replace (plugin rebuilds)')],
+                                ['ha', gettext('HA (Proxmox reboots VM)')],
+                            ],
+                            value: 'replace',
+                            editable: false,
                         },
                         {
                             // select from existing SDN zones
@@ -173,6 +200,21 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                                 delete values[key];
                             }
                         });
+                        if (values['cp-policy'] === 'ha') {
+                            let sc = form.down('[name=storage]');
+                            let rec = sc && sc.getStore()
+                                ? sc.getStore().findRecord(
+                                    'storage', sc.getValue())
+                                : null;
+                            if (!rec || !rec.get('shared')) {
+                                Ext.Msg.alert(gettext('Error'),
+                                    gettext('HA needs shared storage '
+                                    + 'for the control-plane disks. '
+                                    + 'Pick a shared storage or the '
+                                    + 'Replace policy.'));
+                                return;
+                            }
+                        }
                         // worker groups are managed after
                         // creation, under Nodes; the backend
                         // default (one group of 2) applies
@@ -294,7 +336,8 @@ Ext.define('PVE.dc.K8sView', {
             fields: ['name', 'state', 'k8s-version', 'template-rev',
                 'cp', 'workers', 'node-subnet', 'gateway', 'lb-range',
                 'storage', 'sdn-zone', 'public-subnet',
-                'maintenance-window', 'pools', 'action-state'],
+                'maintenance-window', 'pools', 'action-state',
+                'storage-profile', 'cp-policy', 'scaler-state'],
             proxy: { type: 'proxmox', url: '/api2/json/cluster/k8s' },
         });
 
@@ -342,10 +385,18 @@ Ext.define('PVE.dc.K8sView', {
                         ? ' on ' + act.node : '');
                 }
             } catch (e) { /* recorded by the backend */ }
+            let parkedText = '';
+            try {
+                let ss = Ext.decode(rec['scaler-state'] || 'null');
+                if (ss && ss.parked) { parkedText = ss.parked; }
+            } catch (e) { /* recorded by the backend */ }
             let rows = [
                 ['Name', name],
                 ['State', rec.state || ''],
                 ['Running Action', actionText],
+                ['Storage Profile', rec['storage-profile'] || ''],
+                ['CP Failure Policy', rec['cp-policy'] || 'replace'],
+                ['Parked (awaiting placement)', parkedText],
                 ['Kubernetes', rec['k8s-version'] || ''],
                 ['Template Rev', rec['template-rev'] || ''],
                 ['Control Plane', rec.cp || ''],
@@ -620,7 +671,8 @@ Ext.define('PVE.dc.K8sView', {
             // groups and converges membership to them.
             let groupStore = Ext.create('Ext.data.Store', {
                 fields: ['name', 'size', 'min', 'max', 'labels',
-                    'taints', 'hosts', 'storage', 'arch', 'count'],
+                    'taints', 'hosts', 'storage', 'arch', 'policy',
+                    'count'],
             });
             let groupsGrid;
             let currentGroups = function() {
@@ -630,8 +682,8 @@ Ext.define('PVE.dc.K8sView', {
                         size: r.data.size, min: r.data.min,
                         max: r.data.max,
                     };
-                    ['labels', 'taints', 'hosts', 'storage', 'arch']
-                        .forEach(function(k) {
+                    ['labels', 'taints', 'hosts', 'storage', 'arch',
+                        'policy'].forEach(function(k) {
                             if (r.data[k]) { d[k] = r.data[k]; }
                         });
                     return d;
@@ -721,6 +773,21 @@ Ext.define('PVE.dc.K8sView', {
                             value: existing ? (existing.storage || '') : '',
                             emptyText: gettext('cluster default'),
                         },
+                        {
+                            // HA is refused by the backend
+                            // unless this group's storage (and
+                            // the pod storage) is shared
+                            xtype: 'combobox', name: 'policy',
+                            fieldLabel: gettext('Failure Policy'),
+                            store: [
+                                ['replace', gettext('Replace')],
+                                ['ha', gettext('HA (shared storage only)')],
+                            ],
+                            value: existing
+                                ? (existing.policy || 'replace')
+                                : 'replace',
+                            editable: false,
+                        },
                     ],
                 });
                 win = Ext.create('Ext.window.Window', {
@@ -746,9 +813,10 @@ Ext.define('PVE.dc.K8sView', {
                                     max: parseInt(v.max, 10),
                                 };
                                 ['labels', 'taints', 'hosts',
-                                    'storage', 'arch'].forEach(function(k) {
-                                    if (v[k]) { entry[k] = v[k]; }
-                                });
+                                    'storage', 'arch', 'policy']
+                                    .forEach(function(k) {
+                                        if (v[k]) { entry[k] = v[k]; }
+                                    });
                                 let groups = currentGroups().filter(
                                     function(gr) {
                                         return gr.name !== entry.name;
@@ -793,6 +861,7 @@ Ext.define('PVE.dc.K8sView', {
                     { text: gettext('Taints'), dataIndex: 'taints', flex: 1 },
                     { text: gettext('Hosts'), dataIndex: 'hosts', flex: 1 },
                     { text: gettext('Storage'), dataIndex: 'storage', flex: 1 },
+                    { text: gettext('Policy'), dataIndex: 'policy', width: 70 },
                 ],
                 tbar: [
                     groupBtn(gettext('Create'), function() {
@@ -1271,6 +1340,28 @@ Ext.define('PVE.dc.K8sView', {
                         value: rec['backup-retention'] || '',
                         minValue: 1, maxValue: 100,
                         emptyText: gettext('etcd backups to keep'),
+                    },
+                    {
+                        xtype: 'combobox',
+                        name: 'cp-policy',
+                        fieldLabel: gettext('Control Plane Failure Policy'),
+                        store: [
+                            ['replace', gettext('Replace (plugin rebuilds)')],
+                            ['ha', gettext('HA (Proxmox reboots VM)')],
+                        ],
+                        value: rec['cp-policy'] || 'replace',
+                        editable: false,
+                    },
+                    {
+                        xtype: 'combobox',
+                        name: 'storage-profile',
+                        fieldLabel: gettext('Storage Profile'),
+                        store: [
+                            ['shared', gettext('Shared (Ceph)')],
+                            ['local', gettext('Local disks')],
+                        ],
+                        value: rec['storage-profile'] || '',
+                        editable: false,
                     },
                     {
                         xtype: 'textfield',

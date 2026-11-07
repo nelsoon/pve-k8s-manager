@@ -202,6 +202,25 @@ my $defaultData = {
             description => "Rolling window HH:MM-HH:MM (local time).",
             optional => 1,
         },
+        'storage-profile' => {
+            type => 'string',
+            enum => ['shared', 'local'],
+            description => "Storage profile chosen at create: "
+                . "shared (Ceph RBD disks + shared PVs) or "
+                . "local (node-local disks and PVs). Presets "
+                . "the storage choices; per-pool storage "
+                . "overrides still apply.",
+            optional => 1,
+        },
+        'cp-policy' => {
+            type => 'string',
+            enum => ['ha', 'replace'],
+            description => "Control-plane failure policy: ha "
+                . "(Proxmox HA reboots CP VMs on a peer; only "
+                . "honoured on shared storage) or replace "
+                . "(plugin rebuilds failed CP members).",
+            optional => 1,
+        },
         'scaler-state' => {
             type => 'string',
             description => "Scaler leader/action state JSON (T2.4).",
@@ -275,6 +294,8 @@ sub options {
         'template-rev' => { optional => 1 },
         'upgrade-applied' => { optional => 1 },
         'maintenance-window' => { optional => 1 },
+        'storage-profile' => { optional => 1 },
+        'cp-policy' => { optional => 1 },
         'scaler-state' => { optional => 1 },
         'action-state' => { optional => 1 },
         'retired-nodes' => { optional => 1 },
@@ -390,6 +411,14 @@ sub parse_pools {
         if (defined $pool->{arch}) {
             die "pool '$name' arch must be amd64 or arm64\n"
                 if $pool->{arch} !~ /^(amd64|arm64)$/;
+        }
+        # Failure policy (Increment 6): ha lets Proxmox HA
+        # reboot the pool's VMs on a peer (shared storage
+        # only, enforced at provision); replace lets the
+        # plugin rebuild them. Absent = replace.
+        if (defined $pool->{policy}) {
+            die "pool '$name' policy must be ha or replace\n"
+                if $pool->{policy} !~ /^(ha|replace)$/;
         }
     }
     return $pools;

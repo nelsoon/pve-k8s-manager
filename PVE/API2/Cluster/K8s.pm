@@ -188,6 +188,20 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "PVE storage for node disks.",
             },
+            'storage-profile' => {
+                type => 'string',
+                enum => ['shared', 'local'],
+                optional => 1,
+                description => "Storage profile: shared (Ceph "
+                    . "RBD disks + shared PVs) or local "
+                    . "(node-local disks and PVs).",
+            },
+            'cp-policy' => {
+                type => 'string',
+                enum => ['ha', 'replace'],
+                optional => 1,
+                description => "Control-plane failure policy.",
+            },
             'maintenance-window' => {
                 type => 'string',
                 pattern => '^\d{2}:\d{2}-\d{2}:\d{2}$',
@@ -278,7 +292,8 @@ __PACKAGE__->register_method({
                     qw(node-subnet gateway lb-range pools storage
                         maintenance-window backup-dir sdn-zone
                         public-subnet file-backend file-server
-                        file-share cp-arch
+                        file-share cp-arch storage-profile
+                        cp-policy
                         backup-retention description)),
             };
 
@@ -503,6 +518,18 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Etcd backups to keep.",
             },
+            'cp-policy' => {
+                type => 'string',
+                enum => ['ha', 'replace'],
+                optional => 1,
+                description => "Control-plane failure policy.",
+            },
+            'storage-profile' => {
+                type => 'string',
+                enum => ['shared', 'local'],
+                optional => 1,
+                description => "Storage profile (shared/local).",
+            },
             description => {
                 type => 'string',
                 maxLength => 4096,
@@ -520,13 +547,17 @@ __PACKAGE__->register_method({
             if !defined $param->{'maintenance-window'}
             && !defined $param->{pools}
             && !defined $param->{'backup-retention'}
-            && !defined $param->{description};
+            && !defined $param->{description}
+            && !defined $param->{'cp-policy'}
+            && !defined $param->{'storage-profile'};
 
         PVE::K8s::Provision::set_cluster_options($param->{name}, {
             'maintenance-window' => $param->{'maintenance-window'},
             pools => $param->{pools},
             'backup-retention' => $param->{'backup-retention'},
             description => $param->{description},
+            'cp-policy' => $param->{'cp-policy'},
+            'storage-profile' => $param->{'storage-profile'},
         });
 
         return undef;
