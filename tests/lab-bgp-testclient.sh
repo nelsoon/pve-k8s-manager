@@ -55,7 +55,11 @@ fi
     echo "!"
 } > /etc/frr/frr.conf
 
-systemctl enable --now frr
+# Restart, not just enable --now: the package may already
+# have the service running with bgpd disabled, and only a
+# restart re-reads /etc/frr/daemons.
+systemctl enable frr
+systemctl restart frr
 sleep 3
 systemctl is-active frr
 vtysh -c 'show bgp summary' || true
