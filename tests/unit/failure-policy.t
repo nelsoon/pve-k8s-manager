@@ -94,5 +94,7 @@ like($js, qr/name: 'policy',\n\s+fieldLabel: gettext\('Failure Policy'\)/,
     'node group editor has a failure policy');
 like($js, qr/Parked \(awaiting placement\)/,
     'overview surfaces a parked pool');
+like($prov, qr/template_storage_shared\(\$canon_id\)/,
+    'shared-storage templates are cloned centrally, not copied per host');
 
 done_testing();

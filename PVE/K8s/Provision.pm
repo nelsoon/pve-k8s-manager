@@ -551,6 +551,27 @@ my sub ensure_template_rev_on {
     return $copy_id;
 }
 
+# Does the canonical template's disk live on shared
+# storage? Then every host can clone it directly and no
+# per-host copies are needed (T2.1's design; the check was
+# missing and shared installs silently got a copy per host
+# anyway - first physical install, 2026-11-07).
+my sub template_storage_shared {
+    my ($canon_id) = @_;
+
+    my $cfg = eval { qm('config', $canon_id) } // '';
+    my ($store) = $cfg =~ /^(?:scsi0|virtio0|sata0): ([^:\s,]+)/m;
+    return 0 if !$store;
+    my $list = eval {
+        decode_pvesh_json(run(['pvesh', 'get', '/storage',
+            '--output-format', 'json'], timeout => 60)) } // [];
+    for my $s ($list->@*) {
+        return ($s->{shared} // 0) ? 1 : 0
+            if ($s->{storage} // '') eq $store;
+    }
+    return 0;
+}
+
 # Template distribution (T2.1): on nothing-shared storage a
 # copy is made lazily, once per revision, only on hosts where
 # a node is placed (clone locally, migrate the copy, mark it
@@ -559,6 +580,7 @@ my sub ensure_template_on {
     my ($host, $k8s_version, $canon_id, $arch) = @_;
 
     return $canon_id if $host eq local_node_name();
+    return $canon_id if template_storage_shared($canon_id);
     my ($canon_rev) = (find_template_in_list(
         qm('list'), $k8s_version, $arch))[1];
     my ($existing, $existing_rev) = find_template_in_list(
