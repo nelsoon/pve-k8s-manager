@@ -525,6 +525,8 @@ my sub ensure_template_rev_on {
         return undef;
     };
     if (my $id = $on->($host)) {
+        ensure_template_ha($id)
+            if template_storage_shared($id);
         return $id;
     }
     my ($src_host, $src_id);
@@ -537,6 +539,14 @@ my sub ensure_template_rev_on {
     }
     die "no template $tpl_name on any online host; build it first (images/)\n"
         if !defined $src_id;
+    if (template_storage_shared($src_id)) {
+        # Shared storage: no per-host copy (single central
+        # template by design); the clone path runs on the
+        # owner with --target, and HA keeps the owner
+        # config relocatable.
+        ensure_template_ha($src_id);
+        return $src_id;
+    }
     my $copy_id = run(['pvesh', 'get', '/cluster/nextid'], timeout => 60);
     $copy_id =~ s/\D//g;
     print "distributing template $tpl_name to $host (vmid $copy_id)\n";
@@ -556,10 +566,22 @@ my sub ensure_template_rev_on {
 # per-host copies are needed (T2.1's design; the check was
 # missing and shared installs silently got a copy per host
 # anyway - first physical install, 2026-11-07).
-my sub template_storage_shared {
+# Plain package sub, not lexical: ensure_template_rev_on
+# above this point calls it, and a lexical declared here
+# would be invisible there.
+sub template_storage_shared {
     my ($canon_id) = @_;
 
     my $cfg = eval { qm('config', $canon_id) } // '';
+    if ($cfg !~ /^(?:scsi0|virtio0|sata0):/m) {
+        # qm only reads configs homed on this host; the
+        # pmxcfs copy is readable from every host (T4.2:
+        # provision running on a peer of the template's
+        # down owner still needs the answer).
+        $cfg = eval { run(['sh', '-c',
+            "cat /etc/pve/nodes/*/qemu-server/$canon_id.conf"],
+            timeout => 60) } // '';
+    }
     my ($store) = $cfg =~ /^(?:scsi0|virtio0|sata0): ([^:\s,]+)/m;
     return 0 if !$store;
     my $list = eval {
@@ -574,6 +596,56 @@ my sub template_storage_shared {
 
 # Which host owns a template VM's config (qm clone must
 # run there). Searches the cluster VM inventory by vmid.
+# The single central template (shared-storage installs)
+# is one host's config away from being unusable: qm clone
+# only runs where the config lives. Register it with
+# pve-ha-manager in state stopped - HA never starts it
+# (it is a template), but on host shutdown or failure HA
+# relocates the config to a surviving host, the same way
+# it moves any managed VM (T4.2, user direction; the
+# pattern is the documented cluster-wide-template trick).
+# Nothing-shared installs do not need this: they already
+# keep one copy per host (ensure_template_on).
+sub ensure_template_ha {
+    my ($tpl_vmid) = @_;
+
+    return if !$tpl_vmid;
+    my $sid = "vm:$tpl_vmid";
+    # ha_resource_list is lexical and declared later; read
+    # the resource list directly here.
+    my $resources = eval {
+        decode_pvesh_json(run(['pvesh', 'get',
+            '/cluster/ha/resources',
+            '--output-format', 'json'], timeout => 60))
+    } // [];
+    my ($existing) = grep {
+        ($_->{sid} // '') eq $sid } $resources->@*;
+    if (!$existing) {
+        eval { run(['pvesh', 'create', '/cluster/ha/resources',
+            '--sid', $sid, '--state', 'stopped',
+            '--comment', 'pve-k8s:template'], timeout => 60) };
+        print "ha: template $tpl_vmid registered "
+            . "(state stopped)\n" if !$@;
+        print "warning: HA registration of template "
+            . "$tpl_vmid failed: $@" if $@;
+    } elsif (($existing->{state} // '') ne 'stopped') {
+        eval { run(['pvesh', 'set',
+            "/cluster/ha/resources/$sid",
+            '--state', 'stopped'], timeout => 60) };
+    }
+}
+
+# Drop a template's HA registration before destroying it,
+# so the HA manager never chases a VM that is gone.
+sub drop_template_ha {
+    my ($tpl_vmid) = @_;
+
+    return if !$tpl_vmid;
+    eval { run(['pvesh', 'delete',
+        "/cluster/ha/resources/vm:$tpl_vmid"],
+        timeout => 60) };
+}
+
 my sub template_owner_host {
     my ($tpl_vmid) = @_;
 
@@ -592,8 +664,13 @@ my sub template_owner_host {
 my sub ensure_template_on {
     my ($host, $k8s_version, $canon_id, $arch) = @_;
 
+    if (template_storage_shared($canon_id)) {
+        # the central template gets HA relocation cover;
+        # per-host copies further down do not need it
+        ensure_template_ha($canon_id);
+        return $canon_id;
+    }
     return $canon_id if $host eq local_node_name();
-    return $canon_id if template_storage_shared($canon_id);
     my ($canon_rev) = (find_template_in_list(
         qm('list'), $k8s_version, $arch))[1];
     my ($existing, $existing_rev) = find_template_in_list(
@@ -608,6 +685,7 @@ my sub ensure_template_on {
             my $other = qm('config', $1);
             next if $other =~ /^template:/m;
             print "removing stale template copy $1\n";
+            drop_template_ha($1);
             qm('destroy', $1, '--purge');
         }
     }
@@ -621,6 +699,7 @@ my sub ensure_template_on {
     qm_on($host, 'template', $copy_id);
     # prune the superseded revision copy on this host
     if (defined $existing && $existing != $copy_id) {
+        drop_template_ha($existing);
         eval { qm_on($host, 'destroy', $existing, '--purge') };
         print "pruned stale template r$existing_rev on $host\n";
     }
@@ -1820,9 +1899,23 @@ sub create_node_vm {
         # A shared-storage template is cloned from its own
         # host with --target: qm clone refuses to run where
         # the template's config does not live (exit 2, first
-        # physical install).
+        # physical install). The owner is kept alive by HA:
+        # the template is registered as an HA resource in
+        # state stopped (ensure_template_ha), so Proxmox
+        # relocates its config when the owner host dies.
         my $tpl_host = template_owner_host($tpl);
         if ($tpl_host && $tpl_host ne $target) {
+            # The template is HA-registered (state stopped),
+            # so a dead owner's config should already have
+            # relocated; if it has not, say so plainly
+            # instead of dying inside an ssh to a dead host.
+            my %online = map { $_ => 1 }
+                pve_online_nodes()->@*;
+            die "template $tpl lives on $tpl_host, which is "
+                . "down, and HA has not relocated it yet; "
+                . "cannot create $node->{host} until it "
+                . "moves or $tpl_host returns\n"
+                if !$online{$tpl_host};
             push @clone, '--target', $target;
             qm_on($tpl_host, @clone);
         } else {
@@ -1932,17 +2025,18 @@ my sub assert_cluster_hosts_online {
     # Hosts already carrying this cluster's nodes are the
     # only hard stop; other offline hosts are simply skipped
     # by placement (it already chooses among online hosts).
+    # Locations come from the LIVE inventory, never the
+    # recorded one: HA may have moved a VM to another host
+    # (T4.2: vm102 fence-restarted from cloud1 to cloud2
+    # while the record still says cloud1), and blocking on
+    # the stale record refuses work no dead host is needed
+    # for - including a scale-up whose template sits on
+    # shared storage.
+    my $vms = cluster_vms();
     my %cluster_hosts;
-    if ($scfg->{nodes}) {
-        my $inventory = eval {
-            JSON::PP->new->decode($scfg->{nodes}) } // [];
-        $cluster_hosts{$_->{pvehost}} = 1 for $inventory->@*;
-    } else {
-        my $vms = cluster_vms();
-        for my $vmname (keys $vms->%*) {
-            $cluster_hosts{$vms->{$vmname}{node}} = 1
-                if $vmname =~ /^\Q$name\E-/;
-        }
+    for my $vmname (keys $vms->%*) {
+        $cluster_hosts{$vms->{$vmname}{node}} = 1
+            if $vmname =~ /^\Q$name\E-/;
     }
     my @blocking = grep { $cluster_hosts{$_} } sort keys %offline;
     die "Proxmox host(s) offline: " . join(', ', @blocking)
@@ -2200,11 +2294,36 @@ sub provision_cluster {
     my $cp_arch = $scfg->{'cp-arch'} // 'amd64';
     my (undef, $local_tpl_rev) = find_template_in_list(
         qm('list'), $version, $cp_arch);
+    # The template may live on another host - including a
+    # down one (T4.2: provision re-run from a peer while
+    # the template's host was off). Look cluster-wide
+    # before deciding there is nothing to clone, and never
+    # "build" a replacement for a template the record
+    # knows exists: the builder would collide with it.
+    my $any_tpl_rev = $local_tpl_rev;
+    for my $h (pve_online_nodes()->@*) {
+        next if $h eq local_node_name();
+        my (undef, $r) = find_template_in_list(
+            eval { qm_on($h, 'list') } // '',
+            $version, $cp_arch);
+        $any_tpl_rev = $r if $r > $any_tpl_rev;
+    }
+    if ($any_tpl_rev < 0
+        && defined $scfg->{'template-rev'}
+        && $scfg->{'template-rev'} >= 0) {
+        die "template k8s-node-$version-r"
+            . "$scfg->{'template-rev'} is recorded for "
+            . "cluster '$name' but is not visible on any "
+            . "online host; its host is likely down (the "
+            . "template is HA-registered and its config "
+            . "relocates - retry once it lands)\n";
+    }
     # No template anywhere yet and the cluster recorded a
     # builder address: the plugin builds its own template
     # instead of dying "build one first" (fresh installs
     # must not need operator shell work).
-    if ($local_tpl_rev < 0 && $scfg->{'builder-ip'}) {
+    if ($local_tpl_rev < 0 && $any_tpl_rev < 0
+        && $scfg->{'builder-ip'}) {
         print "no template for $version; building one\n";
         # The builder lives on the host LAN (vmbr0), not in
         # the cluster VNet: its gateway is this host's own
@@ -2220,8 +2339,10 @@ sub provision_cluster {
         (undef, $local_tpl_rev) = find_template_in_list(
             qm('list'), $version, $cp_arch);
     }
+    my $best_tpl_rev = $local_tpl_rev > $any_tpl_rev
+        ? $local_tpl_rev : $any_tpl_rev;
     my $want_tpl_rev = wanted_roll_rev(
-        $scfg->{'template-rev'}, $local_tpl_rev, 0);
+        $scfg->{'template-rev'}, $best_tpl_rev, 0);
     my $template = ensure_template_rev_on(
         local_node_name(), $version, $want_tpl_rev, $cp_arch);
     print "using template vmid $template for Kubernetes $version\n";
@@ -3619,6 +3740,19 @@ sub scale_reconcile {
         next if !$node || $node->{role} ne 'worker';
         my $pool = $pool_by_name{$node->{pool}} or next;
         next if $pool->{size} <= ($pool->{min} // $pool->{size});
+        # Never scale in at or below the desired size: an
+        # idle-looking node is still a wanted member when
+        # the pool is under-provisioned (T4.2: a pass at
+        # size 3 with 2 live workers removed one instead
+        # of converging up). Count live k8s nodes, not the
+        # record - a deleted Node object must not read as
+        # spare capacity either.
+        my $live = grep {
+            my $pl = $_->{metadata}{labels}
+                {'pve-k8s.proxmox.com/pool'} // '';
+            $pl eq $node->{pool};
+        } values %k8s_node;
+        next if $live <= $pool->{size};
         my @pool_nodes = grep { $_->{pool} eq $node->{pool} } @nodes;
         my $last = (sort { $b->{idx} <=> $a->{idx} } @pool_nodes)[0];
         next if $last->{host} ne $host;
@@ -6102,6 +6236,8 @@ sub build_template {
     die "template build finished but no k8s-node-$version "
         . "template appeared\n" if !$found;
     print "template k8s-node-$version built (vmid $found)\n";
+    ensure_template_ha($found)
+        if template_storage_shared($found);
     return $found;
 }
 

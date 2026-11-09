@@ -98,6 +98,34 @@ like($prov, qr/template_storage_shared\(\$canon_id\)/,
     'shared-storage templates are cloned centrally, not copied per host');
 like($prov, qr/'--target', \$target/,
     'shared template clones run on the template host with --target');
+# T4.2 (user direction): the central shared template is
+# HA-registered in state stopped so Proxmox relocates its
+# config when the owner host dies; qm clone then runs on
+# the new owner as before. No hand-rolled clone.
+like($prov, qr/sub ensure_template_ha/,
+    'template HA registration exists');
+like($prov, qr/'--state', 'stopped'/,
+    'template registered stopped (relocate, never start)');
+like($prov, qr/ensure_template_ha\(\$canon_id\)/,
+    'shared central template gets HA cover at clone time');
+like($prov, qr/sub drop_template_ha/,
+    'template HA unregistration exists');
+like($prov, qr/HA has not relocated it yet/,
+    'dead owner without relocation dies with a clear message');
+unlike($prov, qr/manual_clone_shared/,
+    'no hand-rolled rbd clone path');
+# T4.2 companion fixes: the offline-host guard and the
+# scale-in gate both read LIVE state, not records.
+like($prov, qr/Locations come from the LIVE inventory/,
+    'offline-host guard uses live VM locations');
+like($prov, qr/Never scale in at or below the desired size/,
+    'scaler never scales in at or below desired size');
+like($prov, qr/any_tpl_rev/,
+    'provision looks for the template cluster-wide');
+like($prov, qr/not visible on any/,
+    'recorded-but-invisible template dies clearly, no rebuild');
+like($prov, qr/pmxcfs copy is readable from every host/,
+    'shared-storage check works from a peer host');
 like($prov, qr/resource-affinity/,
     'CP VMs get a negative-affinity HA rule');
 like($prov, qr|/cluster/ha/rules/k8s-|,
