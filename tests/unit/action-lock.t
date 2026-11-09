@@ -51,6 +51,17 @@ like($prov, qr/sub run_cluster_action/,
 like($prov, qr/heartbeat/i, 'long actions heartbeat their claim');
 like($prov, qr/open STDOUT, '>', '\/dev\/null'/,
     'heartbeat child detaches from the task log pipe');
+# P9: the heartbeat child must replace the worker's inherited
+# die-on-signal handlers before anything else, or the TERM
+# that ends it writes a spurious "TASK ERROR: received
+# interrupt" into the task log via the inherited fork_worker
+# frame.
+my ($hb) = $prov =~ /(my \$heartbeat = fork\(\);.+?POSIX::_exit\(0\);)/s;
+ok($hb, 'heartbeat child block found');
+like($hb // '', qr/\$SIG\{TERM\} = sub \{ POSIX::_exit\(0\) \}/,
+    'heartbeat child exits silently on TERM');
+like($hb // '', qr/\$SIG\{INT\} = \$SIG\{QUIT\} = 'IGNORE'/,
+    'heartbeat child ignores INT/QUIT instead of dying');
 ok((grep { /fork_cluster_worker\(/ } split /\n/, $api) >= 14,
     'every mutating task endpoint goes through the action guard');
 unlike($api, qr/fork_worker\('k8s/,

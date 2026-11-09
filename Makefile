@@ -46,6 +46,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/resource-tree.t
 	@perl -I. -Itests/stubs tests/unit/action-lock.t
 	@perl -I. -Itests/stubs tests/unit/failure-policy.t
+	@perl -I. -Itests/stubs tests/unit/summary.t
 	@perl -I. -Itests/stubs tests/unit/arch-pools.t
 	@dpkg-deb -I $(DEB) | grep -q "Package: $(PACKAGE)" && echo "deb ok: $(DEB)"
 

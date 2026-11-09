@@ -89,6 +89,33 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             ],
                             value: 'shared',
                             editable: false,
+                            listeners: {
+                                // preselect the first storage
+                                // matching the profile, so the
+                                // common case needs no second
+                                // decision (Increment 7)
+                                change: function(combo, profile) {
+                                    let sc = combo.up('window')
+                                        .down('[name=storage]');
+                                    if (!sc || !sc.getStore()) {
+                                        return;
+                                    }
+                                    let want = profile === 'shared'
+                                        ? 1 : 0;
+                                    let found = null;
+                                    sc.getStore().each(function(r) {
+                                        if (!found
+                                            && (r.get('shared') ? 1 : 0)
+                                                === want) {
+                                            found = r;
+                                        }
+                                    });
+                                    if (found) {
+                                        sc.setValue(
+                                            found.get('storage'));
+                                    }
+                                },
+                            },
                         },
                         {
                             // HA is refused by the backend when
@@ -124,6 +151,23 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             queryMode: 'local',
                             editable: false,
                             emptyText: gettext('dedicated VNet mode (with Public Subnet)'),
+                            listeners: {
+                                // a single SDN zone needs no
+                                // decision: preselect it
+                                afterrender: function(combo) {
+                                    let pick = function(store) {
+                                        if (store.getCount() === 1
+                                            && !combo.getValue()) {
+                                            combo.setValue(store
+                                                .getAt(0).get('zone'));
+                                        }
+                                    };
+                                    combo.getStore().on('load', pick);
+                                    if (combo.getStore().isLoaded()) {
+                                        pick(combo.getStore());
+                                    }
+                                },
+                            },
                         },
                         {
                             xtype: 'displayfield',
@@ -441,6 +485,89 @@ Ext.define('PVE.dc.K8sView', {
                     certInfo.setValue(gettext('unknown'));
                 },
             });
+            // Visual Summary (Increment 7): verdict banner,
+            // readiness counts and node capacity bars fed by
+            // the /summary aggregate; each piece degrades to
+            // 'unknown' instead of breaking the panel.
+            let healthInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Health'),
+                value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let nodesInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Nodes'),
+                value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let lbInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('LoadBalancer IPs'),
+                value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let backupInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Last Backup'),
+                value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let summaryBarMem = Ext.create('Ext.ProgressBar', {
+                value: 0,
+                text: gettext('Node memory: loading...'),
+            });
+            let summaryBarCpu = Ext.create('Ext.ProgressBar', {
+                value: 0,
+                text: gettext('Node CPU: loading...'),
+            });
+            api({
+                url: '/cluster/k8s/' + name + '/summary',
+                method: 'GET',
+                success: function(r) {
+                    let s = r.result.data || {};
+                    let icons = {
+                        ok: 'fa fa-check good',
+                        degraded: 'fa fa-exclamation-triangle warning',
+                        down: 'fa fa-times critical',
+                    };
+                    let icon = icons[s.health]
+                        || 'fa fa-question-circle warning';
+                    healthInfo.setValue('<i class="' + icon
+                        + '"></i> ' + Ext.htmlEncode(
+                            String(s.health || 'unknown')));
+                    nodesInfo.setValue(s.nodes_ready !== undefined
+                        && s.nodes_ready !== null
+                        ? Ext.String.format(gettext(
+                            '{0}/{1} Ready (control plane {2}/{3})'),
+                            s.nodes_ready, s.nodes_total,
+                            s.cp_ready, s.cp)
+                        : gettext('unknown'));
+                    lbInfo.setValue(s.lb
+                        ? Ext.String.format(gettext('{0} of {1} used'),
+                            s.lb.used, s.lb.total)
+                        : gettext('unknown'));
+                    backupInfo.setValue(s.backup
+                        ? Ext.Date.format(
+                            new Date(s.backup.last * 1000),
+                            'Y-m-d H:i')
+                        : gettext('none'));
+                    if (s.capacity) {
+                        summaryBarMem.updateProgress(
+                            s.capacity.mem_pct / 100,
+                            Ext.String.format(gettext(
+                                'Node memory: {0}%'),
+                                s.capacity.mem_pct));
+                        summaryBarCpu.updateProgress(
+                            s.capacity.cpu_pct / 100,
+                            Ext.String.format(gettext(
+                                'Node CPU: {0}%'),
+                                s.capacity.cpu_pct));
+                    }
+                },
+                failure: function() {
+                    healthInfo.setValue(gettext('unknown'));
+                    nodesInfo.setValue(gettext('unknown'));
+                    lbInfo.setValue(gettext('unknown'));
+                    backupInfo.setValue(gettext('unknown'));
+                },
+            });
             let act = function(label, icon, fn) {
                 return {
                     text: label, iconCls: icon,
@@ -573,7 +700,9 @@ Ext.define('PVE.dc.K8sView', {
                             value: value,
                             labelWidth: 160,
                         };
-                    }).concat([certInfo]),
+                    }).concat([healthInfo, nodesInfo, lbInfo,
+                        backupInfo, summaryBarMem, summaryBarCpu,
+                        certInfo]),
                 }],
             });
         };

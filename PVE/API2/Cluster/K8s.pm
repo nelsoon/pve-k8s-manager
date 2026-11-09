@@ -1205,6 +1205,37 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'summary',
+    path => '{name}/summary',
+    method => 'GET',
+    protected => 1, # aggregates kubectl via qm guest exec
+    description => "Visual Summary data for one cluster: "
+        . "health verdict, node readiness, node VM capacity, "
+        . "LoadBalancer usage, last backup, worst "
+        . "certificate expiry. Live pieces degrade to "
+        . "absent fields instead of failing.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::summary_cluster(
+            $param->{name});
+    }});
+
+__PACKAGE__->register_method({
     name => 'delete',
     path => '{name}',
     method => 'DELETE',

@@ -786,6 +786,18 @@ sub run_cluster_action {
     my $worker_pid = $$;
     my $heartbeat = fork();
     if (defined $heartbeat && $heartbeat == 0) {
+        # Own signal handlers FIRST: the child inherits the
+        # worker's die-on-INT/QUIT/TERM handlers installed by
+        # PVE::RESTEnvironment::fork_worker. Our own TERM
+        # below then made the child die "received interrupt",
+        # the exception unwound into the child's copy of the
+        # fork_worker frame, and that frame wrote a spurious
+        # "TASK ERROR: received interrupt" result into the
+        # task log next to the real TASK OK (P9, root-caused
+        # 2026-11-09 on a successful k8sdelete).
+        require POSIX;
+        $SIG{TERM} = sub { POSIX::_exit(0) };
+        $SIG{INT} = $SIG{QUIT} = 'IGNORE';
         # Detach from the worker's stdio first: the child
         # inherits the PVE task-log pipe, and holding it
         # open past the worker's exit corrupts the task
@@ -2621,6 +2633,19 @@ sub provision_cluster {
     print "warning: HA resource sync failed: $@" if $@;
     set_state($name, 'ready');
     print "cluster '$name' ready: $ready/$total nodes\n";
+
+    # metrics-server ships by default (Increment 7): pod
+    # metrics are table stakes for the Summary/Metrics
+    # panels. Only an explicit disable (tombstone in the
+    # add-on state) keeps it off; enable/disable in the
+    # Add-ons panel still owns it afterwards.
+    my $astate = addons_state($scfg);
+    if (!$astate->{'metrics-server'}) {
+        my $ok = eval {
+            enable_addon($name, 'metrics-server', {}); 1 } // 0;
+        print "warning: default metrics-server install "
+            . "failed: $@" if !$ok;
+    }
     return $total;
 }
 
@@ -5169,7 +5194,8 @@ sub list_addons {
         my $conf = $state->{'metrics-server'};
         push @addons, {
             name => 'metrics-server',
-            status => $conf ? 'configured' : 'unconfigured',
+            status => !$conf ? 'unconfigured'
+                : $conf->{disabled} ? 'disabled' : 'configured',
             mustdeploy => 0,
             summary => 'Pod/node CPU+memory metrics '
                 . '(kubectl top; feeds the Metrics panel)',
@@ -5280,7 +5306,11 @@ sub disable_addon {
     PVE::K8s::Config::lock_config(sub {
         my $locked = PVE::K8s::Config->config();
         my $state = addons_state($locked->{ids}->{$name});
-        delete $state->{$addon};
+        # Tombstone, not a delete: provision installs
+        # metrics-server by default, and only this marker
+        # distinguishes "user turned it off" from "never
+        # asked" (Increment 7).
+        $state->{$addon} = { disabled => 1 };
         $locked->{ids}->{$name}->{addons} =
             JSON::PP->new->canonical->encode($state);
         PVE::K8s::Config::store_config($locked);
@@ -5822,7 +5852,8 @@ sub metrics_cluster {
         push @node_rows, $row;
     }
     my $state = addons_state($scfg);
-    my $have_ms = $state->{'metrics-server'} ? 1 : 0;
+    my $have_ms = ($state->{'metrics-server'}
+        && !$state->{'metrics-server'}{disabled}) ? 1 : 0;
     my @pod_rows;
     if ($have_ms) {
         my $cp = ops_cp($nodes);
@@ -5832,6 +5863,135 @@ sub metrics_cluster {
     }
     return { nodes => \@node_rows, pods => \@pod_rows,
         metrics_server => $have_ms };
+}
+
+# --- Increment 7: visual Summary data ---------------------
+# One aggregate read for the cluster Summary panel. Every
+# live piece is eval-guarded: a Summary that 500s exactly
+# when the cluster is down would be useless. The verdict
+# itself is pure and unit-tested.
+sub summary_health {
+    my ($state, $cp_total, $cp_ready, $ready, $total) = @_;
+
+    return $state // 'unknown' if ($state // '') ne 'ready';
+    return 'unknown' if !defined $total;
+    my $quorum = int(($cp_total // 0) / 2) + 1;
+    return 'down' if ($cp_ready // 0) < $quorum;
+    return 'degraded' if $ready < $total || $cp_ready < $cp_total;
+    return 'ok';
+}
+
+# Worst leaf-certificate lifetime. CA rows report no day
+# count (multi-year residual) and must not read as expired.
+sub worst_cert_days {
+    my ($certs) = @_;
+
+    my @days = grep { defined }
+        map { $_->{days} } $certs->@*;
+    return undef if !@days;
+    my ($worst) = sort { $a <=> $b } @days;
+    return $worst;
+}
+
+sub lb_pool_size {
+    my ($scfg) = @_;
+
+    if (($scfg->{'lb-range'} // '') =~
+        /^(\d+\.\d+\.\d+)\.(\d+)-(\d+\.\d+\.\d+)\.(\d+)$/) {
+        return $4 - $2 + 1;
+    }
+    return $scfg->{'public-subnet'} ? 21 : 0;
+}
+
+sub summary_cluster {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $out = {
+        name => $name,
+        state => $scfg->{state} // '',
+        'k8s-version' => $scfg->{'k8s-version'},
+        cp => $scfg->{cp} // 0,
+        nodes_total => scalar $nodes->@*,
+        nodes_ready => undef,
+        cp_ready => undef,
+        action => cluster_action_describe($name,
+            cluster_action_record($name)),
+        'storage-profile' => $scfg->{'storage-profile'},
+        'cp-policy' => $scfg->{'cp-policy'} // 'replace',
+    };
+
+    my $live = eval {
+        my $cp = ops_cp($nodes);
+        my $data = kubectl_json($cp, 'get nodes');
+        my ($ready, $cp_ready) = (0, 0);
+        for my $n (($data->{items} // [])->@*) {
+            my ($r) = grep { ($_->{type} // '') eq 'Ready' }
+                ($n->{status}{conditions} // [])->@*;
+            my $is_ready = $r && ($r->{status} // '') eq 'True';
+            $ready++ if $is_ready;
+            $cp_ready++ if $is_ready
+                && exists $n->{metadata}{labels}
+                    {'node-role.kubernetes.io/control-plane'};
+        }
+        $out->{nodes_ready} = $ready;
+        $out->{cp_ready} = $cp_ready;
+        $out->{nodes_total} = scalar(($data->{items} // [])->@*)
+            || $out->{nodes_total};
+
+        my $wl = eval { workloads_cluster($name) } // {};
+        my @pods = ($wl->{pods} // [])->@*;
+        $out->{pods} = {
+            total => scalar @pods,
+            running => scalar(grep {
+                ($_->{status} // '') eq 'Running' } @pods),
+            pending => scalar(grep {
+                ($_->{status} // '') eq 'Pending' } @pods),
+        };
+        my @lb = grep { ($_->{type} // '') eq 'LoadBalancer' }
+            ($wl->{services} // [])->@*;
+        $out->{lb} = {
+            used => scalar(grep {
+                ($_->{externalip} // 'pending') ne 'pending' } @lb),
+            total => lb_pool_size($scfg),
+        };
+        1;
+    } // 0;
+    $out->{live} = $live ? 1 : 0;
+
+    my $metrics = eval { metrics_cluster($name) } // {};
+    my ($mem, $maxmem, $cpu, $cpu_n) = (0, 0, 0, 0);
+    for my $n (($metrics->{nodes} // [])->@*) {
+        next if !defined $n->{maxmem};
+        $mem += $n->{mem} // 0;
+        $maxmem += $n->{maxmem};
+        $cpu += $n->{cpu} // 0;
+        $cpu_n++;
+    }
+    $out->{capacity} = $maxmem ? {
+        mem_used => $mem, mem_total => $maxmem,
+        mem_pct => int(100 * $mem / $maxmem),
+        cpu_pct => $cpu_n ? int(100 * $cpu / $cpu_n) : 0,
+        metrics_server => $metrics->{metrics_server} // 0,
+    } : undef;
+
+    my $backups = eval { list_backups($name) } // [];
+    if ($backups->@*) {
+        my ($last) = sort { $b <=> $a }
+            map { $_->{mtime} // 0 } $backups->@*;
+        $out->{backup} = { count => scalar $backups->@*,
+            last => $last };
+    }
+    my $certs = eval { cert_expiry($name) } // [];
+    my $worst = worst_cert_days($certs);
+    $out->{cert_days} = $worst if defined $worst;
+    $out->{health} = summary_health($out->{state},
+        $out->{cp}, $out->{cp_ready}, $out->{nodes_ready},
+        $out->{live} ? $out->{nodes_total} : undef);
+    return $out;
 }
 
 sub cert_expiry {
