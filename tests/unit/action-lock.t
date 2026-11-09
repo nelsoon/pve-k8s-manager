@@ -62,6 +62,10 @@ like($hb // '', qr/\$SIG\{TERM\} = sub \{ POSIX::_exit\(0\) \}/,
     'heartbeat child exits silently on TERM');
 like($hb // '', qr/\$SIG\{INT\} = \$SIG\{QUIT\} = 'IGNORE'/,
     'heartbeat child ignores INT/QUIT instead of dying');
+like($prov, qr/sub action_task_finished/,
+    'claim liveness checks the recorded task status');
+like($prov, qr/finished without releasing its claim/,
+    'claims of finished tasks are reclaimed, not waited out');
 ok((grep { /fork_cluster_worker\(/ } split /\n/, $api) >= 14,
     'every mutating task endpoint goes through the action guard');
 unlike($api, qr/fork_worker\('k8s/,

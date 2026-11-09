@@ -238,6 +238,7 @@ parameters:
   clusterID: $fsid
   fsName: $fs
   pool: cephfs.${fs}.data
+  mounter: fuse
   csi.storage.k8s.io/provisioner-secret-name: csi-cephfs-secret
   csi.storage.k8s.io/provisioner-secret-namespace: kube-system
   csi.storage.k8s.io/controller-expand-secret-name: csi-cephfs-secret
@@ -265,6 +266,14 @@ csiConfig:
   - clusterID: "%s"
     monitors: [%s]
     cephFS: {}
+# The StorageClass selects FUSE mounts: current Ceph
+# issues 32-byte CephX secrets and every guest kernel
+# we tested (6.1 and 6.12) rejects them at mount time
+# ("libceph: secret too big 32"). ceph-csi's bundled
+# ceph-fuse (librados) handles them natively. OnDelete
+# strategy is the chart's recommendation for FUSE.
+nodeplugin:
+  updateStrategy: OnDelete
 # The chart default of 3 provisioner replicas with pod
 # anti-affinity cannot schedule on small clusters (the
 # common 1-2 worker case); the provisioner is

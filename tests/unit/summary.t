@@ -50,6 +50,15 @@ my $js = do {
     local $/; <$fh>;
 };
 like($js, qr{/summary'}, 'overview fetches the summary aggregate');
-like($js, qr/summaryBar/, 'overview renders capacity bars');
+like($js, qr/summaryChart/, 'overview renders capacity charts');
+like($js, qr/CartesianChart/, 'charts use the stock Ext chart type');
+my $prov = do {
+    open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
+    local $/; <$fh>;
+};
+like($prov, qr/Hour series for the Summary charts/,
+    'metrics carry per-node hour series');
+like($prov, qr/Cluster-average hour series/,
+    'summary aggregates the series for charts');
 
 done_testing();

@@ -509,14 +509,49 @@ Ext.define('PVE.dc.K8sView', {
                 value: gettext('loading...'),
                 labelWidth: 160,
             });
-            let summaryBarMem = Ext.create('Ext.ProgressBar', {
-                value: 0,
-                text: gettext('Node memory: loading...'),
+            let haInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('HA Errors'),
+                value: gettext('none'),
+                labelWidth: 160,
             });
-            let summaryBarCpu = Ext.create('Ext.ProgressBar', {
-                value: 0,
-                text: gettext('Node CPU: loading...'),
-            });
+            // Increment 8: hour charts in the stock
+            // Summary idiom instead of bare progress bars.
+            let summaryChart = function(title) {
+                return Ext.create('Ext.chart.CartesianChart', {
+                    height: 140,
+                    title: title,
+                    store: Ext.create('Ext.data.Store', {
+                        fields: [
+                            { name: 'time', type: 'date' },
+                            { name: 'pct', type: 'int' },
+                        ],
+                    }),
+                    axes: [{
+                        type: 'numeric',
+                        position: 'left',
+                        minimum: 0,
+                        maximum: 100,
+                        grid: true,
+                        label: { fontSize: 9 },
+                    }, {
+                        type: 'time',
+                        position: 'bottom',
+                        dateFormat: 'H:i',
+                        label: { fontSize: 9 },
+                    }],
+                    series: [{
+                        type: 'line',
+                        xField: 'time',
+                        yField: 'pct',
+                        style: { lineWidth: 2 },
+                        highlight: true,
+                    }],
+                });
+            };
+            let summaryChartMem = summaryChart(
+                gettext('Node memory % (last hour)'));
+            let summaryChartCpu = summaryChart(
+                gettext('Node CPU % (last hour)'));
             api({
                 url: '/cluster/k8s/' + name + '/summary',
                 method: 'GET',
@@ -548,17 +583,25 @@ Ext.define('PVE.dc.K8sView', {
                             new Date(s.backup.last * 1000),
                             'Y-m-d H:i')
                         : gettext('none'));
-                    if (s.capacity) {
-                        summaryBarMem.updateProgress(
-                            s.capacity.mem_pct / 100,
-                            Ext.String.format(gettext(
-                                'Node memory: {0}%'),
-                                s.capacity.mem_pct));
-                        summaryBarCpu.updateProgress(
-                            s.capacity.cpu_pct / 100,
-                            Ext.String.format(gettext(
-                                'Node CPU: {0}%'),
-                                s.capacity.cpu_pct));
+                    haInfo.setValue(s.ha_errors
+                        && s.ha_errors.length
+                        ? '<i class="fa fa-times critical"></i> '
+                            + Ext.htmlEncode(
+                                s.ha_errors.join(', '))
+                        : gettext('none'));
+                    if (s.series) {
+                        let toRows = function(pts) {
+                            return (pts || []).map(function(p) {
+                                return {
+                                    time: new Date(p[0] * 1000),
+                                    pct: p[1],
+                                };
+                            });
+                        };
+                        summaryChartMem.getStore().loadData(
+                            toRows(s.series.mem));
+                        summaryChartCpu.getStore().loadData(
+                            toRows(s.series.cpu));
                     }
                 },
                 failure: function() {
@@ -701,8 +744,8 @@ Ext.define('PVE.dc.K8sView', {
                             labelWidth: 160,
                         };
                     }).concat([healthInfo, nodesInfo, lbInfo,
-                        backupInfo, summaryBarMem, summaryBarCpu,
-                        certInfo]),
+                        backupInfo, haInfo, summaryChartMem,
+                        summaryChartCpu, certInfo]),
                 }],
             });
         };

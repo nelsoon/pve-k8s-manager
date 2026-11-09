@@ -28,4 +28,13 @@ like($recipe, qr/SystemdCgroup = true/,
 like($recipe, qr/systemctl mask apt-daily\.service/,
     'immutable nodes never run apt-daily (replaced, not upgraded)');
 
+my $versions = do {
+    open my $fh, '<', 'images/versions.env' or die $!;
+    local $/; <$fh>;
+};
+like($versions, qr/debian-13-genericcloud-amd64/,
+    'node image is Debian 13 (bookworm kernel cannot mount CephFS, P13)');
+unlike($versions, qr/bookworm/,
+    'no bookworm image remains pinned');
+
 done_testing();

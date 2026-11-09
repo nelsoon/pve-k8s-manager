@@ -126,6 +126,46 @@ like($prov, qr/not visible on any/,
     'recorded-but-invisible template dies clearly, no rebuild');
 like($prov, qr/pmxcfs copy is readable from every host/,
     'shared-storage check works from a peer host');
+# P15: ghosts are recorded on every replacement path and
+# retired by the scaler, identity-verified.
+like($prov, qr/sub retire_retired_ghosts/,
+    'scaler retires recorded ghosts');
+like($prov, qr/retire_retired_ghosts\(\$name, \$scfg/,
+    'every scaler pass attempts ghost retirement first');
+like($prov, qr/RUNNING with a duplicate identity/,
+    'running ghost is stopped before destroy');
+like($prov, qr/sub clear_retired_ghost/,
+    'retired records are cleared after destroy');
+like($prov, qr/A node converged onto a different VM/,
+    'provision converge records ghosts too');
+unlike($prov, qr/wipe that VM before provisioning/,
+    'provision no longer demands a manual wipe');
+like($prov, qr/Match on name AND vmid/,
+    'ghost lookup cannot be hidden by the live namesake');
+# P14: snippets replicate to every online host so a VM
+# can cold-start anywhere, and removal mirrors that.
+like($prov, qr/snippet \$file not replicated to/,
+    'snippet writes replicate beyond the home host');
+like($prov, qr/removal mirrors the write/,
+    'snippet removal cleans every host too');
+like($prov, qr/Replicate each node's existing/,
+    'converge replicates snippets for reused running VMs');
+like($prov, qr/is not registered with the API/,
+    'orphaned kubelet credentials trigger a rejoin');
+like($prov, qr/ha_errors/,
+    'summary surfaces HA error-state services');
+like($prov, qr/sub host_confirmed_dead/,
+    'replacement requires multi-signal dead confirmation');
+like($prov, qr/not confirmed dead/,
+    'unconfirmed hosts are left alone by repair');
+like($prov, qr/P2 hard rule/,
+    'CP placement never stacks when hosts allow spread');
+like($prov, qr/drift: \$node->\{host\} moved/,
+    'scaler repairs placement drift on sight');
+like($prov, qr/waiting for nodes Ready/,
+    'long provision waits log progress instead of silence');
+like($prov, qr/reconciling/,
+    'provision opens with a reconcile line');
 like($prov, qr/resource-affinity/,
     'CP VMs get a negative-affinity HA rule');
 like($prov, qr|/cluster/ha/rules/k8s-|,

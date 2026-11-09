@@ -276,8 +276,10 @@ my sub guest_exec {
 my sub wait_agent {
     my ($vmid, $tries) = @_;
 
-    for (1 .. ($tries // 80)) {
+    for my $try (1 .. ($tries // 80)) {
         return 1 if eval { qm_on(host_of($vmid), 'agent', $vmid, 'ping'); 1 };
+        print "waiting for guest agent on VM $vmid "
+            . "(attempt $try)\n" if $try % 4 == 0;
         sleep 15;
     }
     die "guest agent on $vmid never came up\n";
@@ -766,6 +768,23 @@ sub cluster_action_describe {
     return "$what$upid$where";
 }
 
+# Is the task recorded for a claim actually finished?
+# A worker killed outright (signal, host reset) never
+# releases its claim; the task index knows the truth
+# long before the stale window expires.
+sub action_task_finished {
+    my ($record) = @_;
+
+    my $upid = $record->{upid} or return 0;
+    my $node = $record->{node} or return 0;
+    my $out = eval {
+        run(['pvesh', 'get', "/nodes/$node/tasks/$upid/status",
+            '--output-format', 'json'], timeout => 30);
+    } // '';
+    my $st = eval { decode_pvesh_json($out) } // {};
+    return (($st->{status} // '') eq 'stopped') ? 1 : 0;
+}
+
 sub claim_cluster_action {
     my ($name, $key, $task, $user) = @_;
 
@@ -780,6 +799,18 @@ sub claim_cluster_action {
         my $record = eval {
             JSON::PP->new->decode($scfg->{'action-state'} // '{}') } // {};
         my $decision = cluster_action_decision($record, $key, $now);
+        if ($decision ne 'start' && $record->{upid}
+            && action_task_finished($record)) {
+            # The recorded worker is dead (e.g. killed by
+            # SIGPIPE through a truncated client stream)
+            # but its claim is younger than the stale
+            # window: do not lock the cluster for 30
+            # minutes over a finished task.
+            print "note: previous $record->{task} task "
+                . "finished without releasing its claim; "
+                . "reclaiming\n";
+            $decision = 'start';
+        }
         if ($decision ne 'start') {
             $result = { status => $decision, record => $record };
             return;
@@ -939,27 +970,56 @@ my sub write_snippet {
     return "local:snippets/$file";
 }
 
-# Snippets live on the target host's local storage.
+# Snippets live on host-local storage, and the VM config
+# references local:snippets/<file> - so the file must
+# exist on EVERY host the VM might ever start on, or a
+# cold start away from home fails (P14: HA recovery of a
+# worker died on two hosts with "volume
+# 'local:snippets/...' does not exist"). Write to all
+# online hosts; a host that is down gets its copy on the
+# next converge (configure_node_vm runs every pass).
 my sub write_snippet_on {
     my ($host, $file, $content) = @_;
 
-    return write_snippet($file, $content) if $host eq local_node_name();
     my $b64 = MIME::Base64::encode_base64($content, '');
-    run(['ssh', '-o', 'BatchMode=yes', $host,
-        "mkdir -p /var/lib/vz/snippets && echo $b64 | base64 -d "
-        . "> /var/lib/vz/snippets/$file"], timeout => 120);
+    my %seen;
+    for my $h ($host, pve_online_nodes()->@*) {
+        next if !$h || $seen{$h}++;
+        my $ok = eval {
+            if ($h eq local_node_name()) {
+                write_snippet($file, $content);
+            } else {
+                run(['ssh', '-o', 'BatchMode=yes', $h,
+                    "mkdir -p /var/lib/vz/snippets && "
+                    . "echo $b64 | base64 -d "
+                    . "> /var/lib/vz/snippets/$file"],
+                    timeout => 120);
+            }
+            1;
+        } // 0;
+        die "could not write snippet $file on $host: $@"
+            if !$ok && $h eq $host;
+        print "warning: snippet $file not replicated to "
+            . "$h: $@\n" if !$ok;
+    }
     return "local:snippets/$file";
 }
 
 my sub remove_snippet_on {
     my ($host, $file) = @_;
 
-    if ($host eq local_node_name()) {
-        unlink "/var/lib/vz/snippets/$file";
-    } else {
-        run(['ssh', '-o', 'BatchMode=yes', $host,
-            "rm -f /var/lib/vz/snippets/$file"],
-            timeout => 60, noerr => 1);
+    # removal mirrors the write: every online host, so no
+    # stale identity file survives anywhere (P14)
+    my %seen;
+    for my $h (($host // ()), pve_online_nodes()->@*) {
+        next if !$h || $seen{$h}++;
+        if ($h eq local_node_name()) {
+            unlink "/var/lib/vz/snippets/$file";
+        } else {
+            run(['ssh', '-o', 'BatchMode=yes', $h,
+                "rm -f /var/lib/vz/snippets/$file"],
+                timeout => 60, noerr => 1);
+        }
     }
 }
 
@@ -2260,6 +2320,8 @@ sub provision_cluster {
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
 
+    print "provisioning cluster '$name': reconciling "
+        . "desired state (nodes, add-ons, HA)\n";
     assert_cluster_hosts_online($name, $scfg);
     check_retired_ghosts($name, $scfg);
 
@@ -2421,6 +2483,18 @@ sub provision_cluster {
                 die "pool '$node->{pool}' needs a $node->{arch} host; "
                     . "none online\n" if !$candidates->@*;
             }
+            if ($node->{role} eq 'cp'
+                && scalar @$candidates >= $cp_count) {
+                # P2 hard rule: enough hosts for every CP
+                # to sit alone - stacking is then a bug,
+                # not a preference. Only hosts with no CP
+                # yet are eligible. (Degraded layouts,
+                # fewer hosts than CPs, keep the soft
+                # spread below and the warning above.)
+                my @free = grep {
+                    !($counts{"cp:$_"} // 0) } @$candidates;
+                $candidates = \@free if @free;
+            }
             my %pool_counts = map { ("pool:$_" => $counts{"pool:$node->{pool}:$_"} // 0) }
                 $candidates->@*;
             $host = choose_host($candidates, $group_of,
@@ -2559,6 +2633,29 @@ sub provision_cluster {
         die "cannot probe join state of $node->{host}: $probe_err\n"
             if !defined $probe;
         my $joined = $probe =~ /JOINED/ ? 1 : 0;
+        if ($joined) {
+            # A leftover kubelet.conf is not membership: a
+            # node deleted from the API while its VM lived
+            # on (scale-in that could not destroy it) probes
+            # JOINED forever and then never registers.
+            # Verify against the API; rejoin from a reset
+            # when absent (T4.2 orphan w2).
+            my $listed = eval {
+                guest_exec($cp1->{vmid},
+                    'kubectl --kubeconfig '
+                    . '/etc/kubernetes/admin.conf '
+                    . "get node $node->{host} "
+                    . '--no-headers 2>/dev/null');
+            } // '';
+            if ($listed !~ /^\Q$node->{host}\E\s/m) {
+                print "$node->{host} holds credentials but "
+                    . "is not registered with the API; "
+                    . "resetting and rejoining\n";
+                eval { guest_exec($node->{vmid},
+                    'kubeadm reset -f') };
+                $joined = 0;
+            }
+        }
         if (!$joined) {
             my $last_error = '';
             for my $attempt (1 .. 3) {
@@ -2603,7 +2700,7 @@ sub provision_cluster {
 
     # --- Ready gate: all nodes Ready according to kubectl
     my $ready = 0;
-    for (1 .. 40) {
+    for my $try (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
                 'kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers');
@@ -2611,6 +2708,8 @@ sub provision_cluster {
         my @ready_nodes = grep { /\sReady\s/ } split /\n/, $out;
         $ready = scalar @ready_nodes;
         last if $ready >= $total;
+        print "waiting for nodes Ready: $ready/$total\n"
+            if $try % 4 == 1;
         sleep 15;
     }
     die "only $ready/$total nodes Ready after waiting\n" if $ready < $total;
@@ -2665,7 +2764,7 @@ sub provision_cluster {
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::ccm_apply_cmd(
         '/etc/kubernetes/admin.conf', $ccm_config));
     my $identified = 0;
-    for (1 .. 40) {
+    for my $try (1 .. 40) {
         my $out = eval {
             guest_exec($cp1->{vmid},
                 'kubectl --kubeconfig /etc/kubernetes/admin.conf '
@@ -2674,6 +2773,8 @@ sub provision_cluster {
         my @ids = grep { /^proxmox:\/\// } split /\n/, $out;
         $identified = scalar @ids;
         last if $identified >= $total;
+        print "waiting for CCM providerIDs: "
+            . "$identified/$total\n" if $try % 4 == 1;
         sleep 15;
     }
     die "CCM set providerID on only $identified/$total nodes\n"
@@ -2749,6 +2850,53 @@ sub provision_cluster {
             . "(Cilium LB IPAM, L2 announcement)\n";
     }
 
+    # P14 completion: running reused VMs never pass
+    # through configure_node_vm, so their snippets would
+    # stay home-only. Replicate each node's existing
+    # snippet content to every online host, content
+    # unchanged - cold starts must work anywhere.
+    for my $node (@nodes) {
+        my $file = "k8s-$node->{host}.yaml";
+        # The snippet's home is the host the VM was
+        # CREATED on, which is neither the recorded host
+        # nor necessarily the VM's current host after
+        # migrations - search every online host for it.
+        my $content = '';
+        for my $h (pve_online_nodes()->@*) {
+            $content = eval {
+                host_run_on($h, 'cat',
+                    "/var/lib/vz/snippets/$file") } // '';
+            last if $content ne '';
+        }
+        next if $content eq '';
+        eval { write_snippet_on($node->{pvehost},
+            $file, $content) };
+        print "warning: snippet replication for "
+            . "$node->{host} failed: $@" if $@;
+    }
+
+    # A node converged onto a different VM (its old VM's
+    # host was down and could not be destroyed) leaves a
+    # retired ghost behind; record it so the scaler can
+    # retire it once its host returns (P15). The scaler
+    # CP-repair path records its own the same way.
+    if ($scfg->{nodes}) {
+        my $old = eval {
+            JSON::PP->new->decode($scfg->{nodes}) } // [];
+        my %old_vmid = map {
+            $_->{name} => $_->{vmid} } $old->@*;
+        my $live = cluster_vms();
+        for my $node (@nodes) {
+            my $was = $old_vmid{$node->{host}} or next;
+            next if "$was" eq "$node->{vmid}";
+            my $vm = $live->{$node->{host}} or next;
+            next if "$vm->{vmid}" ne "$was";
+            record_retired_ghost($name, {
+                host => $node->{host}, vmid => $was,
+                pvehost => $vm->{node} });
+        }
+    }
+
     store_inventory($name, \@nodes, $want_tpl_rev);
     eval { sync_ha_resources($name, $scfg, \@nodes) };
     print "warning: HA resource sync failed: $@" if $@;
@@ -2768,6 +2916,26 @@ sub provision_cluster {
             . "failed: $@" if !$ok;
     }
     return $total;
+}
+
+# P3 fencing, multi-signal edition (user decision
+# 2026-11-09): a node may only be replaced when its host
+# is confirmed dead by independent signals - PVE quorum
+# no longer lists the host online AND the node IP does
+# not answer. The caller has already established the
+# third signal (guest agent silent) and the grace
+# period. Anything short of all signals leaves the node
+# alone: a partitioned-but-alive host must never get a
+# duplicate replacement.
+sub host_confirmed_dead {
+    my ($node) = @_;
+
+    return 0 if grep { $_ eq $node->{pvehost} }
+        pve_online_nodes()->@*;
+    my $ip_answers = eval {
+        run(['ping', '-c', '2', '-W', '2', $node->{ip}],
+            timeout => 15); 1 } // 0;
+    return $ip_answers ? 0 : 1;
 }
 
 # --- Increment 6: failure policies and Proxmox HA ---------
@@ -3320,7 +3488,10 @@ my sub claim_scaler_leadership {
 # is down) as a retired ghost: if the host returns with the
 # VM still on it, check_retired_ghosts stops provisioning
 # until an operator wipes it.
-my sub record_retired_ghost {
+# Plain package sub: provision_cluster (above) records
+# ghosts too since P15, and a lexical declared here
+# would be invisible there.
+sub record_retired_ghost {
     my ($name, $node) = @_;
 
     PVE::K8s::Config::lock_config(sub {
@@ -3329,6 +3500,10 @@ my sub record_retired_ghost {
         my $retired = eval {
             JSON::PP->new->decode($scfg->{'retired-nodes'} // '[]')
         } // [];
+        return if grep {
+            ($_->{name} // '') eq $node->{host}
+            && int($_->{vmid} // 0) == int($node->{vmid})
+        } $retired->@*;
         push $retired->@*, { name => $node->{host},
             vmid => $node->{vmid},
             pvehost => $node->{pvehost}, at => time() };
@@ -3491,6 +3666,38 @@ sub scale_reconcile {
     my $kpods = kubectl_json($cp, 'get pods -A')->{items} // [];
     my %k8s_node = map { $_->{metadata}{name} => $_ } $knodes->@*;
 
+    # P15: retire recorded ghosts before anything else;
+    # one action per pass keeps the pass conservative.
+    return 1 if retire_retired_ghosts($name, $scfg,
+        \@nodes, \%k8s_node);
+
+    # P10: a node VM that live-migrated (or was HA
+    # restarted elsewhere) leaves the record and the
+    # site label naming the old host, and everything
+    # downstream (CSI topology, simulation) reasons
+    # about the wrong host. Repair drift on sight.
+    my $live_vms = cluster_vms();
+    my $drifted = 0;
+    for my $node (@nodes) {
+        my $vm = $live_vms->{$node->{host}} or next;
+        next if $vm->{node} eq $node->{pvehost};
+        print "drift: $node->{host} moved "
+            . "$node->{pvehost} -> $vm->{node}; repairing "
+            . "record and site label\n";
+        $node->{pvehost} = $vm->{node};
+        $node->{site} = $vm->{node};
+        eval { kubectl_on($cp,
+            "label nodes $node->{host} "
+            . 'topology.pve-k8s.proxmox.com/site='
+            . "$vm->{node} --overwrite") };
+        $drifted = 1;
+    }
+    if ($drifted) {
+        store_inventory($name, \@nodes,
+            $scfg->{'template-rev'});
+        return 1;
+    }
+
     # CP repair (Increment 6): a control-plane node that is
     # NotReady past its policy grace AND whose VM is silent
     # is replaced remove-then-add: etcd member removed
@@ -3523,6 +3730,13 @@ sub scale_reconcile {
                 print "cp-repair: $node->{host} NotReady for "
                     . "${since}s but its VM answers; leaving "
                     . "it alone\n";
+                next;
+            }
+            if (!host_confirmed_dead($node)) {
+                print "cp-repair: $node->{host} VM is silent "
+                    . "but its host is not confirmed dead "
+                    . "(quorum still sees it or the node IP "
+                    . "answers); leaving it alone\n";
                 next;
             }
             if ($cp_ready < int($cp_total / 2) + 1) {
@@ -3574,6 +3788,13 @@ sub scale_reconcile {
         if ($vm_alive) {
             print "repair: $node->{host} NotReady for ${since}s but "
                 . "its VM answers; leaving it alone\n";
+            next;
+        }
+        if (!host_confirmed_dead($node)) {
+            print "repair: $node->{host} VM is silent but "
+                . "its host is not confirmed dead (quorum "
+                . "still sees it or the node IP answers); "
+                . "leaving it alone\n";
             next;
         }
         print "repair: replacing dead node $node->{host} "
@@ -4566,7 +4787,9 @@ sub force_retire_node {
 
 # A force-retired VM that reappears (its host came back)
 # must never silently rejoin: stop provisioning until an
-# operator wipes it.
+# operator wipes it. Since P15 the scaler retires
+# recorded ghosts itself; provision only hard-stops on a
+# ghost that is actually RUNNING (live duplicate identity).
 sub check_retired_ghosts {
     my ($name, $scfg) = @_;
 
@@ -4577,16 +4800,127 @@ sub check_retired_ghosts {
     my $out = run(['pvesh', 'get', '/cluster/resources',
         '--type', 'vm', '--output-format', 'json'], timeout => 60);
     my $vms = decode_pvesh_json($out);
+    my %online = map { $_ => 1 } pve_online_nodes()->@*;
     for my $ghost ($retired->@*) {
         my ($vm) = grep {
             ($_->{name} // '') eq $ghost->{name}
             && int($_->{vmid} // 0) == int($ghost->{vmid})
         } $vms->@*;
+        next if !$vm || !$online{$vm->{node}};
+        my $st = eval {
+            qm_on($vm->{node}, 'status', $vm->{vmid}) } // '';
         die "force-retired node $ghost->{name} (vmid "
-            . "$ghost->{vmid} on $ghost->{pvehost}) has "
-            . "reappeared; wipe that VM before provisioning "
-            . "(it still holds the old node identity)\n" if $vm;
+            . "$ghost->{vmid} on $ghost->{pvehost}) is "
+            . "RUNNING again; stop it before provisioning "
+            . "(it holds the old node identity)\n"
+            if $st =~ /^status:\s*running/m;
+        print "note: retired ghost $ghost->{name} (vmid "
+            . "$ghost->{vmid}) still on $vm->{node}; the "
+            . "scaler retires it\n";
     }
+}
+
+# Remove one ghost from the retired-nodes record.
+sub clear_retired_ghost {
+    my ($name, $ghost) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $retired = eval {
+            JSON::PP->new->decode($scfg->{'retired-nodes'} // '[]')
+        } // [];
+        my @keep = grep {
+            !(($_->{name} // '') eq $ghost->{name}
+                && int($_->{vmid} // 0) == int($ghost->{vmid}))
+        } $retired->@*;
+        if (@keep) {
+            $scfg->{'retired-nodes'} =
+                JSON::PP->new->canonical->encode(\@keep);
+        } else {
+            delete $scfg->{'retired-nodes'};
+        }
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
+# P15: the scaler retires recorded ghosts itself. Every
+# check is identity-first: the VM must match the recorded
+# name+VMID, its host must be online, the replacement
+# (when the name is still in the inventory) must be
+# Ready. A running ghost is stopped first - it holds a
+# duplicate hostname/IP - and destroyed on a later pass
+# once stopped. A down host simply defers.
+sub retire_retired_ghosts {
+    my ($name, $scfg, $nodes, $k8s_node) = @_;
+
+    my $retired = eval {
+        JSON::PP->new->decode($scfg->{'retired-nodes'} // '[]')
+    } // [];
+    return 0 if !$retired->@*;
+    my %inv = map { $_->{host} => $_ } $nodes->@*;
+    my %online = map { $_ => 1 } pve_online_nodes()->@*;
+    # Match on name AND vmid from the raw resource list:
+    # the ghost and its live replacement share one name,
+    # so the name-keyed cluster_vms() hash hides the ghost
+    # behind the replacement (seen live, first P15 pass).
+    my $res = decode_pvesh_json(run(
+        ['pvesh', 'get', '/cluster/resources', '--type', 'vm',
+            '--output-format', 'json'], timeout => 60)) // [];
+    my $acted = 0;
+    for my $ghost ($retired->@*) {
+        my ($vm) = grep {
+            ($_->{name} // '') eq $ghost->{name}
+            && int($_->{vmid} // 0) == int($ghost->{vmid})
+        } $res->@*;
+        $vm = $vm ? { vmid => $vm->{vmid}, node => $vm->{node} }
+            : undef;
+        if (!$vm) {
+            clear_retired_ghost($name, $ghost);
+            print "ghost: retired node $ghost->{name} "
+                . "(vmid $ghost->{vmid}) is already gone; "
+                . "record cleared\n";
+            $acted = 1;
+            next;
+        }
+        my $host = $vm->{node};
+        next if !$online{$host};
+        my $inv_node = $inv{$ghost->{name}};
+        if ($inv_node
+            && "$inv_node->{vmid}" eq "$ghost->{vmid}") {
+            print "ghost: record for $ghost->{name} "
+                . "matches the live inventory; not "
+                . "touching it\n";
+            next;
+        }
+        if ($inv_node) {
+            my $kn = $k8s_node->{$ghost->{name}};
+            my ($ready) = grep {
+                ($_->{type} // '') eq 'Ready'
+            } ($kn->{status}{conditions} // [])->@*;
+            next if !$kn || !$ready
+                || ($ready->{status} // '') ne 'True';
+        }
+        my $st = eval {
+            qm_on($host, 'status', $ghost->{vmid}) } // '';
+        if ($st =~ /^status:\s*running/m) {
+            print "ghost: retired node $ghost->{name} "
+                . "(vmid $ghost->{vmid} on $host) is "
+                . "RUNNING with a duplicate identity; "
+                . "stopping it\n";
+            eval { qm_on($host, 'stop', $ghost->{vmid}) };
+            $acted = 1;
+            next;
+        }
+        next if $st !~ /^status:\s*stopped/m;
+        qm_on($host, 'destroy', $ghost->{vmid},
+            '--purge', '--destroy-unreferenced-disks', 1);
+        clear_retired_ghost($name, $ghost);
+        print "ghost: retired node $ghost->{name} "
+            . "(vmid $ghost->{vmid} on $host) destroyed\n";
+        $acted = 1;
+    }
+    return $acted;
 }
 
 # --- T3.6b: cross-host local-volume move -----------------
@@ -5983,6 +6317,14 @@ sub metrics_cluster {
             $row->{mem} = $last->{mem};
             $row->{maxmem} = $last->{maxmem};
         }
+        # Hour series for the Summary charts (Increment
+        # 8): [epoch, cpu%, mem%] per RRD sample.
+        $row->{series} = [map {
+            [int($_->{time}), int(100 * ($_->{cpu} // 0)),
+                $_->{maxmem}
+                    ? int(100 * ($_->{mem} // 0)
+                        / $_->{maxmem}) : 0]
+        } grep { defined $_->{cpu} } $data->@*];
         push @node_rows, $row;
     }
     my $state = addons_state($scfg);
@@ -6111,6 +6453,29 @@ sub summary_cluster {
         cpu_pct => $cpu_n ? int(100 * $cpu / $cpu_n) : 0,
         metrics_server => $metrics->{metrics_server} // 0,
     } : undef;
+    # Cluster-average hour series for the Summary charts:
+    # average each node's per-sample percentages by time.
+    my (%cpu_at, %mem_at);
+    for my $n (($metrics->{nodes} // [])->@*) {
+        for my $p (($n->{series} // [])->@*) {
+            push $cpu_at{$p->[0]}->@*, $p->[1];
+            push $mem_at{$p->[0]}->@*, $p->[2];
+        }
+    }
+    my $avg = sub {
+        my ($h) = @_;
+        my @out;
+        for my $t (sort { $a <=> $b } keys $h->%*) {
+            my $s = 0;
+            $s += $_ for $h->{$t}->@*;
+            push @out, [int($t),
+                int($s / scalar $h->{$t}->@*)];
+        }
+        return \@out;
+    };
+    $out->{series} = {
+        cpu => $avg->(\%cpu_at), mem => $avg->(\%mem_at),
+    } if %cpu_at;
 
     my $backups = eval { list_backups($name) } // [];
     if ($backups->@*) {
@@ -6122,6 +6487,15 @@ sub summary_cluster {
     my $certs = eval { cert_expiry($name) } // [];
     my $worst = worst_cert_days($certs);
     $out->{cert_days} = $worst if defined $worst;
+    # HA services in error state are invisible in every
+    # other view and silently stop HA recovery (T4.2:
+    # two services sat in error until reset by hand).
+    # Surface them; the scaler does not auto-reset them.
+    my $ha_status = eval {
+        run(['ha-manager', 'status'], timeout => 60) } // '';
+    my @ha_errors = $ha_status =~
+        /^service (vm:\d+) \(\w+, error\)/gm;
+    $out->{ha_errors} = \@ha_errors if @ha_errors;
     $out->{health} = summary_health($out->{state},
         $out->{cp}, $out->{cp_ready}, $out->{nodes_ready},
         $out->{live} ? $out->{nodes_total} : undef);

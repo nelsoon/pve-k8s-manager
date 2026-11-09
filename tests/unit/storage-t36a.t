@@ -38,6 +38,13 @@ is(PVE::K8s::Config::assert_file_config(
 ok(!eval { PVE::K8s::Config::assert_file_config(
         { 'file-backend' => 'gluster' }); 1 },
     'an unknown file backend is rejected');
+my $addons_src = do {
+    open my $fh, '<', 'PVE/K8s/Addons.pm' or die $!;
+    local $/; <$fh>;
+};
+like($addons_src, qr/mounter: fuse/,
+    'cephfs mounts via FUSE (kernel rejects 32-byte CephX keys, P13)');
+
 is(PVE::K8s::Config::cephfs_name('Lab_11'), 'k8s-lab-11',
     'cephfs filesystem name derives from the cluster');
 
