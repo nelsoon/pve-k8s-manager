@@ -96,5 +96,9 @@ like($js, qr/Parked \(awaiting placement\)/,
     'overview surfaces a parked pool');
 like($prov, qr/template_storage_shared\(\$canon_id\)/,
     'shared-storage templates are cloned centrally, not copied per host');
+like($prov, qr/resource-affinity/,
+    'CP VMs get a negative-affinity HA rule');
+like($prov, qr|/cluster/ha/rules/k8s-|,
+    'cluster deletion removes the affinity rule');
 
 done_testing();

@@ -773,6 +773,13 @@ sub run_cluster_action {
     my $worker_pid = $$;
     my $heartbeat = fork();
     if (defined $heartbeat && $heartbeat == 0) {
+        # Detach from the worker's stdio first: the child
+        # inherits the PVE task-log pipe, and holding it
+        # open past the worker's exit corrupts the task
+        # result ("TASK ERROR: broken pipe" on otherwise
+        # successful long tasks, seen 2026-11-07).
+        open STDOUT, '>', '/dev/null' or die $!;
+        open STDERR, '>', '/dev/null' or die $!;
         # heartbeat child: refresh the claim until the worker
         # exits or the claim is taken over
         while (kill(0, $worker_pid) && getppid() == $worker_pid) {
@@ -2684,6 +2691,7 @@ sub sync_ha_resources {
         }
         $want{"vm:$vmid"} = {
             ha => $use_ha,
+            cp => $is_cp,
             comment => "pve-k8s:$name:$node->{host}",
         };
     }
@@ -2730,6 +2738,45 @@ sub sync_ha_resources {
         print "warning: HA registration of $sid failed: $@"
             if $@;
     }
+
+    # CP anti-affinity (Increment 6 follow-up): a negative
+    # resource-affinity HA rule keeps control-plane VMs on
+    # separate hosts whenever Proxmox places or relocates
+    # them. Non-strict: best effort today; hardening it is
+    # the recorded P2 item. Applies in both policies - the
+    # VMs are HA resources either way.
+    my @cp_sids = sort grep {
+        $want{$_}{cp} } keys %want;
+    if (@cp_sids > 1) {
+        my $rule = "k8s-$name-cp";
+        my $resources = join ',', @cp_sids;
+        eval {
+            my $rules = decode_pvesh_json(run(
+                ['pvesh', 'get', '/cluster/ha/rules',
+                    '--output-format', 'json'],
+                timeout => 60)) // [];
+            my ($existing) = grep {
+                ($_->{rule} // '') eq $rule } $rules->@*;
+            if ($existing
+                && ($existing->{resources} // '') ne $resources) {
+                run(['pvesh', 'delete',
+                    "/cluster/ha/rules/$rule"], timeout => 60);
+                $existing = undef;
+            }
+            if (!$existing) {
+                run(['pvesh', 'create', '/cluster/ha/rules',
+                    '--rule', $rule,
+                    '--type', 'resource-affinity',
+                    '--affinity', 'negative',
+                    '--resources', $resources,
+                    '--comment', "pve-k8s:$name"],
+                    timeout => 60);
+                print "ha: CP anti-affinity rule $rule "
+                    . "($resources)\n";
+            }
+        };
+        print "warning: CP anti-affinity rule failed: $@" if $@;
+    }
     return 1;
 }
 
@@ -2737,6 +2784,8 @@ sub sync_ha_resources {
 sub remove_ha_resources {
     my ($name) = @_;
 
+    eval { run(['pvesh', 'delete',
+        "/cluster/ha/rules/k8s-$name-cp"], timeout => 60) };
     for my $res (ha_resource_list()->@*) {
         my $comment = $res->{comment} // '';
         next if $comment !~ /^\Qpve-k8s:$name:\E/;

@@ -49,6 +49,8 @@ like($prov, qr/sub claim_cluster_action/,
 like($prov, qr/sub run_cluster_action/,
     'workers run under the claimed action');
 like($prov, qr/heartbeat/i, 'long actions heartbeat their claim');
+like($prov, qr/open STDOUT, '>', '\/dev\/null'/,
+    'heartbeat child detaches from the task log pipe');
 ok((grep { /fork_cluster_worker\(/ } split /\n/, $api) >= 14,
     'every mutating task endpoint goes through the action guard');
 unlike($api, qr/fork_worker\('k8s/,
