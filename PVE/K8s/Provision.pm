@@ -572,6 +572,19 @@ my sub template_storage_shared {
     return 0;
 }
 
+# Which host owns a template VM's config (qm clone must
+# run there). Searches the cluster VM inventory by vmid.
+my sub template_owner_host {
+    my ($tpl_vmid) = @_;
+
+    my $vms = cluster_vms();
+    for my $vm (values $vms->%*) {
+        return $vm->{node}
+            if ($vm->{vmid} // '') eq "$tpl_vmid" && $vm->{node};
+    }
+    return undef;
+}
+
 # Template distribution (T2.1): on nothing-shared storage a
 # copy is made lazily, once per revision, only on hosts where
 # a node is placed (clone locally, migrate the copy, mark it
@@ -1792,7 +1805,17 @@ sub create_node_vm {
             '--full', 1);
         push @clone, '--storage', $node->{pool_storage}
             if $node->{pool_storage};
-        qm_on($target, @clone);
+        # A shared-storage template is cloned from its own
+        # host with --target: qm clone refuses to run where
+        # the template's config does not live (exit 2, first
+        # physical install).
+        my $tpl_host = template_owner_host($tpl);
+        if ($tpl_host && $tpl_host ne $target) {
+            push @clone, '--target', $target;
+            qm_on($tpl_host, @clone);
+        } else {
+            qm_on($target, @clone);
+        }
         print "created $vmname (vmid $vmid on $target, $node->{ip})\n";
     } else {
         $VM_HOST{$vmid} = $target;
