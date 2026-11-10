@@ -25,6 +25,8 @@ packages:
   - open-iscsi
   # kubeadm preflight requires conntrack in PATH; also used by CNI.
   - conntrack
+  # socat backs the vsock API proxy (hypervisor channel).
+  - socat
 
 write_files:
   - path: /etc/modules-load.d/k8s.conf
@@ -47,6 +49,22 @@ write_files:
         runtime_type = "io.containerd.runc.v2"
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
         SystemdCgroup = true
+  # Management channel: the PVE host reaches the apiserver
+  # over virtio-vsock (no IP route into the node zone).
+  # Harmless on workers: nothing connects without a
+  # vsock device, which only control planes receive.
+  - path: /etc/systemd/system/k8s-api-vsock.service
+    content: |
+      [Unit]
+      Description=K8s API vsock proxy
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/bin/socat VSOCK-LISTEN:10244,reuseaddr,fork TCP:127.0.0.1:6443
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
 
 runcmd:
   # Immutable appliances: nodes are replaced, never apt-upgraded,
@@ -56,6 +74,7 @@ runcmd:
   - modprobe overlay br_netfilter
   - sysctl --system
   - systemctl enable --now containerd qemu-guest-agent open-iscsi iscsid
+  - systemctl enable --now k8s-api-vsock || true
   # Kubernetes packages, pinned to the minor line and held.
   - install -m 0755 -d /etc/apt/keyrings
   - curl -fsSL __K8S_REPO__Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg

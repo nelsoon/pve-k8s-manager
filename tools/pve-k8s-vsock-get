@@ -1,0 +1,97 @@
+#!/usr/bin/perl
+# pve-k8s-vsock-get: one HTTPS GET to a cluster's
+# apiserver through the CP VM's virtio-vsock proxy
+# (host-side client; the guest forwards vsock:10244 to
+# 127.0.0.1:6443). No IP route to the node subnet is
+# needed - vsock is a hypervisor channel.
+#
+# Usage: pve-k8s-vsock-get --cid <vmid> --path /api/v1/nodes
+# Env:   PVE_K8S_TOKEN_FILE  bearer token file
+#        PVE_K8S_CA_FILE     cluster CA PEM file
+# Prints the response body on stdout; dies on any
+# transport or non-200 failure.
+use strict;
+use warnings;
+
+use Net::SSLeay ();
+use Socket qw(SOCK_STREAM);
+
+my ($cid, $path);
+while (@ARGV) {
+    my $arg = shift @ARGV;
+    if ($arg eq '--cid') { $cid = shift @ARGV }
+    elsif ($arg eq '--path') { $path = shift @ARGV }
+    else { die "unknown argument $arg\n" }
+}
+die "usage: pve-k8s-vsock-get --cid <id> --path </api/...>\n"
+    if !$cid || $cid !~ /^\d+$/ || !$path || $path !~ m|^/api|;
+my $token_file = $ENV{PVE_K8S_TOKEN_FILE}
+    or die "PVE_K8S_TOKEN_FILE not set\n";
+my $ca_file = $ENV{PVE_K8S_CA_FILE}
+    or die "PVE_K8S_CA_FILE not set\n";
+my $token = do {
+    open my $fh, '<', $token_file or die "token file: $!\n";
+    local $/;
+    my $t = <$fh> // '';
+    $t =~ s/\s+//g;
+    $t;
+};
+die "empty token\n" if !$token;
+
+# sockaddr_vm: family(2) reserved(2) port(4) cid(4)
+# flags(1) zero(3); AF_VSOCK is family 40 on Linux.
+socket(my $sock, 40, SOCK_STREAM, 0)
+    or die "vsock socket: $!\n";
+connect($sock, pack('vvVVCC3', 40, 0, 10244, $cid, 0, 0, 0, 0))
+    or die "vsock connect cid $cid: $!\n";
+
+Net::SSLeay::load_error_strings();
+Net::SSLeay::SSLeay_add_ssl_algorithms();
+my $ctx = Net::SSLeay::CTX_new()
+    or die "tls ctx failed\n";
+Net::SSLeay::CTX_load_verify_locations($ctx, $ca_file, '')
+    or die "cannot load CA $ca_file\n";
+Net::SSLeay::CTX_set_verify($ctx,
+    Net::SSLeay::VERIFY_PEER(), undef);
+my $ssl = Net::SSLeay::new($ctx)
+    or die "tls session failed\n";
+Net::SSLeay::set_fd($ssl, fileno($sock));
+# SNI only: hostname verification is not repeated
+# here - the vsock CID already pins the exact VM, and
+# the chain check below proves it serves a certificate
+# signed by this cluster's CA.
+eval { Net::SSLeay::set_tlsext_host_name($ssl, 'kubernetes') };
+Net::SSLeay::connect($ssl)
+    or die "tls connect failed: "
+        . Net::SSLeay::print_errs() . "\n";
+die "peer certificate not verified\n"
+    if Net::SSLeay::get_verify_result($ssl) != 0;
+
+my $req = "GET $path HTTP/1.1\r\nHost: kubernetes\r\n"
+    . "Authorization: Bearer $token\r\n"
+    . "Accept: application/json\r\nConnection: close\r\n\r\n";
+Net::SSLeay::write($ssl, $req)
+    or die "tls write failed\n";
+my $raw = '';
+while (my $buf = Net::SSLeay::read($ssl)) {
+    $raw .= $buf;
+}
+Net::SSLeay::free($ssl);
+Net::SSLeay::CTX_free($ctx);
+close $sock;
+
+my ($head, $body) = split /\r\n\r\n/, $raw, 2;
+die "bad response\n" if !$head || $head !~ m|^HTTP/1\.\d (\d+)|;
+my $code = $1;
+if ($head =~ /Transfer-Encoding: chunked/i) {
+    my $decoded = '';
+    while ($body =~ /^([0-9a-fA-F]+)\r\n/) {
+        my $len = hex $1;
+        last if !$len;
+        $decoded .= substr($body, length($1) + 2, $len);
+        $body = substr($body, length($1) + 2 + $len + 2);
+    }
+    $body = $decoded;
+}
+die "GET $path returned $code: $body\n" if $code != 200;
+print $body;

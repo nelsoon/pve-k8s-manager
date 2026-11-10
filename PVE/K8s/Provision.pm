@@ -8,6 +8,7 @@ use warnings;
 use JSON::PP ();
 use MIME::Base64 ();
 use Time::Local ();
+use Fcntl ();
 
 use PVE::Tools qw(run_command);
 
@@ -1774,6 +1775,9 @@ sub cluster_nodes {
                 arch => $pool->{arch},
                 labels => $pool->{labels}, taints => $pool->{taints},
                 pool_storage => $pool->{storage},
+                cpu => $pool->{cpu}, memory => $pool->{memory},
+                disk => $pool->{disk},
+                device_profile => $pool->{'device-profile'},
                 ip => "$prefix." . (++$worker_ip), idx => $i,
             };
         }
@@ -1832,6 +1836,9 @@ sub converge_nodes {
                 pool_hosts => $pdef->{hosts},
                 arch => $pdef->{arch} // $item->{arch},
                 pool_storage => $pdef->{storage},
+                cpu => $pdef->{cpu}, memory => $pdef->{memory},
+                disk => $pdef->{disk},
+                device_profile => $pdef->{'device-profile'},
             };
         }
         my $have = scalar @keep;
@@ -2056,9 +2063,40 @@ sub configure_node_vm {
         '--cicustom', "user=$snippet",
         '--ipconfig0', "ip=$node->{ip}/24,gw=$gateway",
         '--nameserver', '1.1.1.1',
-        '--memory', $node->{role} eq 'cp' ? 3072 : 4096,
-        '--cores', $node->{role} eq 'cp' ? 4 : 2,
+        '--memory', $node->{memory}
+            // ($node->{role} eq 'cp' ? 3072 : 4096),
+        '--cores', $node->{cpu}
+            // ($node->{role} eq 'cp' ? 4 : 2),
     );
+    # Per-group disk is grow-only: qm resize refuses a
+    # shrink, so a smaller value than the template's is
+    # ignored rather than failing the node create.
+    if ($node->{disk}) {
+        my ($dev) = $vmcfg =~ /^(scsi0|virtio0|sata0):/m;
+        eval {
+            qm_on($target, 'resize', $vmid, $dev,
+                $node->{disk} . 'G');
+        } if $dev;
+    }
+    # GPU/device passthrough via a Datacenter PCI
+    # resource mapping; a bad mapping name fails the
+    # create loudly instead of silently dropping it.
+    if ($node->{device_profile}) {
+        qm_on($target, 'set', $vmid, '--hostpci0',
+            "mapping=$node->{device_profile}");
+    }
+    # Control planes get a virtio-vsock device (CID =
+    # VMID) for the fast API transport; it takes effect
+    # at VM start, and existing args are preserved.
+    if ($node->{role} eq 'cp') {
+        my ($args) = $vmcfg =~ /^args: (.*)$/m;
+        if (($args // '') !~ /vhost-vsock-pci/) {
+            my $new = (($args // '')
+                . " -device vhost-vsock-pci,id=vsock0,"
+                . "guest-cid=$vmid") =~ s/^\s+//r;
+            qm_on($target, 'set', $vmid, '--args', $new);
+        }
+    }
     return $vmid;
 }
 
@@ -2743,6 +2781,8 @@ sub provision_cluster {
                 if @taint;
         }
         print "labelled $node->{host} pool=$node->{pool} site=$node->{site}\n";
+        eval { ensure_vsock_device($node) };
+        eval { ensure_vsock_proxy($node) };
     }
 
     # --- Proxmox CCM: scoped token in, providerIDs out
@@ -3320,12 +3360,75 @@ my sub etcd_member_remove {
 # Plain package sub (not lexical): joined_names calls it
 # from above this declaration, and a lexical defined
 # below its caller is invisible there.
-sub kubectl_on {
-    my ($cp, $args) = @_;
+my sub kubectl_cmd {
+    my ($args) = @_;
     # admin.conf exists on every control-plane node;
     # local-super-admin.conf only ever existed on the init node
-    return guest_exec($cp->{vmid},
-        "kubectl --kubeconfig /etc/kubernetes/admin.conf $args");
+    return "kubectl --kubeconfig /etc/kubernetes/admin.conf $args";
+}
+
+sub kubectl_on {
+    my ($cp, $args) = @_;
+
+    return guest_exec($cp->{vmid}, kubectl_cmd($args));
+}
+
+# The vsock API proxy in CP guests: socat forwards
+# vsock:10244 to the local apiserver. Installed by
+# provision so clusters built before the unit shipped
+# in the template gain it without a roll; a guest
+# without the vsock device just never gets connections.
+# Existing control planes (created before vsock) get
+# the device in their config too; it activates on the
+# next VM start - the transport falls back to guest
+# exec until then.
+sub ensure_vsock_device {
+    my ($node) = @_;
+
+    return if ($node->{role} // '') ne 'cp';
+    my $cfg = eval {
+        qm_on($node->{pvehost}, 'config', $node->{vmid}) } // '';
+    return if $cfg =~ /vhost-vsock-pci/;
+    my ($args) = $cfg =~ /^args: (.*)$/m;
+    my $new = (($args // '')
+        . " -device vhost-vsock-pci,id=vsock0,"
+        . "guest-cid=$node->{vmid}") =~ s/^\s+//r;
+    eval {
+        qm_on($node->{pvehost}, 'set', $node->{vmid},
+            '--args', $new);
+    };
+    print "vsock device configured on $node->{host} "
+        . "(active at next start)\n";
+}
+
+sub ensure_vsock_proxy {
+    my ($node) = @_;
+
+    return if ($node->{role} // '') ne 'cp';
+    my $active = eval {
+        guest_exec($node->{vmid},
+            'systemctl is-active k8s-api-vsock || true');
+    } // '';
+    return if $active =~ /^active/m;
+    my $unit = <<'EOF';
+[Unit]
+Description=K8s API vsock proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/socat VSOCK-LISTEN:10244,reuseaddr,fork TCP:127.0.0.1:6443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    my $b64 = MIME::Base64::encode_base64($unit, '');
+    guest_exec($node->{vmid},
+        "echo $b64 | base64 -d "
+        . '> /etc/systemd/system/k8s-api-vsock.service; '
+        . 'systemctl daemon-reload; '
+        . 'systemctl enable --now k8s-api-vsock');
+    print "vsock API proxy installed on $node->{host}\n";
 }
 
 my sub wait_node_ready {
@@ -3344,6 +3447,9 @@ my sub label_node {
 
     my @label = ("pve-k8s.proxmox.com/pool=$node->{pool}",
         "topology.pve-k8s.proxmox.com/site=$node->{site}");
+    push @label,
+        "pve-k8s.proxmox.com/device-profile=$node->{device_profile}"
+        if $node->{device_profile};
     push @label, grep { /^[a-zA-Z0-9.\/-]+=[^,]+$/ }
         split /\s*,\s*/, $node->{labels} // '';
     kubectl_on($cp, "label nodes $node->{host} "
@@ -3397,8 +3503,24 @@ sub remove_node {
     eval { kubectl_on($cp, "delete node $old->{host}") };
     if ($vmid) {
         eval { qm_on($vhost, 'stop', $vmid) };
-        eval { qm_on($vhost, 'destroy', $vmid, '--purge',
-            '--destroy-unreferenced-disks', 1) };
+        # qm stop is asynchronous: destroying while the
+        # guest is still stopping fails and silently
+        # leaves a stopped ghost VM behind (seen in the
+        # lab retiring a sized test group, 2026-11-09).
+        for (1 .. 30) {
+            my $st = eval {
+                qm_on($vhost, 'status', $vmid) } // '';
+            last if $st =~ /^status:\s*stopped/m;
+            sleep 2;
+        }
+        my $ok = eval {
+            qm_on($vhost, 'destroy', $vmid, '--purge',
+                '--destroy-unreferenced-disks', 1);
+            1;
+        } // 0;
+        print "warning: destroy of $old->{host} (vmid $vmid) "
+            . "failed; stopped VM left for the scaler\n"
+            if !$ok;
     }
     remove_snippet_on($vhost // $old->{pvehost}, "k8s-$old->{host}.yaml");
     print "removed $old->{host} (vmid $old->{vmid} on $old->{pvehost})\n";
@@ -3455,6 +3577,98 @@ my sub kubectl_json {
     my $start = index($out, '{');
     $out = substr($out, $start) if $start > 0;
     return JSON::PP->new->decode($out);
+}
+
+# Several kubectl reads in ONE guest-agent exec: each
+# exec round-trip costs ~6s, so read paths (summary,
+# workloads) batch their calls behind one marker-split
+# invocation. The PVE host has no direct route to the
+# node subnet (SDN-isolated), so guest exec remains
+# the bridge - batching is the speed lever.
+# --- vsock API transport --------------------------------
+# CP VMs carry a virtio-vsock device (CID = VMID); the
+# guest proxies vsock:10244 to the apiserver. HTTPS over
+# that channel is ~70x faster than a guest-agent exec
+# and needs no IP route into the SDN zone. Credentials
+# are the pve-k8s-admin SA token + cluster CA, cached
+# on pmxcfs for 50 minutes (the token lives 1h); the
+# mint itself goes through kubeconfig_cluster, i.e.
+# guest exec, once per cache period. Every caller
+# falls back to kubectl_json_batch when vsock is not
+# available (old nodes, proxy unit missing).
+my $VSOCK_PORT = 10244;
+
+sub api_credentials {
+    my ($name) = @_;
+
+    my $tf = "/etc/pve/k8s/api-$name.token";
+    my $cf = "/etc/pve/k8s/api-$name.ca";
+    my @st = stat $tf;
+    return ($tf, $cf)
+        if @st && time() - $st[9] < 3000 && -s $cf;
+    my $kc = kubeconfig_cluster($name)->{kubeconfig};
+    my ($token) = $kc =~ /token: (\S+)/;
+    my ($ca_b64) = $kc =~ /certificate-authority-data: (\S+)/;
+    die "could not parse issued kubeconfig for '$name'\n"
+        if !$token || !$ca_b64;
+    my $ca = MIME::Base64::decode_base64($ca_b64);
+    for my $pair ([$tf, $token], [$cf, $ca]) {
+        sysopen my $fh, "$pair->[0].tmp",
+            Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(),
+            0600 or die "credential cache: $!\n";
+        print $fh $pair->[1];
+        close $fh;
+        rename "$pair->[0].tmp", $pair->[0]
+            or die "credential cache rename: $!\n";
+    }
+    return ($tf, $cf);
+}
+
+sub k8s_api_get {
+    my ($name, $cp, $path) = @_;
+
+    my ($tf, $cf) = api_credentials($name);
+    my $cid = $cp->{vmid};
+    my $out;
+    if (!$cp->{pvehost} || $cp->{pvehost} eq local_node_name()) {
+        $out = run(['env', "PVE_K8S_TOKEN_FILE=$tf",
+            "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
+            '--cid', $cid, '--path', $path], timeout => 60);
+    } else {
+        $out = run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
+            "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
+            . "pve-k8s-vsock-get --cid $cid --path "
+            . shq($path)], timeout => 60);
+    }
+    return JSON::PP->new->decode($out);
+}
+
+my sub kubectl_json_batch {
+    my ($cp, @calls) = @_;
+
+    my $cmd = join '; echo __PVEK8S_BATCH__; ',
+        map { kubectl_cmd("$_ -o json") } @calls;
+    my $out = guest_exec($cp->{vmid}, $cmd);
+    my @parts = split /__PVEK8S_BATCH__\n?/, $out;
+    return [map {
+        my $part = $_ // '';
+        my $start = index($part, '{');
+        $part = substr($part, $start) if $start > 0;
+        eval { JSON::PP->new->decode($part) } // {};
+    } @parts];
+}
+
+# One logical read: vsock when it works, batched guest
+# exec otherwise. $api_path undef means exec-only.
+sub k8s_read_json {
+    my ($name, $cp, $kubectl_args, $api_path) = @_;
+
+    if ($api_path) {
+        my $data = eval { k8s_api_get($name, $cp, $api_path) };
+        return $data if $data;
+    }
+    my $batch = kubectl_json_batch($cp, $kubectl_args);
+    return $batch->[0];
 }
 
 my sub claim_scaler_leadership {
@@ -4560,6 +4774,8 @@ my sub load_nodes {
                 : ($pool_by_name{$pool} // {})->{arch},
             labels => ($pool_by_name{$pool} // {})->{labels},
             taints => ($pool_by_name{$pool} // {})->{taints},
+            device_profile => ($pool_by_name{$pool} // {})
+                ->{'device-profile'},
         };
         $VM_HOST{$vmid} = $pvehost;
     }
@@ -6262,12 +6478,24 @@ sub workloads_cluster {
         or die "cluster '$name' does not exist\n";
     my $nodes = load_nodes($name, $scfg);
     my $cp = ops_cp($nodes);
+    my ($dep, $pods, $svc);
+    my $via_api = eval {
+        $dep = k8s_api_get($name, $cp,
+            '/apis/apps/v1/deployments');
+        $pods = k8s_api_get($name, $cp, '/api/v1/pods');
+        $svc = k8s_api_get($name, $cp, '/api/v1/services');
+        1;
+    } // 0;
+    if (!$via_api) {
+        my $batch = kubectl_json_batch($cp,
+            'get deployments -A', 'get pods -A',
+            'get services -A');
+        ($dep, $pods, $svc) = $batch->@*;
+    }
     return {
-        deployments => deployment_rows(
-            kubectl_json($cp, 'get deployments -A')),
-        pods => pod_rows(kubectl_json($cp, 'get pods -A')),
-        services => service_rows(
-            kubectl_json($cp, 'get services -A')),
+        deployments => deployment_rows($dep),
+        pods => pod_rows($pods),
+        services => service_rows($svc),
     };
 }
 
@@ -6293,23 +6521,35 @@ sub parse_top_pods {
 # metrics exist only with the metrics-server add-on; the
 # panel shows both and says which source is live.
 sub metrics_cluster {
-    my ($name) = @_;
+    my ($name, $opts) = @_;
 
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
     my $nodes = load_nodes($name, $scfg);
-    my @node_rows;
-    for my $node ($nodes->@*) {
+    my $fetch_row = sub {
+        my ($node) = @_;
         my $row = { name => $node->{host} };
-        my $out = eval {
-            host_run_on($node->{pvehost}, 'pvesh', 'get',
-                "/nodes/$node->{pvehost}/qemu/$node->{vmid}/rrddata",
-                '--timeframe', 'hour', '--cf', 'AVERAGE',
-                '--output-format', 'json');
-        } // '';
+        # RRD data is replicated to every PVE host
+        # (pve-vm-9.0 in the local rrdcached), so read it
+        # in-process - the old ssh+pvesh spawn per node
+        # cost ~1.4s each. Fall back to pvesh if the RRD
+        # read is unavailable.
         my $data = eval {
-            PVE::K8s::Provision::decode_pvesh_json($out) } // [];
+            require PVE::RRD;
+            PVE::RRD::create_rrd_data(
+                "pve-vm-9.0/$node->{vmid}", 'hour', 'AVERAGE');
+        };
+        if (!$data) {
+            my $out = eval {
+                host_run_on($node->{pvehost}, 'pvesh', 'get',
+                    "/nodes/$node->{pvehost}/qemu/$node->{vmid}/rrddata",
+                    '--timeframe', 'hour', '--cf', 'AVERAGE',
+                    '--output-format', 'json');
+            } // '';
+            $data = eval {
+                PVE::K8s::Provision::decode_pvesh_json($out) } // [];
+        }
         my ($last) = grep { defined $_->{cpu} }
             reverse $data->@*;
         if ($last) {
@@ -6325,13 +6565,43 @@ sub metrics_cluster {
                     ? int(100 * ($_->{mem} // 0)
                         / $_->{maxmem}) : 0]
         } grep { defined $_->{cpu} } $data->@*];
+        return $row;
+    };
+    # One RRD fetch per node VM, in parallel: sequential
+    # ssh/pvesh round-trips made /summary take ~48s and
+    # the UI timed out at 30s (empty charts, error box).
+    my @node_rows;
+    my %reader;
+    for my $node ($nodes->@*) {
+        pipe(my $rd, my $wr) or die "pipe: $!\n";
+        my $pid = fork();
+        die "fork: $!\n" if !defined $pid;
+        if ($pid == 0) {
+            close $rd;
+            my $row = eval { $fetch_row->($node) }
+                // { name => $node->{host} };
+            print $wr JSON::PP->new->encode($row);
+            close $wr;
+            POSIX::_exit(0);
+        }
+        close $wr;
+        $reader{$node->{host}} = $rd;
+    }
+    for my $node ($nodes->@*) {
+        my $rd = $reader{$node->{host}};
+        local $/;
+        my $json = <$rd> // '';
+        close $rd;
+        my $row = eval { JSON::PP->new->decode($json) }
+            // { name => $node->{host} };
         push @node_rows, $row;
     }
+    while (waitpid(-1, 0) > 0) { }
     my $state = addons_state($scfg);
     my $have_ms = ($state->{'metrics-server'}
         && !$state->{'metrics-server'}{disabled}) ? 1 : 0;
     my @pod_rows;
-    if ($have_ms) {
+    if ($have_ms && !($opts && $opts->{light})) {
         my $cp = ops_cp($nodes);
         my $out = eval {
             kubectl_on($cp, 'top pods -A --no-headers') } // '';
@@ -6379,8 +6649,49 @@ sub lb_pool_size {
     return $scfg->{'public-subnet'} ? 21 : 0;
 }
 
+# The summary aggregate costs several live reads; the
+# UI polls it like Proxmox's own minute-granular RRD
+# pages, so serve a 60s pmxcfs cache (shared by all
+# hosts) instead of recomputing on every open.
+my $SUMMARY_CACHE_TTL = 60;
+
+sub summary_cache_path {
+    my ($name) = @_;
+    return "/etc/pve/k8s/summary-$name.json";
+}
+
+sub summary_cache_read {
+    my ($name) = @_;
+
+    my $path = summary_cache_path($name);
+    my @st = stat $path;
+    return undef if !@st || time() - $st[9] > $SUMMARY_CACHE_TTL;
+    my $json = eval {
+        open my $fh, '<', $path or die $!;
+        local $/;
+        <$fh>;
+    };
+    return undef if !$json;
+    return eval { JSON::PP->new->decode($json) };
+}
+
+sub summary_cache_write {
+    my ($name, $out) = @_;
+
+    eval {
+        my $path = summary_cache_path($name);
+        open my $fh, '>', "$path.tmp" or die $!;
+        print $fh JSON::PP->new->encode($out);
+        close $fh;
+        rename "$path.tmp", $path or die $!;
+    };
+}
+
 sub summary_cluster {
     my ($name) = @_;
+
+    my $cached = summary_cache_read($name);
+    return $cached if $cached;
 
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}
@@ -6402,7 +6713,23 @@ sub summary_cluster {
 
     my $live = eval {
         my $cp = ops_cp($nodes);
-        my $data = kubectl_json($cp, 'get nodes');
+        my ($data, $both);
+        my $via_api = eval {
+            my $n = k8s_api_get($name, $cp, '/api/v1/nodes');
+            my $p = k8s_api_get($name, $cp, '/api/v1/pods');
+            my $s = k8s_api_get($name, $cp, '/api/v1/services');
+            $data = $n;
+            $both = { items => [
+                ($p->{items} // [])->@*,
+                ($s->{items} // [])->@*] };
+            1;
+        } // 0;
+        if (!$via_api) {
+            my $batch = kubectl_json_batch($cp,
+                'get nodes', 'get pods,services -A');
+            $data = $batch->[0];
+            $both = $batch->[1] // {};
+        }
         my ($ready, $cp_ready) = (0, 0);
         for my $n (($data->{items} // [])->@*) {
             my ($r) = grep { ($_->{type} // '') eq 'Ready' }
@@ -6418,7 +6745,14 @@ sub summary_cluster {
         $out->{nodes_total} = scalar(($data->{items} // [])->@*)
             || $out->{nodes_total};
 
-        my $wl = eval { workloads_cluster($name) } // {};
+        my $wl = {
+            pods => pod_rows({ items => [grep {
+                ($_->{kind} // '') eq 'Pod'
+            } ($both->{items} // [])->@*] }),
+            services => service_rows({ items => [grep {
+                ($_->{kind} // '') eq 'Service'
+            } ($both->{items} // [])->@*] }),
+        };
         my @pods = ($wl->{pods} // [])->@*;
         $out->{pods} = {
             total => scalar @pods,
@@ -6438,7 +6772,7 @@ sub summary_cluster {
     } // 0;
     $out->{live} = $live ? 1 : 0;
 
-    my $metrics = eval { metrics_cluster($name) } // {};
+    my $metrics = eval { metrics_cluster($name, { light => 1 }) } // {};
     my ($mem, $maxmem, $cpu, $cpu_n) = (0, 0, 0, 0);
     for my $n (($metrics->{nodes} // [])->@*) {
         next if !defined $n->{maxmem};
@@ -6499,6 +6833,10 @@ sub summary_cluster {
     $out->{health} = summary_health($out->{state},
         $out->{cp}, $out->{cp_ready}, $out->{nodes_ready},
         $out->{live} ? $out->{nodes_total} : undef);
+    # Never cache a degraded read: a transient guest-exec
+    # failure would otherwise stick as 'unknown' for the
+    # whole TTL (seen in the lab, 2026-11-09).
+    summary_cache_write($name, $out) if $out->{live};
     return $out;
 }
 

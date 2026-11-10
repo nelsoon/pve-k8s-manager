@@ -19,7 +19,22 @@ my $pools = PVE::K8s::Config::parse_pools(
 is(scalar $pools->@*, 2, 'two pools parse');
 is($pools->[1]{labels}, 'size=big', 'pool labels carried');
 is($pools->[1]{'device-profile'}, 'gpu-future',
-    'device profile is carried (reserved, unused in v1)');
+    'device profile is carried (PCI resource mapping name)');
+
+my $sized = PVE::K8s::Config::parse_pools(
+    '[{"name":"big","size":1,"cpu":8,"memory":16384,"disk":100}]', 9);
+is($sized->[0]{cpu}, 8, 'pool cpu sizing parsed');
+is($sized->[0]{memory}, 16384, 'pool memory sizing parsed');
+is($sized->[0]{disk}, 100, 'pool disk sizing parsed');
+ok(!eval { PVE::K8s::Config::parse_pools(
+    '[{"name":"x","size":1,"cpu":0}]', 1); 1 },
+    'pool cpu below 1 is rejected');
+ok(!eval { PVE::K8s::Config::parse_pools(
+    '[{"name":"x","size":1,"memory":128}]', 1); 1 },
+    'pool memory below 512 MiB is rejected');
+ok(!eval { PVE::K8s::Config::parse_pools(
+    '[{"name":"x","size":1,"device-profile":"bad name!"}]', 1); 1 },
+    'bad device-profile mapping name is rejected');
 
 ok(!eval { PVE::K8s::Config::parse_pools('[{"name":"x"}]', 1); 1 },
     'pool without size is rejected');

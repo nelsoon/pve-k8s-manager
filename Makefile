@@ -62,6 +62,7 @@ deb:
 	@mkdir -p $(STAGE)/usr/share/pve-k8s
 	@cp -r images $(STAGE)/usr/share/pve-k8s/
 	@install -m 0755 tools/pve-k8s-scaler $(STAGE)/usr/sbin/pve-k8s-scaler
+	@install -m 0755 tools/pve-k8s-vsock-get $(STAGE)/usr/sbin/pve-k8s-vsock-get
 	@install -m 0755 tools/pve-k8s-backup $(STAGE)/usr/sbin/pve-k8s-backup
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
 		systemd/pve-k8s-backup.service systemd/pve-k8s-backup.timer \

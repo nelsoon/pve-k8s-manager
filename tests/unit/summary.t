@@ -51,7 +51,27 @@ my $js = do {
 };
 like($js, qr{/summary'}, 'overview fetches the summary aggregate');
 like($js, qr/summaryChart/, 'overview renders capacity charts');
-like($js, qr/CartesianChart/, 'charts use the stock Ext chart type');
+like($js, qr/Proxmox\.widget\.RRDChart/, 'charts use the stock RRD chart widget');
+like($js, qr/timeout: 120000/, 'summary request outlives the slow aggregate read');
+unlike($js, qr/title: gettext\('Node CPU \(last hour\)'\)/,
+    'charts are not nested in a second titled card');
+like($js, qr/Proxmox\.panel\.GaugeWidget/, 'resources use the stock gauge widget');
+like($js, qr/updateColumns/, 'summary uses the stock responsive column layout');
+like($js, qr/checkIcon\(s\.cp_ready >= s\.cp/,
+    'health rows carry per-check status icons');
+like($js, qr/title: gettext\('Overview'\)/,
+    'top card is an Overview, host-Summary style');
+like($js, qr/Node VMs CPU \(cluster average %\)/,
+    'chart title says node-VM cluster average');
+unlike($js, qr/title: gettext\('Details'\)/,
+    'no Details card duplicating Settings');
+like($js, qr/CPU Cores/, 'node group editor exposes CPU sizing');
+like($js, qr/Device Profile \(GPU\)/,
+    'node group editor exposes the device profile');
+like($js, qr|/cluster/mapping/pci|,
+    'device profile is picked from PCI mappings, not typed');
+like($js, qr/multiSelect: true/,
+    'PVE hosts are picked from a multi-select');
 my $prov = do {
     open my $fh, '<', 'PVE/K8s/Provision.pm' or die $!;
     local $/; <$fh>;
@@ -60,5 +80,41 @@ like($prov, qr/Hour series for the Summary charts/,
     'metrics carry per-node hour series');
 like($prov, qr/Cluster-average hour series/,
     'summary aggregates the series for charts');
+like($prov, qr/metrics_cluster\(\$name, \{ light => 1 \}\)/,
+    'summary uses the light metrics path (no pod top)');
+like($prov, qr/in parallel: sequential/,
+    'node RRD fetches run in parallel');
+like($prov, qr/get pods,services -A/,
+    'summary reads pods and services in one kubectl call');
+like($prov, qr/sub kubectl_json_batch|kubectl_json_batch/,
+    'kubectl reads batch behind one guest exec');
+like($prov, qr/PVE::RRD::create_rrd_data/,
+    'node RRD is read in-process, no ssh/pvesh spawn');
+like($prov, qr/SUMMARY_CACHE_TTL = 60/,
+    'summary aggregate is cached for 60s');
+like($prov, qr/qm stop is asynchronous/,
+    'node removal waits for the stop before destroy');
+like($prov, qr/map \{ kubectl_cmd\("\$_ -o json"\) \}/,
+    'every batched segment carries the kubectl prefix');
+like($prov, qr/summary_cache_write\(\$name, \$out\) if \$out->\{live\}/,
+    'degraded summaries are not cached');
+like($prov, qr/sub k8s_api_get/,
+    'reads can go over the vsock API transport');
+like($prov, qr/vhost-vsock-pci,id=vsock0/,
+    'control planes receive a vsock device at create');
+like($prov, qr/sub ensure_vsock_proxy/,
+    'provision installs the in-guest vsock proxy');
+my $vtool = do {
+    open my $fh, '<', 'tools/pve-k8s-vsock-get' or die $!;
+    local $/; <$fh>;
+};
+like($vtool, qr/AF_VSOCK is family 40|family 40/,
+    'vsock client speaks AF_VSOCK');
+my $makefile = do {
+    open my $fh, '<', 'Makefile' or die $!;
+    local $/; <$fh>;
+};
+like($makefile, qr/tools\/pve-k8s-vsock-get/,
+    'vsock client ships in the deb');
 
 done_testing();

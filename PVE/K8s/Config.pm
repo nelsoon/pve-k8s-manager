@@ -363,8 +363,11 @@ __PACKAGE__->init();
 # legacy single default pool sized by 'workers'. Labels and
 # taints are comma lists of key=value (taints key=value:Effect
 # or bare key). 'hosts' is a comma list of PVE node names the
-# pool may be placed on; 'device-profile' is reserved for
-# future GPU support and only carried, never acted on in v1.
+# pool may be placed on; 'device-profile' names a Proxmox
+# PCI resource mapping attached to the pool's VMs as
+# hostpci (GPU passthrough). Optional cpu/memory/disk
+# size the pool's VMs (defaults: 2 cores, 4096 MiB,
+# template disk).
 sub parse_pools {
     my ($json, $workers) = @_;
 
@@ -419,6 +422,40 @@ sub parse_pools {
         if (defined $pool->{policy}) {
             die "pool '$name' policy must be ha or replace\n"
                 if $pool->{policy} !~ /^(ha|replace)$/;
+        }
+        # Per-group VM sizing (absent = plugin defaults:
+        # 2 cores / 4096 MiB / template disk). Disk is
+        # grow-only at clone time.
+        if (defined $pool->{cpu}) {
+            die "pool '$name' cpu must be 1..64\n"
+                if $pool->{cpu} !~ /^\d+$/
+                    || $pool->{cpu} < 1 || $pool->{cpu} > 64;
+            $pool->{cpu} = int $pool->{cpu};
+        }
+        if (defined $pool->{memory}) {
+            die "pool '$name' memory must be 512..1048576 MiB\n"
+                if $pool->{memory} !~ /^\d+$/
+                    || $pool->{memory} < 512
+                    || $pool->{memory} > 1048576;
+            $pool->{memory} = int $pool->{memory};
+        }
+        if (defined $pool->{disk}) {
+            die "pool '$name' disk must be 8..4096 GiB\n"
+                if $pool->{disk} !~ /^\d+$/
+                    || $pool->{disk} < 8 || $pool->{disk} > 4096;
+            $pool->{disk} = int $pool->{disk};
+        }
+        # GPU/device passthrough: the value is a Proxmox
+        # PCI resource mapping name (Datacenter ->
+        # Resource Mappings); provision attaches it as
+        # hostpci to this group's VMs.
+        if (defined $pool->{'device-profile'}) {
+            die "pool '$name' device-profile must be a string\n"
+                if ref $pool->{'device-profile'};
+            die "pool '$name' device-profile is not a valid "
+                . "resource mapping name\n"
+                if $pool->{'device-profile'}
+                    !~ /^[A-Za-z0-9._-]+$/;
         }
     }
     return $pools;

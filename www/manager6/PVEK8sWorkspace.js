@@ -434,27 +434,25 @@ Ext.define('PVE.dc.K8sView', {
                 let ss = Ext.decode(rec['scaler-state'] || 'null');
                 if (ss && ss.parked) { parkedText = ss.parked; }
             } catch (e) { /* recorded by the backend */ }
-            let rows = [
-                ['Name', name],
-                ['State', rec.state || ''],
-                ['Running Action', actionText],
-                ['Storage Profile', rec['storage-profile'] || ''],
-                ['CP Failure Policy', rec['cp-policy'] || 'replace'],
-                ['Parked (awaiting placement)', parkedText],
-                ['Kubernetes', rec['k8s-version'] || ''],
-                ['Template Rev', rec['template-rev'] || ''],
-                ['Control Plane', rec.cp || ''],
-                ['Workers', rec.workers || ''],
-                ['Node Subnet', rec['node-subnet'] || ''],
-                ['Gateway', rec.gateway || ''],
-                ['SDN Zone', rec['sdn-zone'] || ''],
-                ['Public Subnet', rec['public-subnet'] || ''],
-                ['LB Range', rec['lb-range'] || ''],
-                ['Storage', rec.storage || ''],
-                ['Maintenance Window', rec['maintenance-window'] || ''],
-                ['Node Groups', poolsText],
-            ].filter(function(row) {
-                return row[1] !== '' && row[1] !== undefined;
+            let groupsInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Node Groups'),
+                // one group per line - a '; '-joined
+                // sentence wraps into mush past 2 groups
+                value: Ext.htmlEncode(poolsText)
+                    .replace(/; /g, '<br>'),
+                labelWidth: 160,
+            });
+            let actionInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Running Action'),
+                value: Ext.htmlEncode(actionText
+                    || gettext('none')),
+                labelWidth: 160,
+            });
+            let parkedInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Parked (awaiting placement)'),
+                value: Ext.htmlEncode(parkedText
+                    || gettext('none')),
+                labelWidth: 160,
             });
             let certInfo = Ext.create('Ext.form.field.Display', {
                 fieldLabel: gettext('Certificates'),
@@ -476,10 +474,13 @@ Ext.define('PVE.dc.K8sView', {
                             soon = c.certificate + ' (' + c.residual + ')';
                         }
                     });
-                    certInfo.setValue(worst === 'ok'
-                        ? gettext('ok')
-                        : Ext.String.format(gettext('{0}: next {1}'),
-                            worst, soon));
+                    certInfo.setValue((worst === 'ok'
+                        ? '<i class="fa fa-check good"></i> '
+                        : '<i class="fa fa-exclamation-triangle warning"></i> ')
+                        + (worst === 'ok'
+                            ? gettext('ok')
+                            : Ext.String.format(gettext('{0}: next {1}'),
+                                worst, soon)));
                 },
                 failure: function() {
                     certInfo.setValue(gettext('unknown'));
@@ -490,13 +491,30 @@ Ext.define('PVE.dc.K8sView', {
             // the /summary aggregate; each piece degrades to
             // 'unknown' instead of breaking the panel.
             let healthInfo = Ext.create('Ext.form.field.Display', {
-                fieldLabel: gettext('Health'),
+                fieldLabel: gettext('Status'),
                 value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let versionInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Kubernetes'),
+                value: Ext.htmlEncode(String(
+                    rec['k8s-version'] || '')),
                 labelWidth: 160,
             });
             let nodesInfo = Ext.create('Ext.form.field.Display', {
                 fieldLabel: gettext('Nodes'),
                 value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let podsInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Pods'),
+                value: gettext('loading...'),
+                labelWidth: 160,
+            });
+            let storageInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Storage Profile'),
+                value: Ext.htmlEncode(String(
+                    rec['storage-profile'] || '')),
                 labelWidth: 160,
             });
             let lbInfo = Ext.create('Ext.form.field.Display', {
@@ -514,47 +532,42 @@ Ext.define('PVE.dc.K8sView', {
                 value: gettext('none'),
                 labelWidth: 160,
             });
-            // Increment 8: hour charts in the stock
-            // Summary idiom instead of bare progress bars.
+            // Increment 9: stock Summary idiom - the
+            // toolkit RRD chart widget, same as node
+            // Summary history panels.
             let summaryChart = function(title) {
-                return Ext.create('Ext.chart.CartesianChart', {
-                    height: 140,
+                return Ext.create('Proxmox.widget.RRDChart', {
+                    height: 250,
                     title: title,
+                    fields: ['pct'],
+                    fieldTitles: [title],
+                    unit: 'percent',
                     store: Ext.create('Ext.data.Store', {
                         fields: [
                             { name: 'time', type: 'date' },
                             { name: 'pct', type: 'int' },
                         ],
                     }),
-                    axes: [{
-                        type: 'numeric',
-                        position: 'left',
-                        minimum: 0,
-                        maximum: 100,
-                        grid: true,
-                        label: { fontSize: 9 },
-                    }, {
-                        type: 'time',
-                        position: 'bottom',
-                        dateFormat: 'H:i',
-                        label: { fontSize: 9 },
-                    }],
-                    series: [{
-                        type: 'line',
-                        xField: 'time',
-                        yField: 'pct',
-                        style: { lineWidth: 2 },
-                        highlight: true,
-                    }],
                 });
             };
+            let cpuGauge = Ext.create('Proxmox.panel.GaugeWidget', {
+                title: gettext('CPU'),
+                flex: 1,
+            });
+            let memGauge = Ext.create('Proxmox.panel.GaugeWidget', {
+                title: gettext('Memory'),
+                flex: 1,
+                warningThreshold: 0.9,
+                criticalThreshold: 0.975,
+            });
             let summaryChartMem = summaryChart(
-                gettext('Node memory % (last hour)'));
+                gettext('Node VMs memory (cluster average %)'));
             let summaryChartCpu = summaryChart(
-                gettext('Node CPU % (last hour)'));
+                gettext('Node VMs CPU (cluster average %)'));
             api({
                 url: '/cluster/k8s/' + name + '/summary',
                 method: 'GET',
+                timeout: 120000,
                 success: function(r) {
                     let s = r.result.data || {};
                     let icons = {
@@ -567,28 +580,63 @@ Ext.define('PVE.dc.K8sView', {
                     healthInfo.setValue('<i class="' + icon
                         + '"></i> ' + Ext.htmlEncode(
                             String(s.health || 'unknown')));
+                    // Datacenter-Health idiom: every
+                    // check carries its own status icon
+                    let checkIcon = function(ok, warn) {
+                        return ok
+                            ? '<i class="fa fa-check good"></i> '
+                            : warn
+                                ? '<i class="fa fa-exclamation-triangle warning"></i> '
+                                : '<i class="fa fa-times critical"></i> ';
+                    };
+                    let cpQuorum = Math.floor((s.cp || 0) / 2) + 1;
                     nodesInfo.setValue(s.nodes_ready !== undefined
                         && s.nodes_ready !== null
-                        ? Ext.String.format(gettext(
-                            '{0}/{1} Ready (control plane {2}/{3})'),
-                            s.nodes_ready, s.nodes_total,
-                            s.cp_ready, s.cp)
+                        ? checkIcon(s.cp_ready >= s.cp
+                                && s.nodes_ready >= s.nodes_total,
+                            s.cp_ready >= cpQuorum)
+                            + Ext.String.format(gettext(
+                                '{0}/{1} Ready (control plane {2}/{3})'),
+                                s.nodes_ready, s.nodes_total,
+                                s.cp_ready, s.cp)
+                        : gettext('unknown'));
+                    podsInfo.setValue(s.pods
+                        ? checkIcon(s.pods.pending === 0,
+                            s.pods.running > 0)
+                            + Ext.String.format(gettext(
+                                '{0} running, {1} pending, {2} total'),
+                                s.pods.running, s.pods.pending,
+                                s.pods.total)
                         : gettext('unknown'));
                     lbInfo.setValue(s.lb
-                        ? Ext.String.format(gettext('{0} of {1} used'),
-                            s.lb.used, s.lb.total)
+                        ? checkIcon(true, false)
+                            + Ext.String.format(gettext('{0} of {1} used'),
+                                s.lb.used, s.lb.total)
                         : gettext('unknown'));
                     backupInfo.setValue(s.backup
-                        ? Ext.Date.format(
+                        ? checkIcon(true, false) + Ext.Date.format(
                             new Date(s.backup.last * 1000),
                             'Y-m-d H:i')
-                        : gettext('none'));
+                        : checkIcon(false, true) + gettext('none'));
                     haInfo.setValue(s.ha_errors
                         && s.ha_errors.length
                         ? '<i class="fa fa-times critical"></i> '
                             + Ext.htmlEncode(
                                 s.ha_errors.join(', '))
-                        : gettext('none'));
+                        : '<i class="fa fa-check good"></i> '
+                            + gettext('none'));
+                    if (s.capacity) {
+                        cpuGauge.updateValue(
+                            (s.capacity.cpu_pct || 0) / 100,
+                            gettext('node VMs (average)'));
+                        memGauge.updateValue(
+                            (s.capacity.mem_pct || 0) / 100,
+                            Ext.String.format('{0} of {1} GiB',
+                                ((s.capacity.mem_used || 0)
+                                    / 1073741824).toFixed(1),
+                                ((s.capacity.mem_total || 0)
+                                    / 1073741824).toFixed(1)));
+                    }
                     if (s.series) {
                         let toRows = function(pts) {
                             return (pts || []).map(function(p) {
@@ -607,6 +655,7 @@ Ext.define('PVE.dc.K8sView', {
                 failure: function() {
                     healthInfo.setValue(gettext('unknown'));
                     nodesInfo.setValue(gettext('unknown'));
+                    podsInfo.setValue(gettext('unknown'));
                     lbInfo.setValue(gettext('unknown'));
                     backupInfo.setValue(gettext('unknown'));
                 },
@@ -724,28 +773,57 @@ Ext.define('PVE.dc.K8sView', {
                     }),
                 ],
                 items: [{
-                    xtype: 'form',
+                    // Increment 9: Datacenter-Summary
+                    // skeleton - column layout of titled
+                    // cards (Health / Resources / history /
+                    // Details), stock widgets only.
+                    xtype: 'panel',
                     border: false,
-                    items: rows.map(function(row) {
-                        let value = Ext.htmlEncode(String(row[1]));
-                        if (row[0] === 'State') {
-                            // stock state icon, like the
-                            // cluster list renders it
-                            let icon = row[1] === 'ready'
-                                ? 'fa fa-check good'
-                                : 'fa fa-exclamation-triangle warning';
-                            value = '<i class="' + icon + '"></i> '
-                                + value;
-                        }
-                        return {
-                            xtype: 'displayfield',
-                            fieldLabel: row[0],
-                            value: value,
-                            labelWidth: 160,
-                        };
-                    }).concat([healthInfo, nodesInfo, lbInfo,
-                        backupInfo, haInfo, summaryChartMem,
-                        summaryChartCpu, certInfo]),
+                    layout: 'column',
+                    defaults: { padding: 5, columnWidth: 1 },
+                    listeners: {
+                        resize: function(panel) {
+                            Proxmox.Utils.updateColumns(panel);
+                        },
+                    },
+                    items: [
+                        {
+                            title: gettext('Overview'),
+                            xtype: 'panel',
+                            bodyPadding: 10,
+                            minHeight: 250,
+                            layout: 'column',
+                            defaults: { columnWidth: 0.5 },
+                            items: [
+                                {
+                                    xtype: 'container',
+                                    items: [healthInfo,
+                                        versionInfo, nodesInfo,
+                                        podsInfo, lbInfo],
+                                },
+                                {
+                                    xtype: 'container',
+                                    items: [storageInfo,
+                                        groupsInfo, actionInfo,
+                                        parkedInfo, haInfo,
+                                        backupInfo, certInfo],
+                                },
+                            ],
+                        },
+                        {
+                            title: gettext('Resources'),
+                            xtype: 'panel',
+                            bodyPadding: 5,
+                            minHeight: 250,
+                            layout: 'hbox',
+                            items: [cpuGauge, memGauge],
+                        },
+                        // the RRD chart widget carries
+                        // its own header/legend - no
+                        // wrapping card (that nested it)
+                        summaryChartCpu,
+                        summaryChartMem,
+                    ],
                 }],
             });
         };
@@ -883,6 +961,29 @@ Ext.define('PVE.dc.K8sView', {
                     },
                 });
             };
+            // Resource fields are selectors, not free
+            // text: hosts, storages and PCI mappings all
+            // come from the PVE API (typed values that do
+            // not exist fail much later otherwise).
+            let pickStore = function(field, url, key) {
+                let store = Ext.create('Ext.data.Store', {
+                    fields: [field],
+                });
+                api({
+                    url: url,
+                    method: 'GET',
+                    success: function(r) {
+                        store.loadData((r.result.data || [])
+                            .map(function(row) {
+                                let rec = {};
+                                rec[field] = row[key || field];
+                                return rec;
+                            }));
+                    },
+                    failure: function() { /* type-ahead stays empty */ },
+                });
+                return store;
+            };
             let groupWindow = function(existing) {
                 let isNew = !existing;
                 let win;
@@ -934,16 +1035,62 @@ Ext.define('PVE.dc.K8sView', {
                             emptyText: 'key=value:NoSchedule,...',
                         },
                         {
-                            xtype: 'textfield', name: 'hosts',
+                            xtype: 'combobox', name: 'hosts',
                             fieldLabel: gettext('PVE Hosts'),
-                            value: existing ? (existing.hosts || '') : '',
-                            emptyText: gettext('any (comma-separated to pin)'),
+                            store: pickStore('node', '/nodes'),
+                            displayField: 'node',
+                            valueField: 'node',
+                            multiSelect: true,
+                            editable: false,
+                            value: existing && existing.hosts
+                                ? existing.hosts.split(',') : [],
+                            emptyText: gettext('any host'),
                         },
                         {
-                            xtype: 'textfield', name: 'storage',
+                            xtype: 'combobox', name: 'storage',
                             fieldLabel: gettext('Storage'),
+                            store: pickStore('storage', '/storage'),
+                            displayField: 'storage',
+                            valueField: 'storage',
+                            editable: true,
                             value: existing ? (existing.storage || '') : '',
                             emptyText: gettext('cluster default'),
+                        },
+                        {
+                            xtype: 'numberfield', name: 'cpu',
+                            fieldLabel: gettext('CPU Cores'),
+                            value: existing ? (existing.cpu || '') : '',
+                            minValue: 1, maxValue: 64,
+                            allowBlank: true,
+                            emptyText: gettext('default 2'),
+                        },
+                        {
+                            xtype: 'numberfield', name: 'memory',
+                            fieldLabel: gettext('Memory (MiB)'),
+                            value: existing ? (existing.memory || '') : '',
+                            minValue: 512, maxValue: 1048576,
+                            allowBlank: true,
+                            emptyText: gettext('default 4096'),
+                        },
+                        {
+                            xtype: 'numberfield', name: 'disk',
+                            fieldLabel: gettext('Disk (GiB)'),
+                            value: existing ? (existing.disk || '') : '',
+                            minValue: 8, maxValue: 4096,
+                            allowBlank: true,
+                            emptyText: gettext('template size'),
+                        },
+                        {
+                            xtype: 'combobox', name: 'device-profile',
+                            fieldLabel: gettext('Device Profile (GPU)'),
+                            store: pickStore('id',
+                                '/cluster/mapping/pci'),
+                            displayField: 'id',
+                            valueField: 'id',
+                            editable: true,
+                            value: existing
+                                ? (existing['device-profile'] || '') : '',
+                            emptyText: gettext('PVE PCI resource mapping'),
                         },
                         {
                             // HA is refused by the backend
@@ -973,6 +1120,9 @@ Ext.define('PVE.dc.K8sView', {
                             handler: function() {
                                 if (!gform.isValid()) { return; }
                                 let v = gform.getValues();
+                                if (Ext.isArray(v.hosts)) {
+                                    v.hosts = v.hosts.join(',');
+                                }
                                 if (!(v.min <= v.size && v.size <= v.max)) {
                                     Ext.Msg.alert(gettext('Error'),
                                         gettext('Min <= Nodes <= Max required'));
@@ -985,9 +1135,17 @@ Ext.define('PVE.dc.K8sView', {
                                     max: parseInt(v.max, 10),
                                 };
                                 ['labels', 'taints', 'hosts',
-                                    'storage', 'arch', 'policy']
+                                    'storage', 'arch', 'policy',
+                                    'device-profile']
                                     .forEach(function(k) {
                                         if (v[k]) { entry[k] = v[k]; }
+                                    });
+                                ['cpu', 'memory', 'disk']
+                                    .forEach(function(k) {
+                                        if (v[k] !== '' && v[k] !== null
+                                            && v[k] !== undefined) {
+                                            entry[k] = parseInt(v[k], 10);
+                                        }
                                     });
                                 let groups = currentGroups().filter(
                                     function(gr) {
