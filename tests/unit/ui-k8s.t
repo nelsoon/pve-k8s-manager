@@ -18,9 +18,15 @@ like($js, qr/alias: 'widget\.pveDcK8sView'/,
     'view registers the pveDcK8sView xtype used by the dc.Config tab');
 like($js, qr|url: '/api2/json/cluster/k8s'|,
     'grid reads the cluster list from the REST API');
-for my $field (qw(name k8s-version cp node-subnet gateway lb-range storage sdn-zone cp-arch)) {
+for my $field (qw(name k8s-version cp node-subnet public-subnet gateway lb-range storage resilience sdn-zone cp-arch)) {
     like($js, qr/name: '\Q$field\E'/, "create wizard has the $field field");
 }
+like($js, qr/name: 'storage-profile'/,
+    'bundle still submits the storage profile');
+like($js, qr/name: 'cp-policy'/,
+    'bundle still submits the CP policy');
+like($js, qr/delete values\.resilience/,
+    'resilience preset itself is never submitted');
 for my $field (qw(workers pools)) {
     unlike($js, qr/name: '\Q$field\E'/, "create wizard has no $field field");
 }

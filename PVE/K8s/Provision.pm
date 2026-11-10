@@ -1635,6 +1635,14 @@ sub delete_cluster {
     for my $vmname (sort keys $vmids->%*) {
         my ($vmid, $host) = $vmids->{$vmname}->@{qw(vmid node)};
         eval { qm_on($host, 'stop', $vmid) };
+        # Stop is async; wait for it so the destroy
+        # below never races a running guest.
+        for (1 .. 30) {
+            my $st = eval {
+                qm_on($host, 'status', $vmid) } // '';
+            last if $st =~ /^status:\s*stopped/m;
+            sleep 2;
+        }
         qm_on($host, 'destroy', $vmid, '--purge',
             '--destroy-unreferenced-disks', 1);
         remove_snippet_on($host, "k8s-$vmname.yaml");
@@ -2422,9 +2430,14 @@ sub provision_cluster {
     # builder address: the plugin builds its own template
     # instead of dying "build one first" (fresh installs
     # must not need operator shell work).
-    if ($local_tpl_rev < 0 && $any_tpl_rev < 0
-        && $scfg->{'builder-ip'}) {
+    if ($local_tpl_rev < 0 && $any_tpl_rev < 0) {
         print "no template for $version; building one\n";
+        # A Basics-only create must work with zero
+        # Advanced answers, so a missing builder-ip is
+        # not an error: the builder boots with DHCP on
+        # the host LAN (nothing ever dials into it; all
+        # interaction is qm guest exec).
+        my $builder_ip = $scfg->{'builder-ip'};
         # The builder lives on the host LAN (vmbr0), not in
         # the cluster VNet: its gateway is this host's own
         # default gateway, never the VNet gateway (a
@@ -2433,7 +2446,7 @@ sub provision_cluster {
         # internet - first physical install, 2026-11-07).
         my $host_gw = host_default_gateway();
         build_template($version,
-            builder_ip => $scfg->{'builder-ip'},
+            builder_ip => $builder_ip,
             gateway => $host_gw, storage => $storage,
             arch => $cp_arch);
         (undef, $local_tpl_rev) = find_template_in_list(
@@ -6932,14 +6945,19 @@ sub build_template {
         if !-f "$dir/build-template.sh";
     my $storage = $opts{storage} // 'local-zfs';
     my $vmid = $opts{vmid} // 9000;
-    my $ip = $opts{builder_ip}
-        or die "build_template needs a free builder IP "
-            . "on the host network (builder_ip)\n";
-    my $gw = $opts{gateway}
-        or die "build_template needs the host gateway (gateway)\n";
+    # Static builder address is optional: unset means
+    # the builder boots with DHCP (see build-template.sh).
+    # A gateway is only required alongside a static IP.
+    my $env = '';
+    if ($opts{builder_ip}) {
+        my $gw = $opts{gateway}
+            or die "build_template needs the host gateway "
+                . "alongside a static builder IP\n";
+        $env = "BUILDER_IP=$opts{builder_ip} BUILDER_GW=$gw ";
+    }
     my $arch = $opts{arch} // 'amd64';
     my $out = run(['sh', '-c',
-        "cd $dir && BUILDER_IP=$ip BUILDER_GW=$gw "
+        "cd $dir && ${env}"
         . "./build-template.sh --k8s-version $version "
         . "--arch $arch --storage $storage --vmid $vmid"],
         timeout => 3600);

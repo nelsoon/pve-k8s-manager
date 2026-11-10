@@ -2,10 +2,12 @@
 # Build an immutable Kubernetes node template on a Proxmox node.
 # Runs as root on the PVE node. See README.md in this directory.
 #
-# Required env (or flags):
-#   BUILDER_IP   static IP for the throwaway builder VM, e.g. 192.168.200.50
-#   BUILDER_GW   gateway for the builder VM, e.g. 192.168.200.1
-# Optional:
+# Optional env (or flags):
+#   BUILDER_IP   static IP for the throwaway builder VM, e.g. 10.0.2.70
+#   BUILDER_GW   gateway for the builder VM, e.g. 10.0.2.1
+#   Unset both and the builder uses DHCP on the host LAN
+#   (all interaction is via qm guest exec, so the address
+#   never needs to be known ahead of time).
 #   --storage <id>   storage for the template disk (default local-zfs)
 #   --vmid <id>      VMID to use for builder/template (default 9000)
 #   --bridge <id>    bridge for the builder VM (default vmbr0)
@@ -41,8 +43,12 @@ esac
 [ -f "versions/$K8S_VERSION.env" ] || { echo "no pin file versions/$K8S_VERSION.env" >&2; exit 2; }
 . "versions/$K8S_VERSION.env"
 
-: "${BUILDER_IP:?set BUILDER_IP (static IP for the builder VM)}"
-: "${BUILDER_GW:?set BUILDER_GW (gateway for the builder VM)}"
+if [ -n "${BUILDER_IP:-}" ]; then
+    : "${BUILDER_GW:?set BUILDER_GW alongside BUILDER_IP}"
+    IPCONFIG="ip=$BUILDER_IP/24,gw=$BUILDER_GW"
+else
+    IPCONFIG="ip=dhcp"
+fi
 
 CACHE_DIR=/var/lib/vz/template/cache
 IMAGE=$CACHE_DIR/$DEBIAN_IMAGE_NAME
@@ -79,7 +85,7 @@ qm create "$VMID" --name "$NAME" --memory "$TEMPLATE_MEMORY" \
     --boot order=scsi0 --agent enabled=1 \
     --ide2 "$STORAGE:cloudinit" \
     --cicustom "user=local:snippets/k8s-node-user-data.yaml" \
-    --ipconfig0 "ip=$BUILDER_IP/24,gw=$BUILDER_GW" \
+    --ipconfig0 "$IPCONFIG" \
     --nameserver "${BUILDER_DNS:-1.1.1.1}" \
     --serial0 socket --vga serial0 >/dev/null
 

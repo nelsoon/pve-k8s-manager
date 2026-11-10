@@ -269,6 +269,30 @@ __PACKAGE__->register_method({
         my $cp = PVE::K8s::Config::assert_valid_cp_count($param->{cp} // 3);
         # new clusters only on upstream-supported minors
         PVE::K8s::Config::assert_supported_version($param->{'k8s-version'});
+        # Node networking needs no decision: first free
+        # /24 in 10.10.0.0/16 unless the caller pins one.
+        # (The dialog shows the same suggestion, computed
+        # the same way, so API and UI agree.)
+        if (!$param->{'node-subnet'}) {
+            my $cfg = PVE::K8s::Config->config();
+            my @used = map { $cfg->{ids}->{$_}->{'node-subnet'} }
+                keys $cfg->{ids}->%*;
+            $param->{'node-subnet'} =
+                PVE::K8s::Config::allocate_node_subnet(\@used);
+        }
+        # Fail fast on the classic mismatch: HA policy on
+        # non-shared storage silently degraded to replace
+        # at provision time. Refuse here instead.
+        if (($param->{'cp-policy'} // '') eq 'ha' && $param->{storage}) {
+            my $shared = eval {
+                require PVE::Storage;
+                PVE::Storage::config()->{ids}
+                    ->{$param->{storage}}->{shared};
+            } // 0;
+            die "cp-policy 'ha' needs a shared storage; "
+                . "'$param->{storage}' is not shared\n"
+                if !$shared;
+        }
         PVE::K8s::Config::assert_network_config($param);
         PVE::K8s::Config::assert_file_config($param);
         # validate pools eagerly so a bad pool spec fails at

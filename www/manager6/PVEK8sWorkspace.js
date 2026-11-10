@@ -19,6 +19,33 @@ Ext.define('PVE.dc.K8sCreateWindow', {
     initComponent: function() {
         let me = this;
 
+        // The Resilience bundle keeps storage, profile
+        // and CP policy in agreement. One entry point
+        // for the preset combo and the storage store's
+        // first load (a setValue no-op must not skip
+        // the filter).
+        let applyResilience = function(win, preset) {
+            let shared = preset !== 'local-replace';
+            win.down('[name=storage-profile]')
+                .setValue(shared ? 'shared' : 'local');
+            win.down('[name=cp-policy]')
+                .setValue(shared ? 'ha' : 'replace');
+            let sc = win.down('[name=storage]');
+            let store = sc.getStore();
+            store.clearFilter();
+            store.filterBy(function(r) {
+                return (r.get('shared') ? 1 : 0)
+                    === (shared ? 1 : 0);
+            });
+            let cur = store.findRecord(
+                'storage', sc.getValue());
+            if (!cur) {
+                let first = store.getAt(0);
+                sc.setValue(first
+                    ? first.get('storage') : '');
+            }
+        };
+
         let form = Ext.create('Ext.form.Panel', {
             bodyPadding: 10,
             border: false,
@@ -60,8 +87,33 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             editable: false,
                         },
                         {
+                            // One bundle, not three knobs:
+                            // storage, profile and CP policy
+                            // always agree, so the mismatch
+                            // state (HA on local storage) is
+                            // unreachable. The backend
+                            // refuses it too, as a second
+                            // net for API callers.
+                            xtype: 'combobox',
+                            name: 'resilience',
+                            fieldLabel: gettext('Availability'),
+                            store: [
+                                ['shared-ha', gettext('High availability (shared storage)')],
+                                ['local-replace', gettext('Standard (local storage)')],
+                            ],
+                            value: 'shared-ha',
+                            editable: false,
+                            listeners: {
+                                change: function(combo, preset) {
+                                    applyResilience(
+                                        combo.up('window'), preset);
+                                },
+                            },
+                        },
+                        {
                             // select from existing storages,
-                            // never free text
+                            // never free text; filtered to
+                            // the Resilience preset above
                             xtype: 'combobox',
                             name: 'storage',
                             fieldLabel: gettext('Storage'),
@@ -72,6 +124,29 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                                     url: '/api2/json/storage',
                                 },
                                 autoLoad: true,
+                                listeners: {
+                                    load: function(store) {
+                                        let wins = Ext.ComponentQuery
+                                            .query('window');
+                                        let win = wins.length
+                                            ? wins[wins.length - 1]
+                                            : null;
+                                        let combo = win && win.down(
+                                            '[name=resilience]');
+                                        if (!combo) { return; }
+                                        let anyShared = false;
+                                        store.each(function(r) {
+                                            if (r.get('shared')) {
+                                                anyShared = true;
+                                            }
+                                        });
+                                        let preset = anyShared
+                                            ? 'shared-ha'
+                                            : 'local-replace';
+                                        combo.setValue(preset);
+                                        applyResilience(win, preset);
+                                    },
+                                },
                             }),
                             displayField: 'storage',
                             valueField: 'storage',
@@ -80,58 +155,21 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             emptyText: gettext('Proxmox storage for node disks'),
                         },
                         {
-                            xtype: 'combobox',
+                            xtype: 'hiddenfield',
                             name: 'storage-profile',
-                            fieldLabel: gettext('Storage Profile'),
-                            store: [
-                                ['shared', gettext('Shared (Ceph)')],
-                                ['local', gettext('Local disks')],
-                            ],
                             value: 'shared',
-                            editable: false,
-                            listeners: {
-                                // preselect the first storage
-                                // matching the profile, so the
-                                // common case needs no second
-                                // decision (Increment 7)
-                                change: function(combo, profile) {
-                                    let sc = combo.up('window')
-                                        .down('[name=storage]');
-                                    if (!sc || !sc.getStore()) {
-                                        return;
-                                    }
-                                    let want = profile === 'shared'
-                                        ? 1 : 0;
-                                    let found = null;
-                                    sc.getStore().each(function(r) {
-                                        if (!found
-                                            && (r.get('shared') ? 1 : 0)
-                                                === want) {
-                                            found = r;
-                                        }
-                                    });
-                                    if (found) {
-                                        sc.setValue(
-                                            found.get('storage'));
-                                    }
-                                },
-                            },
                         },
                         {
-                            // HA is refused by the backend when
-                            // the disk storage is not shared;
-                            // the submit handler checks first
-                            // so the user hears it here, not
-                            // mid-provision
-                            xtype: 'combobox',
+                            xtype: 'hiddenfield',
                             name: 'cp-policy',
-                            fieldLabel: gettext('Control Plane Failure Policy'),
-                            store: [
-                                ['replace', gettext('Replace (plugin rebuilds)')],
-                                ['ha', gettext('HA (Proxmox reboots VM)')],
-                            ],
-                            value: 'replace',
-                            editable: false,
+                            value: 'ha',
+                        },
+                        {
+                            xtype: 'displayfield',
+                            value: gettext('Shared storage enables Proxmox HA '
+                                + 'for all nodes; local storage rebuilds '
+                                + 'failed nodes instead. Control plane VMs '
+                                + 'always migrate on planned maintenance.'),
                         },
                         {
                             // select from existing SDN zones
@@ -170,6 +208,12 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             },
                         },
                         {
+                            xtype: 'textfield',
+                            name: 'public-subnet',
+                            fieldLabel: gettext('Public Subnet (LB/VIP)'),
+                            emptyText: '192.168.3.0/24',
+                        },
+                        {
                             xtype: 'displayfield',
                             value: gettext('A default worker group '
                                 + '(2 nodes) is created with the cluster. '
@@ -180,40 +224,34 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                 },
                 {
                     xtype: 'fieldset',
-                    title: gettext('Advanced (network, architecture)'),
+                    title: gettext('Advanced (overrides)'),
                     collapsible: true,
                     collapsed: true,
                     defaults: { anchor: '100%', labelWidth: 160 },
                     items: [
                         {
                             xtype: 'textfield',
-                            name: 'public-subnet',
-                            fieldLabel: gettext('Public Subnet (LB/VIP)'),
-                            emptyText: '192.168.212.0/24',
-                        },
-                        {
-                            xtype: 'textfield',
                             name: 'node-subnet',
-                            fieldLabel: gettext('SDN Node Subnet'),
-                            emptyText: '192.168.200.0/24',
+                            fieldLabel: gettext('Node Subnet'),
+                            emptyText: gettext('auto: first free 10.10.x.0/24'),
                         },
                         {
                             xtype: 'textfield',
                             name: 'gateway',
                             fieldLabel: gettext('Gateway'),
-                            emptyText: '192.168.200.1',
+                            emptyText: gettext('auto: .1 of the node subnet'),
                         },
                         {
                             xtype: 'textfield',
                             name: 'lb-range',
                             fieldLabel: gettext('LoadBalancer Range'),
-                            emptyText: '192.168.200.100-192.168.200.120',
+                            emptyText: gettext('auto: .100-.120 of the public subnet'),
                         },
                         {
                             xtype: 'textfield',
                             name: 'builder-ip',
                             fieldLabel: gettext('Template Builder IP'),
-                            emptyText: gettext('free IP; plugin builds a missing template itself'),
+                            emptyText: gettext('auto: DHCP on the host LAN'),
                         },
                         {
                             xtype: 'combobox',
@@ -238,27 +276,17 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                             return;
                         }
                         let values = form.getValues();
+                        // resilience is a dialog-only bundle:
+                        // profile and policy travel, it does not
+                        delete values.resilience;
                         // optional fields: omit blanks entirely
+                        // (a blank node-subnet means the
+                        // backend allocates one)
                         Object.keys(values).forEach(function(key) {
                             if (values[key] === '') {
                                 delete values[key];
                             }
                         });
-                        if (values['cp-policy'] === 'ha') {
-                            let sc = form.down('[name=storage]');
-                            let rec = sc && sc.getStore()
-                                ? sc.getStore().findRecord(
-                                    'storage', sc.getValue())
-                                : null;
-                            if (!rec || !rec.get('shared')) {
-                                Ext.Msg.alert(gettext('Error'),
-                                    gettext('HA needs shared storage '
-                                    + 'for the control-plane disks. '
-                                    + 'Pick a shared storage or the '
-                                    + 'Replace policy.'));
-                                return;
-                            }
-                        }
                         // worker groups are managed after
                         // creation, under Nodes; the backend
                         // default (one group of 2) applies

@@ -100,6 +100,12 @@ like($prov, qr/summary_cache_write\(\$name, \$out\) if \$out->\{live\}/,
     'degraded summaries are not cached');
 like($prov, qr/sub k8s_api_get/,
     'reads can go over the vsock API transport');
+like($prov, qr/Stop is async; wait for it so the destroy/,
+    'cluster delete waits for stop before destroy');
+like($prov, qr/the builder boots with DHCP/,
+    'template auto-build uses DHCP when no builder IP is set');
+like($prov, qr/alongside a static builder IP/,
+    'template build still accepts a pinned static IP');
 like($prov, qr/vhost-vsock-pci,id=vsock0/,
     'control planes receive a vsock device at create');
 like($prov, qr/sub ensure_vsock_proxy/,

@@ -510,6 +510,24 @@ sub assert_valid_cp_count {
 # EVPN zone holding an internal subnet (node-subnet, never
 # advertised) and the public subnet (LB IPs + apiserver
 # VIP, the only range meant to leave the VRF).
+# First free /24 in 10.10.0.0/16 for a cluster's
+# node subnet (pure: takes used subnet strings, so
+# create and the UI suggest the same value). N=0 is
+# skipped (network address reads oddly in labels).
+sub allocate_node_subnet {
+    my ($used) = @_;
+
+    my %taken;
+    for my $s (($used // [])->@*) {
+        my ($n) = ($s // '') =~ /^10\.10\.(\d+)\.0\/24$/;
+        $taken{$n} = 1 if defined $n;
+    }
+    for my $n (1 .. 254) {
+        return "10.10.$n.0/24" if !$taken{$n};
+    }
+    die "no free /24 left in 10.10.0.0/16\n";
+}
+
 sub assert_network_config {
     my ($param) = @_;
 

@@ -88,8 +88,21 @@ like($js, qr/name: 'storage-profile'/,
     'create form has the storage profile selector');
 like($js, qr/name: 'cp-policy'/,
     'create/settings carry the CP failure policy');
-like($js, qr/HA needs shared storage/,
+like($js, qr/High availability \(shared storage\)/,
+    'create offers the availability bundle, not separate knobs');
+my $api = do {
+    open my $fh, '<', 'PVE/API2/Cluster/K8s.pm' or die $!;
+    local $/; <$fh>;
+};
+like($api, qr/cp-policy 'ha' needs a shared storage/,
     'create refuses HA on non-shared storage up front');
+like($api, qr/allocate_node_subnet/,
+    'create auto-allocates a node subnet when blank');
+is(PVE::K8s::Config::allocate_node_subnet([]),
+    '10.10.1.0/24', 'first cluster takes 10.10.1.0/24');
+is(PVE::K8s::Config::allocate_node_subnet(
+        ['10.10.1.0/24', '10.10.2.0/24', '192.168.1.0/24']),
+    '10.10.3.0/24', 'allocation skips taken subnets, ignores foreign ranges');
 like($js, qr/name: 'policy',\n\s+fieldLabel: gettext\('Failure Policy'\)/,
     'node group editor has a failure policy');
 like($js, qr/Parked \(awaiting placement\)/,

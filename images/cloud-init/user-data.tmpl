@@ -41,6 +41,12 @@ write_files:
   - path: /etc/containerd/config.toml
     content: |
       version = 2
+      # Cilium drops its binary in /opt/cni/bin, but the
+      # Debian 13 containerd defaults bin_dir to
+      # /usr/lib/cni (Debian 12 defaulted to /opt/cni/bin,
+      # which is why old templates worked). Pin it.
+      [plugins."io.containerd.grpc.v1.cri".cni]
+        bin_dir = "/opt/cni/bin"
       [plugins."io.containerd.grpc.v1.cri"]
         sandbox_image = "registry.k8s.io/pause:3.10"
       [plugins."io.containerd.grpc.v1.cri".containerd]
