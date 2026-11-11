@@ -75,6 +75,14 @@ ok(!PVE::K8s::Provision::size_drift(
     { cpu => 0, memory => 0 }, 2, 4096),
     'zero def: never drift');
 
+# Regression: a Roll must re-sync HA registration, or replacement
+# workers silently lose live-migration on planned host shutdown.
+open my $psrc, '<', 'PVE/K8s/Provision.pm' or die $!;
+my $code = do { local $/; <$psrc> };
+my ($roll) = $code =~ /^sub roll_cluster \{(.*?)^\}/ms;
+my $n = () = ($roll // '') =~ /sync_ha_resources\(/g;
+ok($n >= 3, 'roll_cluster syncs HA per node, at the end and when current');
+
 my $dp = { cpu => 4, memory => 8096, disk => 50,
     device_profile => 'gpu1' };
 ok(!PVE::K8s::Provision::size_drift($dp, 4, 8096, 60 * 1024, 'gpu1'),

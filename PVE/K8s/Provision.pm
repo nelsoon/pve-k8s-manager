@@ -4560,6 +4560,10 @@ sub roll_cluster {
     } @nodes);
     if (!@work) {
         print "all nodes already on Kubernetes $version r$want_rev\n";
+        # Idempotent self-heal: nodes created by older roll/scale
+        # code may be missing their HA registration.
+        eval { sync_ha_resources($name, $scfg, \@nodes) };
+        print "warning: HA resource sync failed: $@" if $@;
         return 0;
     }
 
@@ -4805,6 +4809,10 @@ sub roll_cluster {
         $cp1 = (grep { $_->{role} eq 'cp' } @nodes)[0]
             if $cp1->{host} eq $old->{host};
         store_inventory($name, \@nodes, $want_rev);
+        # Register the replacement (and drop the retired VM's
+        # entry) so it keeps HA live-migration on host shutdown.
+        eval { sync_ha_resources($name, $scfg, \@nodes) };
+        print "warning: HA resource sync failed: $@" if $@;
         print "rolled $old->{host} -> $new->{host}\n";
     }
 
@@ -4816,6 +4824,8 @@ sub roll_cluster {
         });
     }
     store_inventory($name, \@nodes, $want_rev);
+    eval { sync_ha_resources($name, $scfg, \@nodes) };
+    print "warning: HA resource sync failed: $@" if $@;
     set_state($name, 'ready');
     print "cluster '$name' rolled: all nodes on $version r$want_rev\n";
     return 1;
