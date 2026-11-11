@@ -4108,12 +4108,12 @@ sub scale_reconcile {
         }
         push @sim_nodes, $sim;
     }
-    my ($worker_sim) = grep {
-        ($_->{labels}{'pve-k8s.proxmox.com/pool'} // '') ne 'control-plane'
-    } @sim_nodes;
-    my $tmpl = $worker_sim
-        ? { cpu => $worker_sim->{cpu}, mem => $worker_sim->{mem} }
-        : { cpu => 2000, mem => 4 * 1024**3 };
+    # A new node's size comes from its own pool (a live node of
+    # that pool, else the pool definition), minus what DaemonSets
+    # already take; see PVE::K8s::Scaler::pool_template.
+    my $ds_overhead = PVE::K8s::Scaler::daemonset_overhead(\@sim_nodes);
+    my $sstate = eval {
+        JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
 
     my $now = time();
     # Age gate: ignore pods created in the last 2 minutes.
@@ -4175,36 +4175,45 @@ sub scale_reconcile {
         }
     }
 
-    # Scale out, one pool per pass.
+    # Scale out, one pool per pass. Every pool with room is
+    # evaluated; among those the pending pods fit, the one adding
+    # the least capacity wins (not config order), limited by what
+    # the Proxmox hosts can really take.
     if (@pending) {
+        my $res = eval {
+            run(['pvesh', 'get', '/cluster/resources',
+                '--type', 'node', '--output-format', 'json'],
+                timeout => 60);
+        } // '';
+        my $hosts = eval { JSON::PP->new->decode($res) } // [];
+        my (@cands, @blocked);
         for my $pool ($pools->@*) {
-            my $room = ($pool->{max} // $pool->{size})
-                - $pool->{size};
+            my $room = ($pool->{max} // $pool->{size}) - $pool->{size};
             next if $room <= 0;
+            my $tmpl = PVE::K8s::Scaler::pool_template(
+                $pool, \@sim_nodes, $ds_overhead);
             my $needed = PVE::K8s::Scaler::nodes_needed(
                 \@sim_nodes, \@pending, $pool, $room, $tmpl);
             next if !$needed;
-            my $res = eval {
-                run(['pvesh', 'get', '/cluster/resources',
-                    '--type', 'node', '--output-format', 'json'],
-                    timeout => 60);
-            } // '';
-            my $hosts = eval { JSON::PP->new->decode($res) } // [];
-            my $free = grep {
-                ($_->{maxmem} // 0) - ($_->{mem} // 0) > 4 * 1024**3
-            } $hosts->@*;
-            if (!$free) {
-                print "scale: $name pool $pool->{name} needs "
-                    . "$needed node(s) but all Proxmox hosts are "
-                    . "saturated (no host with 4GiB free); not "
-                    . "scaling\n";
-                next;
-            }
+            my $cap = PVE::K8s::Scaler::host_capacity($hosts, $pool);
+            my $c = { pool => $pool, needed => $needed, cap => $cap,
+                cpu => $tmpl->{cpu}, mem => $tmpl->{mem},
+                source => $tmpl->{source} };
+            if ($cap > 0) { push @cands, $c } else { push @blocked, $c }
+        }
+        if (@cands) {
+            my $c = PVE::K8s::Scaler::choose_pool(\@cands);
+            my $pool = $c->{pool};
+            my $add = $c->{needed} < $c->{cap} ? $c->{needed} : $c->{cap};
+            print "scale: choosing pool $pool->{name} of "
+                . scalar(@cands) . " candidate(s) (least added capacity; "
+                . "node size from $c->{source}); hosts can take "
+                . "$c->{cap} node(s)\n"
+                if @cands > 1;
             print "scale: pool $pool->{name} $pool->{size} -> "
-                . ($pool->{size} + $needed)
+                . ($pool->{size} + $add)
                 . " for " . scalar(@pending) . " pending pod(s)\n";
-            set_pool_size($name, $pool->{name},
-                $pool->{size} + $needed);
+            set_pool_size($name, $pool->{name}, $pool->{size} + $add);
             my $ok = eval { provision_cluster($name); 1 } // 0;
             if (!$ok) {
                 # Replace parks instead of spinning: the
@@ -4213,22 +4222,38 @@ sub scale_reconcile {
                 # the next pass retries when it may succeed.
                 my $err = $@ // 'unknown';
                 $err =~ s/\s+/ /g;
-                set_parked_state($name,
-                    "pool $pool->{name}: $err");
+                set_parked_state($name, "pool $pool->{name}: $err");
                 print "scale: pool $pool->{name} parked: $err\n";
                 return 0;
             }
             set_parked_state($name, undef);
             return 1;
         }
-        print "scale: pending pods exist but no pool can host "
-            . "them (labels/taints/size/max); not scaling\n";
+        if (@blocked) {
+            my $c = $blocked[0];
+            my $msg = "pool $c->{pool}{name} needs $c->{needed} node(s) of "
+                . ($c->{pool}{memory} // 4096) . " MiB but no eligible "
+                . "Proxmox host has that much free memory; add a PVE host "
+                . "or free memory";
+            set_parked_state($name, $msg);
+            print "scale: $name $msg; not scaling\n";
+        } else {
+            print "scale: pending pods exist but no pool can host "
+                . "them (labels/taints/size/max); not scaling\n";
+        }
     }
 
     # Scale in: only the highest-index node of a pool is a
     # candidate, so canonical node naming stays consistent.
     my $candidates = PVE::K8s::Scaler::scale_in_candidates(
         \@sim_nodes, 0.3);
+    if ($candidates->@*
+        && !PVE::K8s::Scaler::scale_in_allowed(
+            $sstate, $now, $scfg->{'scale-in-cooldown'})) {
+        print "scale: scale-in cooldown after the last scale action; "
+            . "not removing nodes yet\n";
+        $candidates = [];
+    }
     for my $host ($candidates->@*) {
         my ($node) = grep { $_->{host} eq $host } @nodes;
         next if !$node || $node->{role} ne 'worker';
@@ -4253,6 +4278,24 @@ sub scale_reconcile {
         my $kn = $k8s_node{$host};
         next if $now - iso_epoch($kn->{metadata}{creationTimestamp})
             < 1800;
+        # Two consecutive passes must pick the same node: a node
+        # that is only transiently idle must not be removed.
+        my ($confirmed, $rec) = PVE::K8s::Scaler::confirm_scale_in(
+            $sstate, $host, $now);
+        PVE::K8s::Config::lock_config(sub {
+            my $c = PVE::K8s::Config->config();
+            my $sc = $c->{ids}->{$name} or return;
+            my $st = eval { JSON::PP->new->decode(
+                $sc->{'scaler-state'} // '{}') } // {};
+            $st->{'scale-in-candidate'} = $rec;
+            $sc->{'scaler-state'} = JSON::PP->new->canonical->encode($st);
+            PVE::K8s::Config::store_config($c);
+        });
+        if (!$confirmed) {
+            print "scale: $host is idle (pool $pool->{name}); "
+                . "confirming on the next pass before removal\n";
+            return 0;
+        }
         print "scale: removing idle node $host "
             . "(pool $pool->{name} $pool->{size} -> "
             . ($pool->{size} - 1) . ")\n";

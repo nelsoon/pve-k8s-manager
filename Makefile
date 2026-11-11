@@ -40,6 +40,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/scaler-standdown.t
 	@perl -I. -Itests/stubs tests/unit/image-revision.t
 	@perl -I. -Itests/stubs tests/unit/templates.t
+	@perl -I. -Itests/stubs tests/unit/scaler-safety.t
 	@perl -I. -Itests/stubs tests/unit/surge-cp-ip.t
 	@perl -I. -Itests/stubs tests/unit/roll-plan.t
 	@perl -I. -Itests/stubs tests/unit/packaging.t

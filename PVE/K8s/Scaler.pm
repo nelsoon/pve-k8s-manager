@@ -213,6 +213,119 @@ my sub clone_nodes {
     } $nodes->@*];
 }
 
+# --- Increment 10: decisions that keep the scaler from acting
+# on guesses. All pure and unit-tested.
+
+# S10.1: what DaemonSets already consume on a node, so a simulated
+# new node is not treated as empty. Taken from the first worker node
+# that runs DaemonSet pods; zero when none does.
+sub daemonset_overhead {
+    my ($nodes) = @_;
+
+    for my $n ($nodes->@*) {
+        next if ($n->{labels}{'pve-k8s.proxmox.com/pool'} // '')
+            eq 'control-plane';
+        my ($cpu, $mem, $seen) = (0, 0, 0);
+        for my $pod ($n->{pods}->@*) {
+            next if (($pod->{metadata}{ownerReferences}[0]{kind})
+                // '') ne 'DaemonSet';
+            my $r = pod_requests($pod);
+            $cpu += $r->{cpu};
+            $mem += $r->{mem};
+            $seen = 1;
+        }
+        return { cpu => $cpu, mem => $mem } if $seen;
+    }
+    return { cpu => 0, mem => 0 };
+}
+
+# S10.5: the size of a NEW node of $pool, so a pool at size 0 can
+# still be considered. A live node of the same pool is the best
+# evidence; otherwise the pool definition (allocatable is about 90%
+# of the VM's memory); otherwise a conservative default. The
+# DaemonSet overhead is subtracted from the usable capacity.
+sub pool_template {
+    my ($pool, $nodes, $overhead) = @_;
+
+    $overhead //= { cpu => 0, mem => 0 };
+    my ($live) = grep {
+        ($_->{labels}{'pve-k8s.proxmox.com/pool'} // '')
+            eq ($pool->{name} // '')
+    } $nodes->@*;
+    my ($cpu, $mem, $source);
+    if ($live && $live->{cpu} && $live->{mem}) {
+        ($cpu, $mem, $source) = ($live->{cpu}, $live->{mem}, 'live node');
+    } elsif ($pool->{cpu} && $pool->{memory}) {
+        ($cpu, $mem, $source) = ($pool->{cpu} * 1000,
+            int($pool->{memory} * 1048576 * 0.9), 'pool definition');
+    } else {
+        ($cpu, $mem, $source) = (2000, int(4 * 1024**3 * 0.9),
+            'default size');
+    }
+    return { cpu => $cpu, mem => $mem, source => $source,
+        overhead_cpu => $overhead->{cpu}, overhead_mem => $overhead->{mem} };
+}
+
+# S10.5: among pools that can host the pending pods pick the one that
+# adds the least capacity (least waste); ties keep config order.
+# Candidates: { pool, needed, cpu, mem }.
+sub choose_pool {
+    my ($cands) = @_;
+
+    my ($best, $best_cost);
+    for my $c ($cands->@*) {
+        my $cost = $c->{needed} * $c->{mem};
+        if (!defined $best_cost || $cost < $best_cost) {
+            ($best, $best_cost) = ($c, $cost);
+        }
+    }
+    return $best;
+}
+
+# S10.6: how many nodes of $pool the Proxmox hosts can really take:
+# memory left after a 1 GiB host reserve, limited to the pool's
+# `hosts` list when set. Host objects are /cluster/resources rows.
+sub host_capacity {
+    my ($hosts, $pool, $reserve) = @_;
+
+    $reserve //= 1024**3;
+    my $need = ($pool->{memory} // 4096) * 1048576;
+    my %allowed = map { $_ => 1 }
+        grep { length } split /\s*,\s*/, ($pool->{hosts} // '');
+    my $count = 0;
+    for my $h ($hosts->@*) {
+        next if ($h->{status} // 'online') ne 'online';
+        next if %allowed && !$allowed{$h->{node} // ''};
+        my $free = ($h->{maxmem} // 0) - ($h->{mem} // 0) - $reserve;
+        $count += int($free / $need) if $free >= $need;
+    }
+    return $count;
+}
+
+# S10.4: no scale-in during the cooldown after any scale action.
+sub scale_in_allowed {
+    my ($state, $now, $cooldown) = @_;
+
+    $cooldown //= 600;
+    return $now - (($state // {})->{'last-action'} // 0) >= $cooldown
+        ? 1 : 0;
+}
+
+# S10.4: a scale-in candidate must be one on consecutive passes.
+# Returns (confirmed, new_candidate_record). A record older than
+# $stale seconds, or for another node, starts over.
+sub confirm_scale_in {
+    my ($state, $host, $now, $need, $stale) = @_;
+
+    $need //= 2;
+    $stale //= 900;
+    my $c = ($state // {})->{'scale-in-candidate'} // {};
+    my $count = (($c->{host} // '') eq $host
+        && $now - ($c->{at} // 0) <= $stale) ? ($c->{count} // 0) + 1 : 1;
+    return ($count >= $need ? 1 : 0,
+        { host => $host, count => $count, at => $now });
+}
+
 # Would pending pods benefit from more nodes of this pool?
 # Adds simulated nodes one at a time (up to $room) and
 # returns how many nodes would raise the placed count.
@@ -226,9 +339,12 @@ sub nodes_needed {
     while ($added < $room) {
         my $trial = clone_nodes($nodes);
         for (1 .. $added + 1) {
-            push $trial->@*, make_node("sim-$_",
+            my $sim = make_node("sim-$_",
                 pool_node_labels($pool), parse_taints($pool),
                 $tmpl->{cpu}, $tmpl->{mem});
+            $sim->{used_cpu} = $tmpl->{overhead_cpu} // 0;
+            $sim->{used_mem} = $tmpl->{overhead_mem} // 0;
+            push $trial->@*, $sim;
         }
         my ($placed) = place_pods($trial, $pending);
         last if scalar $placed->@* <= $best;
