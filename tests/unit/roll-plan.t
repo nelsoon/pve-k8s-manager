@@ -57,6 +57,49 @@ is($plan->{'c-cp1'}, 'surge', 'CP pool plans on its own count');
 is($plan->{'c-w1'}, 'surge', 'worker pool short: surge');
 is($plan->{'c-w2'}, 'retire-only', 'worker pool covered: retire');
 
+# Pool sizing drift: edited node-group must converge by
+# replacement (nodes are never resized in place).
+my %want = (cpu => 4, memory => 8096);
+ok(!PVE::K8s::Provision::size_drift(\%want, 4, 8096),
+    'matching cores/memory is not drift');
+ok(PVE::K8s::Provision::size_drift(\%want, 2, 4096),
+    'pool edit 8GB/4c over 4GB/2c node is drift');
+ok(PVE::K8s::Provision::size_drift(\%want, 4, 4096)
+    || PVE::K8s::Provision::size_drift(\%want, 2, 8096),
+    'either dimension alone is drift');
+ok(!PVE::K8s::Provision::size_drift(undef, 2, 4096),
+    'no pool def: never drift');
+ok(!PVE::K8s::Provision::size_drift({}, 2, 4096),
+    'empty pool def: never drift');
+ok(!PVE::K8s::Provision::size_drift(
+    { cpu => 0, memory => 0 }, 2, 4096),
+    'zero def: never drift');
+
+my $dp = { cpu => 4, memory => 8096, disk => 50,
+    device_profile => 'gpu1' };
+ok(!PVE::K8s::Provision::size_drift($dp, 4, 8096, 60 * 1024, 'gpu1'),
+    'larger live disk and matching device is not drift');
+ok(PVE::K8s::Provision::size_drift($dp, 4, 8096, 32 * 1024, 'gpu1'),
+    'live disk smaller than pool is drift');
+ok(PVE::K8s::Provision::size_drift($dp, 4, 8096, 50 * 1024, ''),
+    'missing device is drift');
+ok(PVE::K8s::Provision::size_drift(
+    { cpu => 4, memory => 8096 }, 4, 8096, undef, 'gpu1'),
+    'unwanted device is drift');
+ok(!PVE::K8s::Provision::size_drift($dp, 4, 8096, undef, undef),
+    'unknown disk/device is never drift');
+my @l = PVE::K8s::Provision::live_size(
+    "cores: 2\nmemory: 4096\nscsi0: local:vm-1-disk-0,size=32G\n"
+    . "hostpci0: mapping=gpu1,pcie=1\n");
+is("@l[2,3]", '32768 gpu1', 'live_size reads disk MiB and device');
+
+my ($lc, $lm) = PVE::K8s::Provision::live_size(
+    "boot: order=scsi0\ncores: 2\nmemory: 4096\n\n"
+    . "[snap1]\ncores: 9\nmemory: 9999\n");
+is("$lc/$lm", '2/4096', 'live_size reads top-level, anchored');
+my @none = PVE::K8s::Provision::live_size("vcpus: 3\n");
+ok(!defined $none[0] && !defined $none[1], 'no false match on vcpus');
+
 my $good = PVE::K8s::Provision::live_node_items(
     '{"items":[{"metadata":{"name":"c-cp7"},'
     . '"status":{"nodeInfo":{"kubeletVersion":"v1.36.5"},'

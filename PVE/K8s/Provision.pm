@@ -508,6 +508,51 @@ sub roll_plan {
     return \%plan;
 }
 
+# Parse cores/memory from `qm config --current` text. Anchored,
+# first (top-level) occurrence only: snapshot sections repeat keys.
+# Pure, unit-tested (roll-plan.t).
+sub live_size {
+    my ($cfg) = @_;
+
+    $cfg //= '';
+    $cfg =~ s/^\[.*//ms;
+    my ($c) = $cfg =~ /^cores:\s*(\d+)/m;
+    my ($m) = $cfg =~ /^memory:\s*(\d+)/m;
+    my ($n, $unit) = $cfg
+        =~ /^(?:scsi0|virtio0|sata0):.*\bsize=(\d+)([MGT])/m;
+    my $disk_mib = !defined $n ? undef
+        : $unit eq 'M' ? $n : $unit eq 'G' ? $n * 1024
+        : $n * 1024 * 1024;
+    my ($dev) = $cfg =~ /^hostpci0:.*\bmapping=([^,\s]+)/m;
+    return ($c, $m, $disk_mib, $dev // '');
+}
+
+# Does a live node's cores/memory differ from its pool def?
+# Returns the qm config's cores/memory for the caller may
+# log; the check for "behind" is the boolean. Pool sizing
+# that drifted (an edited node-group) means the node must be
+# rolling-replaced: nodes are immutable by design, and
+# `qm set --memory/--cores` on a running VM never converges
+# the guest allocation - the old (smaller) shape keeps
+# running while the config silently claims the new one.
+# Pure, unit-tested (roll-plan.t).
+sub size_drift {
+    my ($pdef, $cores, $memory, $disk_mib, $device) = @_;
+
+    return 0 if !(($pdef // {})->{cpu} // 0);
+    return 0 if !(($pdef // {})->{memory} // 0);
+    return 1 if $cores != $pdef->{cpu}
+        || $memory != $pdef->{memory};
+    # Disk is grow-only: only a live disk SMALLER than the pool
+    # wants is drift. Unknown live size (undef) is not drift.
+    return 1 if defined $disk_mib && ($pdef->{disk} // 0)
+        && $disk_mib < $pdef->{disk} * 1024;
+    # Device profile drift in either direction; undef = unknown.
+    return 1 if defined $device
+        && $device ne ($pdef->{device_profile} // '');
+    return 0;
+}
+
 # Ensure the exact template revision exists on a host,
 # distributing a full-copy from wherever it lives when
 # needed (same clone-migrate-mark pattern as
@@ -4309,6 +4354,9 @@ sub roll_cluster {
                 arch => $pool eq 'control-plane' ? $scfg->{'cp-arch'}
                     : ($pdef->{arch} // $item->{arch}),
                 pool_storage => $pdef->{storage},
+                cpu => $pdef->{cpu}, memory => $pdef->{memory},
+                disk => $pdef->{disk},
+                device_profile => $pdef->{'device-profile'},
             };
         }
         @nodes = sort { $a->{role} cmp $b->{role} } @nodes;
@@ -4430,6 +4478,9 @@ sub roll_cluster {
             labels => $pdef->{labels}, taints => $pdef->{taints},
             pool_hosts => $pdef->{hosts},
             pool_storage => $pdef->{storage},
+            cpu => $pdef->{cpu}, memory => $pdef->{memory},
+            disk => $pdef->{disk},
+            device_profile => $pdef->{'device-profile'},
         };
         $node->{rev} = node_rev_on($node);
         $node->{site} = $group_of->{$node->{pvehost}}
@@ -4473,8 +4524,29 @@ sub roll_cluster {
             my $kv = $live_kubelet{$node->{host}} // '';
             $at_target = $kv =~ /^v?\Q$version\E\./ ? 1 : 0;
         }
+        my $drifted = 0;
+        if ($node->{role} ne 'cp' && $node->{vmid}
+            && ($node->{cpu} // 0) && ($node->{memory} // 0)) {
+            # --current: plain `qm config` merges pending values,
+            # which hides exactly the un-restarted resize.
+            my $cfg = eval {
+                qm_on($node->{pvehost}, 'config', $node->{vmid},
+                    '--current') } // '';
+            my ($live_cores, $live_mem, $live_disk, $live_dev)
+                = live_size($cfg);
+            if (defined $live_cores && defined $live_mem
+                && size_drift($node, $live_cores, $live_mem,
+                    $live_disk, $live_dev)) {
+                $drifted = 1;
+                print "roll: $node->{host} sizing drift "
+                    . "(vmconfig $live_cores cores/$live_mem MiB, "
+                    . "pool wants $node->{cpu}/$node->{memory}); "
+                    . "rolling to converge\n";
+            }
+        }
         $node->{current} = (defined $node->{rev}
-            && $node->{rev} == $want_rev && $at_target) ? 1 : 0;
+            && $node->{rev} == $want_rev && $at_target
+            && !$drifted) ? 1 : 0;
     }
     my @behind = grep { !$_->{current} } @nodes;
     my %desired = ('control-plane' => $scfg->{cp} // 3,
