@@ -9,16 +9,21 @@
 #   (all interaction is via qm guest exec, so the address
 #   never needs to be known ahead of time).
 #   --storage <id>   storage for the template disk (default local-zfs)
-#   --vmid <id>      VMID to use for builder/template (default 9000)
+#   --vmid <id>      VMID to use for builder/template (default 9000;
+#                    if taken, the next free cluster VMID is used)
+#   --revision <n>   override the image revision (default: highest
+#                    existing revision for this minor+arch, plus one)
 #   --bridge <id>    bridge for the builder VM (default vmbr0)
 set -eu
 cd "$(dirname "$0")"
 . ./versions.env
+. ./revision.sh
 
 STORAGE=local-zfs
 VMID=9000
 BRIDGE=vmbr0
 ARCH=amd64
+IMAGE_REVISION=
 K8S_VERSION=${K8S_VERSION:-}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -26,6 +31,7 @@ while [ $# -gt 0 ]; do
         --vmid) VMID=$2; shift 2 ;;
         --bridge) BRIDGE=$2; shift 2 ;;
         --arch) ARCH=$2; shift 2 ;;
+        --revision) IMAGE_REVISION=$2; shift 2 ;;
         --k8s-version) K8S_VERSION=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -52,6 +58,13 @@ fi
 
 CACHE_DIR=/var/lib/vz/template/cache
 IMAGE=$CACHE_DIR/$DEBIAN_IMAGE_NAME
+if [ -z "$IMAGE_REVISION" ]; then
+    IMAGE_REVISION=$(cluster_vm_names | next_revision "$K8S_MINOR" "$ARCH")
+fi
+# Templates are immutable and keyed by VMID: never reuse a taken one.
+if ! pvesh get /cluster/nextid --vmid "$VMID" >/dev/null 2>&1; then
+    VMID=$(pvesh get /cluster/nextid | tr -d '"')
+fi
 NAME="k8s-node-$K8S_MINOR-r$IMAGE_REVISION"
 [ "$ARCH" = "arm64" ] && NAME="$NAME-arm64"
 
