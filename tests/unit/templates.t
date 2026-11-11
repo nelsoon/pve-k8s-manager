@@ -108,4 +108,39 @@ ok(!PVE::K8s::Provision::adoption_due($clean, 5, $noon),
 ok(PVE::K8s::Provision::adoption_due($clean, 5, $noon + 21600),
     'current: drift check due after 6 hours');
 
+# Summary image block.
+my $ts = PVE::K8s::Templates::empty_state();
+PVE::K8s::Templates::record_build($ts, '1.36', 'amd64', 5, 'critical', 100 * $day);
+my $sc = { 'k8s-version' => '1.36', 'maintenance-window' => '01:00-03:00',
+    nodes => '[{"rev":4},{"rev":5},{"rev":4}]' };
+my $im = PVE::K8s::Provision::image_status($sc, 5, $ts, 101 * $day);
+is($im->{pending}, 2, 'two nodes pending replacement');
+is($im->{overdue}, 0, 'inside the deadline');
+is($im->{severity}, 'critical', 'deadline severity surfaced');
+ok($im->{auto}, 'a window means automatic rolls');
+$im = PVE::K8s::Provision::image_status($sc, 5, $ts, 110 * $day);
+is($im->{overdue}, 2, 'both pending nodes overdue after 7 days');
+$im = PVE::K8s::Provision::image_status(
+    { %$sc, 'maintenance-window' => undef }, 5, $ts, 101 * $day);
+ok(!$im->{auto} && !defined $im->{window}, 'no window: manual roll only');
+is(PVE::K8s::Provision::image_status($sc, undef, $ts, 1)->{pending}, 0,
+    'no template known: nothing pending');
+
+# Pruning inputs.
+my @cp = PVE::K8s::Provision::template_copies({
+    cloud1 => "  9000 k8s-node-1.36-r4 stopped 4096 20.00 0\n  105 k8s-node-1.36-r5 stopped 4096 20.00 0\n  200 other stopped 1 1 0\n",
+    cloud2 => "  301 k8s-node-1.36-r4 stopped 4096 20.00 0\n  302 k8s-node-1.36-r3-arm64 stopped 1 1 0\n",
+}, '1.36', 'amd64');
+is(join(',', map { "$_->{host}:$_->{vmid}:r$_->{rev}" } @cp),
+    'cloud1:9000:r4,cloud1:105:r5,cloud2:301:r4', 'copies on every host, amd64 only');
+my @arm2 = PVE::K8s::Provision::template_copies({ cloud2 => "302 k8s-node-1.36-r3-arm64 stopped 1 1 0\n" }, '1.36', 'arm64');
+is(scalar @arm2, 1, "arm64 copies are found separately");
+my $use = PVE::K8s::Provision::revisions_in_use({
+    a => { 'k8s-version' => '1.36', 'template-rev' => 4,
+        nodes => '[{"rev":3},{"rev":4}]' },
+    b => { 'k8s-version' => '1.35', 'template-rev' => 9, nodes => '[{"rev":9}]' },
+    c => { 'k8s-version' => '1.36', 'cp-arch' => 'arm64', nodes => '[{"rev":7,"arch":"arm64"}]' },
+}, '1.36', 'amd64');
+is(join(',', sort keys %$use), '3,4', 'in-use: other minors and arches do not count');
+
 done_testing;

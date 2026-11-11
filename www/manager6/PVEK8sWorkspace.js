@@ -555,6 +555,11 @@ Ext.define('PVE.dc.K8sView', {
                 value: gettext('loading...'),
                 labelWidth: 160,
             });
+            let imageInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Node Image'),
+                value: gettext('loading...'),
+                labelWidth: 160,
+            });
             let haInfo = Ext.create('Ext.form.field.Display', {
                 fieldLabel: gettext('HA Errors'),
                 value: gettext('none'),
@@ -646,6 +651,33 @@ Ext.define('PVE.dc.K8sView', {
                             new Date(s.backup.last * 1000),
                             'Y-m-d H:i')
                         : checkIcon(false, true) + gettext('none'));
+                    // Node image: overdue = error, pending = warning
+                    let im = s.image;
+                    if (!im) {
+                        imageInfo.setValue(gettext('unknown'));
+                    } else if (!im.pending) {
+                        imageInfo.setValue(checkIcon(true, false)
+                            + gettext('up to date'));
+                    } else {
+                        let msg = Ext.String.format(gettext(
+                            '{0} node(s) pending replacement by the '
+                            + 'newest image'), im.pending);
+                        if (im.deadline) {
+                            msg += ', ' + Ext.String.format(gettext(
+                                '{0} deadline {1}'), im.severity,
+                                Ext.Date.format(
+                                    new Date(im.deadline * 1000),
+                                    'Y-m-d H:i'));
+                        }
+                        msg += im.auto
+                            ? ' (' + Ext.String.format(gettext(
+                                'rolls automatically in window {0}'),
+                                im.window) + ')'
+                            : ' (' + gettext('no maintenance window: '
+                                + 'roll manually') + ')';
+                        imageInfo.setValue(checkIcon(false, !im.overdue)
+                            + Ext.htmlEncode(msg));
+                    }
                     haInfo.setValue(s.ha_errors
                         && s.ha_errors.length
                         ? '<i class="fa fa-times critical"></i> '
@@ -686,6 +718,7 @@ Ext.define('PVE.dc.K8sView', {
                     podsInfo.setValue(gettext('unknown'));
                     lbInfo.setValue(gettext('unknown'));
                     backupInfo.setValue(gettext('unknown'));
+                    imageInfo.setValue(gettext('unknown'));
                 },
             });
             let act = function(label, icon, fn) {
@@ -833,7 +866,7 @@ Ext.define('PVE.dc.K8sView', {
                                     xtype: 'container',
                                     items: [storageInfo,
                                         groupsInfo, actionInfo,
-                                        parkedInfo, haInfo,
+                                        parkedInfo, imageInfo, haInfo,
                                         backupInfo, certInfo],
                                 },
                             ],

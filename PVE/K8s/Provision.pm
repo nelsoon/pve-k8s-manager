@@ -6783,6 +6783,42 @@ sub summary_cache_write {
     };
 }
 
+# Pure: node-image state for the Summary. $best_rev is the newest
+# template revision for the cluster's version, $tstate the
+# template state (PVE::K8s::Templates). Nodes behind it are
+# "pending replacement"; one past a high/critical deadline is
+# "overdue" and the Summary shows it as an error.
+sub image_status {
+    my ($scfg, $best_rev, $tstate, $now) = @_;
+
+    my $nodes = eval { JSON::PP->new->decode($scfg->{nodes} // '[]') } // [];
+    my $minor = $scfg->{'k8s-version'} // '';
+    my ($pending, $overdue, $deadline, $severity) = (0, 0);
+    for my $n ($nodes->@*) {
+        my $rev = $n->{rev} // 0;
+        next if !defined $best_rev || $rev >= $best_rev;
+        $pending++;
+        my $r = PVE::K8s::Templates::remediation($tstate, $minor,
+            $n->{arch} // 'amd64', $rev, $now);
+        $overdue++ if $r->{overdue};
+        if (defined $r->{deadline}
+            && (!defined $deadline || $r->{deadline} < $deadline)) {
+            ($deadline, $severity) = ($r->{deadline}, $r->{severity});
+        }
+    }
+    my $window = $scfg->{'maintenance-window'};
+    return {
+        latest => $best_rev,
+        pending => $pending,
+        overdue => $overdue,
+        deadline => $deadline,
+        severity => $severity,
+        window => (defined $window && $window ne '') ? $window : undef,
+        auto => (defined $window && $window ne '') ? 1 : 0,
+        failure => ($tstate // {})->{'last-failure'},
+    };
+}
+
 sub summary_cluster {
     my ($name) = @_;
 
@@ -6926,6 +6962,13 @@ sub summary_cluster {
     my @ha_errors = $ha_status =~
         /^service (vm:\d+) \(\w+, error\)/gm;
     $out->{ha_errors} = \@ha_errors if @ha_errors;
+    eval {
+        my (undef, $best) = find_template_in_list(
+            cluster_template_lists(), $scfg->{'k8s-version'},
+            $scfg->{'cp-arch'} // 'amd64');
+        $out->{image} = image_status($scfg, $best,
+            PVE::K8s::Templates::read_state(), time());
+    };
     $out->{health} = summary_health($out->{state},
         $out->{cp}, $out->{cp_ready}, $out->{nodes_ready},
         $out->{live} ? $out->{nodes_total} : undef);
@@ -7091,6 +7134,78 @@ sub cluster_template_lists {
     return $lists;
 }
 
+# Pure: every template copy of (minor, arch) in per-host
+# `qm list` texts -> [{host, vmid, rev}].
+sub template_copies {
+    my ($lists, $minor, $arch) = @_;
+
+    my @out;
+    for my $host (sort keys $lists->%*) {
+        for my $line (split /\n/, $lists->{$host} // '') {
+            my ($id, $rev) = $arch && $arch eq 'arm64'
+                ? $line =~ /^\s*(\d+)\s+k8s-node-\Q$minor\E-r(\d+)-arm64\s/
+                : $line =~ /^\s*(\d+)\s+k8s-node-\Q$minor\E-r(\d+)\s/;
+            push @out, { host => $host, vmid => $id, rev => $rev + 0 }
+                if defined $id;
+        }
+    }
+    return @out;
+}
+
+# Pure: revisions of (minor, arch) some cluster still needs: any
+# node's revision plus the record's floor for clusters on that minor.
+sub revisions_in_use {
+    my ($ids, $minor, $arch) = @_;
+
+    my %use;
+    for my $name (keys $ids->%*) {
+        my $scfg = $ids->{$name};
+        next if ($scfg->{'k8s-version'} // '') ne $minor;
+        $use{$scfg->{'template-rev'}} = 1
+            if defined $scfg->{'template-rev'}
+                && ($scfg->{'cp-arch'} // 'amd64') eq $arch;
+        my $nodes = eval { JSON::PP->new->decode($scfg->{nodes} // '[]') } // [];
+        for my $n ($nodes->@*) {
+            next if ($n->{arch} // $scfg->{'cp-arch'} // 'amd64') ne $arch;
+            $use{$n->{rev}} = 1 if defined $n->{rev};
+        }
+    }
+    return \%use;
+}
+
+# Destroy superseded template revisions: keep what any node or
+# record uses plus the newest two (rollback material). Only a VM
+# that really is a template is ever destroyed.
+sub prune_template_revisions {
+    my ($minor, $arch) = @_;
+
+    my %lists = (local_node_name() => qm('list'));
+    for my $h (pve_online_nodes()->@*) {
+        next if $h eq local_node_name();
+        $lists{$h} = eval { qm_on($h, 'list') } // '';
+    }
+    my @copies = template_copies(\%lists, $minor, $arch);
+    my %present = map { $_->{rev} => 1 } @copies;
+    my $in_use = revisions_in_use(
+        PVE::K8s::Config->config()->{ids}, $minor, $arch);
+    my %drop = map { $_ => 1 } PVE::K8s::Templates::prune_plan(
+        [keys %present], $in_use, 2);
+    my $n = 0;
+    for my $c (grep { $drop{$_->{rev}} } @copies) {
+        my $conf = eval { qm_on($c->{host}, 'config', $c->{vmid}) } // '';
+        next if $conf !~ /^template:\s*1/m;
+        drop_template_ha($c->{vmid});
+        if (eval { qm_on($c->{host}, 'destroy', $c->{vmid}, '--purge'); 1 }) {
+            print "pruned template r$c->{rev} (vmid $c->{vmid} on "
+                . "$c->{host})\n";
+            $n++;
+        } else {
+            print "warning: could not prune template vmid $c->{vmid}: $@";
+        }
+    }
+    return $n;
+}
+
 # Build one new revision for (minor, arch) with a cluster's
 # builder settings and stamp it. Dies on failure; the old
 # revision stays in service and a half-built VM is never
@@ -7115,6 +7230,8 @@ sub rebuild_template_target {
         PVE::K8s::Templates::record_build($_[0], $t->{minor},
             $t->{arch}, $rev, $severity, time());
     });
+    eval { prune_template_revisions($t->{minor}, $t->{arch}) };
+    print "warning: template pruning failed: $@" if $@;
     return $rev;
 }
 
