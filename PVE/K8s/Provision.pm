@@ -6934,7 +6934,7 @@ sub image_status {
     }
     my $window = $scfg->{'maintenance-window'};
     return {
-        latest => $best_rev,
+        latest => defined $best_rev ? $best_rev + 0 : undef,
         pending => $pending,
         overdue => $overdue,
         deadline => $deadline,
