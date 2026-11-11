@@ -3809,6 +3809,22 @@ my sub scaler_state_update {
     });
 }
 
+# Remember an automatic repair so a replacement is never invisible
+# (shown in the Summary); only the last ten are kept.
+my sub record_repair {
+    my ($name, $node, $role, $reason) = @_;
+
+    eval {
+        scaler_state_update($name, sub {
+            my $list = $_[0]->{repairs} // [];
+            push $list->@*, { node => $node, role => $role,
+                reason => $reason, at => time() };
+            shift $list->@* while $list->@* > 10;
+            $_[0]->{repairs} = $list;
+        });
+    };
+}
+
 my sub set_parked_state {
     my ($name, $msg) = @_;
 
@@ -4039,6 +4055,8 @@ sub scale_reconcile {
             }
             print "cp-repair: replacing dead CP $node->{host} "
                 . "(NotReady ${since}s, VM silent)\n";
+            record_repair($name, $node->{host}, 'control-plane',
+                "NotReady ${since}s, VM silent, host confirmed dead");
             etcd_snapshot_any(\@nodes);
             remove_node($cp, $node, \@nodes);
             # If the host is down the VM could not be
@@ -4089,6 +4107,8 @@ sub scale_reconcile {
         }
         print "repair: replacing dead node $node->{host} "
             . "(NotReady ${since}s, VM silent)\n";
+        record_repair($name, $node->{host}, 'worker',
+            "NotReady ${since}s, VM silent, host confirmed dead");
         remove_node($cp, $node, \@nodes);
         # Drop the destroyed node from the record BEFORE
         # recreating it: if provision_cluster dies midway
@@ -7068,6 +7088,9 @@ sub summary_cluster {
     my @ha_errors = $ha_status =~
         /^service (vm:\d+) \(\w+, error\)/gm;
     $out->{ha_errors} = \@ha_errors if @ha_errors;
+    my $rstate = eval {
+        JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
+    $out->{repairs} = $rstate->{repairs} if ($rstate->{repairs} // [])->@*;
     eval {
         my (undef, $best) = find_template_in_list(
             cluster_template_lists(), $scfg->{'k8s-version'},

@@ -560,6 +560,11 @@ Ext.define('PVE.dc.K8sView', {
                 value: gettext('loading...'),
                 labelWidth: 160,
             });
+            let repairInfo = Ext.create('Ext.form.field.Display', {
+                fieldLabel: gettext('Auto-repair'),
+                value: gettext('none'),
+                labelWidth: 160,
+            });
             let haInfo = Ext.create('Ext.form.field.Display', {
                 fieldLabel: gettext('HA Errors'),
                 value: gettext('none'),
@@ -678,6 +683,18 @@ Ext.define('PVE.dc.K8sView', {
                         imageInfo.setValue(checkIcon(false, !im.overdue)
                             + Ext.htmlEncode(msg));
                     }
+                    // Replacements made automatically: never invisible
+                    let reps = s.repairs || [];
+                    repairInfo.setValue(reps.length
+                        ? '<i class="fa fa-exclamation-triangle warning"></i> '
+                            + reps.slice(-3).reverse().map(function(x) {
+                                return Ext.htmlEncode(x.node) + ' ('
+                                    + Ext.Date.format(
+                                        new Date(x.at * 1000), 'Y-m-d H:i')
+                                    + ': ' + x.reason + ')';
+                            }).join('<br>')
+                        : '<i class="fa fa-check good"></i> '
+                            + gettext('none'));
                     haInfo.setValue(s.ha_errors
                         && s.ha_errors.length
                         ? '<i class="fa fa-times critical"></i> '
@@ -866,7 +883,7 @@ Ext.define('PVE.dc.K8sView', {
                                     xtype: 'container',
                                     items: [storageInfo,
                                         groupsInfo, actionInfo,
-                                        parkedInfo, imageInfo, haInfo,
+                                        parkedInfo, imageInfo, repairInfo, haInfo,
                                         backupInfo, certInfo],
                                 },
                             ],

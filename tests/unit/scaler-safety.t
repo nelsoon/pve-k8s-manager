@@ -132,4 +132,11 @@ ok(!PVE::K8s::Scaler::pool_backed_off({ 'pool-backoff' => { default => { until =
     'back in service after the deadline');
 ok(!PVE::K8s::Scaler::pool_backed_off({}, 'default', 1), 'no record: not backed off');
 
+# U4: both automatic repair paths record themselves (the Summary shows them).
+open my $pf, '<', 'PVE/K8s/Provision.pm' or die $!;
+my $prov = do { local $/; <$pf> };
+my $recs = () = $prov =~ /record_repair\(\$name, \$node->\{host\}, '(?:control-plane|worker)'/g;
+is($recs, 2, 'control-plane and worker repairs are both recorded');
+like($prov, qr/\$out->\{repairs\} = \$rstate->\{repairs\}/, 'the Summary carries the repairs');
+
 done_testing;
