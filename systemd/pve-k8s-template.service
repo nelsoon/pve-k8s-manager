@@ -1,0 +1,8 @@
+[Unit]
+Description=pve-k8s weekly node template refresh
+After=pvedaemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-k8s-template-refresh
+TimeoutStartSec=4h

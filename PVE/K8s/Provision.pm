@@ -15,6 +15,7 @@ use PVE::Tools qw(run_command);
 use PVE::K8s::Addons;
 use PVE::K8s::Config;
 use PVE::K8s::Scaler;
+use PVE::K8s::Templates;
 
 # Provisioning FSM (T1.4). Runs in a protected API task worker on
 # one PVE node. All node VMs for a cluster are created on the
@@ -7073,6 +7074,183 @@ sub upgrade_cluster {
         . "build one first (images/)\n"
         if !defined $upgrade_tpl;
     return roll_cluster($name, target_version => $to, force => $opts{force});
+}
+
+# --- template refresh (weekly rebuilds, manual rebuild now) ----
+# Every rebuild is a NEW revision (never an in-place change);
+# nodes adopt it later through a roll. See PVE::K8s::Templates.
+
+# `qm list` text from every online host, so revision lookups see
+# templates wherever they live.
+sub cluster_template_lists {
+    my $lists = qm('list');
+    for my $h (pve_online_nodes()->@*) {
+        next if $h eq local_node_name();
+        $lists .= "\n" . (eval { qm_on($h, 'list') } // '');
+    }
+    return $lists;
+}
+
+# Build one new revision for (minor, arch) with a cluster's
+# builder settings and stamp it. Dies on failure; the old
+# revision stays in service and a half-built VM is never
+# converted to a template (qm template is the last build step).
+sub rebuild_template_target {
+    my ($t, $severity) = @_;
+
+    my $scfg = $t->{scfg};
+    my (undef, $before) = find_template_in_list(
+        cluster_template_lists(), $t->{minor}, $t->{arch});
+    $before //= 0;
+    build_template($t->{minor},
+        builder_ip => $scfg->{'builder-ip'},
+        gateway => host_default_gateway(),
+        storage => $scfg->{storage} // 'local-zfs',
+        arch => $t->{arch});
+    my (undef, $rev) = find_template_in_list(
+        cluster_template_lists(), $t->{minor}, $t->{arch});
+    die "build finished but no newer revision than r$before appeared\n"
+        if !defined $rev || $rev <= $before;
+    PVE::K8s::Templates::with_state(sub {
+        PVE::K8s::Templates::record_build($_[0], $t->{minor},
+            $t->{arch}, $rev, $severity, time());
+    });
+    return $rev;
+}
+
+# Targets to rebuild: [{minor, arch, scfg}], each paired with a
+# cluster record that supplies storage and builder settings.
+# $only narrows to {minor =>, arch =>} (either optional).
+sub rebuild_targets {
+    my ($ids, $only) = @_;
+
+    $only //= {};
+    my @out;
+    for my $t (PVE::K8s::Templates::targets_in_use($ids)) {
+        next if defined $only->{minor} && $t->{minor} ne $only->{minor};
+        next if defined $only->{arch} && $t->{arch} ne $only->{arch};
+        ($t->{scfg}) = map { $ids->{$_} }
+            grep { ($ids->{$_}{'k8s-version'} // '') eq $t->{minor} }
+            sort keys $ids->%*;
+        push @out, $t;
+    }
+    return @out;
+}
+
+# Rebuild the given targets one at a time. One refresh runs
+# cluster-wide (claim in pmxcfs). A failed target never stops the
+# others and leaves the old revision in service.
+# Returns the number built; dies listing failures.
+sub rebuild_templates {
+    my ($targets, $severity) = @_;
+
+    die "severity must be routine, high or critical\n"
+        if !PVE::K8s::Templates::valid_severity($severity);
+    if (!PVE::K8s::Templates::claim(local_node_name(), time())) {
+        print "another template refresh is running, standing down\n";
+        return 0;
+    }
+    my ($built, @failed) = (0);
+    for my $t ($targets->@*) {
+        my $label = "k8s-node-$t->{minor} ($t->{arch})";
+        my $rev = eval { rebuild_template_target($t, $severity) };
+        if (my $err = $@) {
+            $err =~ s/\s+$//;
+            print "template rebuild FAILED for $label: $err; "
+                . "the current revision stays in service\n";
+            push @failed, "$label: $err";
+            next;
+        }
+        print "built $label r$rev (severity $severity)\n";
+        $built++;
+    }
+    PVE::K8s::Templates::release(time(), !@failed, join('; ', @failed));
+    die "template rebuild failed: " . join('; ', @failed) . "\n"
+        if @failed;
+    return $built;
+}
+
+# Timer entry: weekly, only minors/architectures a cluster uses.
+sub refresh_templates_if_due {
+    my ($now) = @_;
+
+    $now //= time();
+    my $state = PVE::K8s::Templates::read_state();
+    return 0 if !PVE::K8s::Templates::refresh_due($state, $now);
+    my $cfg = PVE::K8s::Config->config();
+    my @targets = rebuild_targets($cfg->{ids});
+    if (!@targets) {
+        PVE::K8s::Templates::with_state(
+            sub { $_[0]->{'last-run'} = $now });
+        return 0;
+    }
+    my $built = rebuild_templates(\@targets, 'routine');
+    PVE::K8s::Templates::with_state(
+        sub { $_[0]->{'last-run'} = time() });
+    return $built;
+}
+
+# --- automatic adoption of new node images -----------------
+# A cluster that opted in by setting a maintenance window rolls
+# itself onto a newer template revision (and converges size
+# drift) inside that window, one surge replacement at a time.
+# Without a window nothing rolls automatically: the cluster
+# shows the pending replacement and the operator rolls by hand.
+
+# Pure: may an automatic roll start right now? Cheap checks only
+# (no host calls) so the 3-minute timer can run it everywhere.
+sub adoption_window_open {
+    my ($scfg, $now) = @_;
+
+    return 0 if ($scfg->{state} // '') ne 'ready';
+    my $window = $scfg->{'maintenance-window'};
+    return 0 if !defined $window || $window eq '';
+    return in_maintenance_window($window, $now) ? 1 : 0;
+}
+
+# Pure: does the inventory hold a node older than $best_rev?
+sub nodes_behind_rev {
+    my ($scfg, $best_rev) = @_;
+
+    return 0 if !defined $best_rev || $best_rev < 0;
+    my $nodes = eval { JSON::PP->new->decode($scfg->{nodes} // '[]') } // [];
+    return scalar(grep { ($_->{rev} // 0) < $best_rev } $nodes->@*);
+}
+
+# Pure: throttle. A cluster known to be behind is retried every
+# 15 minutes inside the window; otherwise a pass runs only every
+# 6 hours, which still catches size drift a template check cannot see.
+sub adoption_due {
+    my ($scfg, $best_rev, $now) = @_;
+
+    return 0 if !adoption_window_open($scfg, $now);
+    my $state = eval {
+        JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
+    my $every = nodes_behind_rev($scfg, $best_rev) ? 900 : 21600;
+    return ($now - ($state->{'adopt-at'} // 0)) >= $every ? 1 : 0;
+}
+
+sub adopt_cluster {
+    my ($name, $now) = @_;
+
+    $now //= time();
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name} or return 0;
+    return 0 if !adoption_window_open($scfg, $now);
+    my (undef, $best) = find_template_in_list(cluster_template_lists(),
+        $scfg->{'k8s-version'}, $scfg->{'cp-arch'} // 'amd64');
+    return 0 if !adoption_due($scfg, $best, $now);
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $c = $cfg->{ids}->{$name} or return;
+        my $state = eval {
+            JSON::PP->new->decode($c->{'scaler-state'} // '{}') } // {};
+        $state->{'adopt-at'} = $now;
+        $c->{'scaler-state'} = JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($cfg);
+    });
+    print "adopt: maintenance window open for '$name', checking nodes\n";
+    return with_cluster_action($name, 'roll', 'k8sroll',
+        sub { roll_cluster($name) }) // 0;
 }
 
 1;

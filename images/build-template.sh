@@ -88,7 +88,7 @@ cleanup_builder() {
     qm stop "$VMID" >/dev/null 2>&1 || true
     qm destroy "$VMID" >/dev/null 2>&1 || true
 }
-trap cleanup_builder INT TERM
+trap cleanup_builder INT TERM EXIT
 
 qm create "$VMID" --name "$NAME" --memory "$TEMPLATE_MEMORY" \
     --cores "$TEMPLATE_CORES" --cpu host \
@@ -107,7 +107,7 @@ qm start "$VMID" >/dev/null
 # From here on the VM contains build progress; never destroy it
 # from a signal trap (a killed build script once destroyed a
 # finished image this way). Cleanup is a manual decision.
-trap - INT TERM
+trap - INT TERM EXIT
 echo "builder VM $VMID started; waiting for guest agent..."
 
 i=0
@@ -161,6 +161,6 @@ source-sha256: $SHA256
 recipe-git: $GIT_SHA" >/dev/null
 
 qm template "$VMID" >/dev/null
-trap - INT TERM
+trap - INT TERM EXIT
 echo "template ready: $NAME (vmid $VMID)"
 qm config "$VMID" | grep -E '^(name|template|description):' || true

@@ -39,6 +39,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/reuse-template-guard.t
 	@perl -I. -Itests/stubs tests/unit/scaler-standdown.t
 	@perl -I. -Itests/stubs tests/unit/image-revision.t
+	@perl -I. -Itests/stubs tests/unit/templates.t
 	@perl -I. -Itests/stubs tests/unit/surge-cp-ip.t
 	@perl -I. -Itests/stubs tests/unit/roll-plan.t
 	@perl -I. -Itests/stubs tests/unit/packaging.t
@@ -65,8 +66,10 @@ deb:
 	@install -m 0755 tools/pve-k8s-scaler $(STAGE)/usr/sbin/pve-k8s-scaler
 	@install -m 0755 tools/pve-k8s-vsock-get $(STAGE)/usr/sbin/pve-k8s-vsock-get
 	@install -m 0755 tools/pve-k8s-backup $(STAGE)/usr/sbin/pve-k8s-backup
+	@install -m 0755 tools/pve-k8s-template-refresh $(STAGE)/usr/sbin/pve-k8s-template-refresh
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
 		systemd/pve-k8s-backup.service systemd/pve-k8s-backup.timer \
+		systemd/pve-k8s-template.service systemd/pve-k8s-template.timer \
 		$(STAGE)/lib/systemd/system/
 	@mkdir -p $(STAGE)/etc/sysctl.d
 	@install -m 0644 systemd/99-pve-k8s-vrf.conf \

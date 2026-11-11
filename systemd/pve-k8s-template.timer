@@ -1,0 +1,10 @@
+[Unit]
+Description=Check daily whether the pve-k8s node template refresh is due
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

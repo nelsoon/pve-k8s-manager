@@ -1,0 +1,20 @@
+#!/usr/bin/perl
+# Copyright (C) 2026 pve-k8s contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Weekly template refresh: builds a new node image revision for
+# every Kubernetes minor/arch a cluster uses. Installed on every
+# PVE host and driven by pve-k8s-template.timer (daily check);
+# the claim and last-run stamp in pmxcfs make exactly one host
+# build per week. Nodes are NOT touched: adoption is a roll.
+use strict;
+use warnings;
+
+use PVE::K8s::Provision;
+
+my $built = eval { PVE::K8s::Provision::refresh_templates_if_due() };
+if (my $err = $@) {
+    $err =~ s/\s+$//;
+    print "template refresh failed: $err\n";
+    exit 1;
+}
+print "template refresh: $built built\n" if $built;

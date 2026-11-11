@@ -398,6 +398,69 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'rebuild_template',
+    path => '{name}/rebuild-template',
+    method => 'POST',
+    protected => 1,
+    description => "Build a new node image revision now (for example "
+        . "after a critical security fix) instead of waiting for the "
+        . "weekly refresh. Nodes keep running their current revision "
+        . "until a roll replaces them; the severity stamp starts the "
+        . "remediation deadline (critical 7 days, high 30 days).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            severity => {
+                type => 'string',
+                enum => ['routine', 'high', 'critical'],
+                default => 'routine',
+                optional => 1,
+                description => "How urgent this image update is.",
+            },
+            arch => {
+                type => 'string',
+                enum => ['amd64', 'arm64'],
+                optional => 1,
+                description => "Only rebuild this architecture.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $name = $param->{name};
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name}
+            or die "cluster '$name' does not exist\n";
+        my $severity = $param->{severity} // 'routine';
+        my $minor = $scfg->{'k8s-version'}
+            or die "cluster '$name' has no Kubernetes version\n";
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        # Not a cluster action: rebuilding an image touches no node,
+        # so the scaler and rolls keep running; one refresh at a
+        # time cluster-wide is enforced by the template claim.
+        return $rpcenv->fork_worker('k8srebuild', $name, $authuser, sub {
+            my $ids = PVE::K8s::Config->config()->{ids};
+            my @targets = PVE::K8s::Provision::rebuild_targets(
+                { $name => $ids->{$name} },
+                { minor => $minor, arch => $param->{arch} });
+            die "nothing to rebuild for cluster '$name'\n" if !@targets;
+            PVE::K8s::Provision::rebuild_templates(\@targets, $severity);
+        });
+    }});
+
+__PACKAGE__->register_method({
     name => 'upgrade',
     path => '{name}/upgrade',
     method => 'POST',

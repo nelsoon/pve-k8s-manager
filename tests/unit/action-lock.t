@@ -68,8 +68,12 @@ like($prov, qr/finished without releasing its claim/,
     'claims of finished tasks are reclaimed, not waited out');
 ok((grep { /fork_cluster_worker\(/ } split /\n/, $api) >= 14,
     'every mutating task endpoint goes through the action guard');
-unlike($api, qr/fork_worker\('k8s/,
-    'no mutating endpoint forks a worker directly any more');
+# The one exception: rebuilding an image touches no node, so it is
+# not a cluster action (it must not stall the scaler for an hour);
+# it is serialized cluster-wide by the template claim instead.
+my @direct = $api =~ /fork_worker\('(k8s\w+)'/g;
+is_deeply(\@direct, ['k8srebuild'],
+    'only the node-free template rebuild forks a worker directly');
 like($api, qr/already running/,
     'busy and coalesced responses name the running action');
 
