@@ -7476,4 +7476,150 @@ sub adopt_cluster {
         sub { roll_cluster($name) }) // 0;
 }
 
+# --- pre-upgrade check (read-only; the EKS "upgrade insights" idea).
+# Each check is { id, level => ok|warn|block, message }. Blocking
+# items would make the upgrade fail or stall; warnings are worth
+# knowing about. Pure helpers are unit-tested; the cluster reads
+# live in upgrade_check.
+
+# Pure: deprecated APIs the apiserver saw requests for that are
+# removed in or before $target (a "1.37" string). Reads the
+# apiserver_requested_deprecated_apis metric.
+sub deprecated_apis_removed_by {
+    my ($metrics, $target) = @_;
+
+    my ($tmaj, $tmin) = ($target // '') =~ /^(\d+)\.(\d+)/ or return [];
+    my %seen;
+    for my $line (split /\n/, $metrics // '') {
+        next if $line !~ /^apiserver_requested_deprecated_apis\{(.*)\}\s+1\b/;
+        my $labels = $1;
+        my ($rel) = $labels =~ /removed_release="(\d+\.\d+)"/ or next;
+        my ($rmaj, $rmin) = split /\./, $rel;
+        next if $rmaj > $tmaj || ($rmaj == $tmaj && $rmin > $tmin);
+        my ($g) = $labels =~ /group="([^"]*)"/;
+        my ($v) = $labels =~ /version="([^"]*)"/;
+        my ($r) = $labels =~ /resource="([^"]*)"/;
+        $seen{join('/', grep { length } $g, $v, $r) . " (removed in $rel)"} = 1;
+    }
+    return [sort keys %seen];
+}
+
+# Pure: roll the checks up. ok only when nothing blocks.
+sub upgrade_check_summary {
+    my ($checks) = @_;
+
+    my $blockers = grep { $_->{level} eq 'block' } $checks->@*;
+    my $warnings = grep { $_->{level} eq 'warn' } $checks->@*;
+    return { ok => $blockers ? 0 : 1, blockers => $blockers,
+        warnings => $warnings, checks => $checks };
+}
+
+# Pure: does any online host have room for one more node of
+# $need_mib (surge VM), after a 1 GiB reserve?
+sub surge_headroom_ok {
+    my ($hosts, $need_mib) = @_;
+
+    return (grep {
+        ($_->{status} // 'online') eq 'online'
+            && ($_->{maxmem} // 0) - ($_->{mem} // 0) - 1024**3
+                >= $need_mib * 1048576
+    } $hosts->@*) ? 1 : 0;
+}
+
+sub upgrade_check {
+    my ($name, $target) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my @checks;
+    my $add = sub { push @checks, { id => $_[0], level => $_[1],
+        message => $_[2] } };
+
+    my $to = eval { assert_minor_upgrade($scfg->{'k8s-version'}, $target) };
+    if (my $e = $@) {
+        $e =~ s/\s+$//;
+        $add->('version-skew', 'block', $e);
+        return upgrade_check_summary(\@checks);
+    }
+    $add->('version-skew', 'ok', "$scfg->{'k8s-version'} -> $to is one minor");
+    eval { PVE::K8s::Config::assert_supported_version($to) };
+    if (my $e = $@) {
+        $e =~ s/\s+$//;
+        $add->('supported', 'block', $e);
+    } else {
+        $add->('supported', 'ok', "Kubernetes $to is supported");
+    }
+    ($scfg->{state} // '') eq 'ready'
+        ? $add->('cluster-state', 'ok', 'cluster is ready')
+        : $add->('cluster-state', 'block',
+            "cluster is '" . ($scfg->{state} // 'unknown')
+            . "'; wait until it is ready");
+    my ($tpl) = eval { find_template_in_list(cluster_template_lists(),
+        $to, $scfg->{'cp-arch'} // 'amd64') };
+    defined $tpl
+        ? $add->('template', 'ok', "a $to node template exists")
+        : $add->('template', 'block',
+            "no k8s-node-$to template exists; rebuild the template for "
+            . "$to first");
+
+    my $hosts = eval { decode_pvesh_json(run(['pvesh', 'get',
+        '/cluster/resources', '--type', 'node', '--output-format',
+        'json'], timeout => 60)) };
+    if ($hosts) {
+        surge_headroom_ok($hosts, 3072)
+            ? $add->('headroom', 'ok', 'a host has room for the surge node')
+            : $add->('headroom', 'block',
+                'no Proxmox host has room for one more control-plane node '
+                . '(the roll adds a node before removing one)');
+    } else {
+        $add->('headroom', 'warn', 'could not read host resources');
+    }
+
+    my $backups = eval { list_backups($name) } // [];
+    my ($last) = sort { $b <=> $a } map { $_->{mtime} // 0 } $backups->@*;
+    if (!$last) {
+        $add->('etcd-backup', 'warn',
+            'no etcd backup exists (the roll takes a snapshot first)');
+    } elsif (time() - $last > 86400) {
+        $add->('etcd-backup', 'warn', 'last etcd backup is older than a day');
+    } else {
+        $add->('etcd-backup', 'ok', 'a recent etcd backup exists');
+    }
+
+    my $certs = eval { cert_expiry($name) } // [];
+    my $worst = worst_cert_days($certs);
+    defined $worst && $worst < 90
+        ? $add->('certificates', 'warn',
+            "a certificate expires in $worst days (the roll renews them)")
+        : $add->('certificates', 'ok', 'certificates are not close to expiry');
+
+    my $live = eval {
+        my $nodes = load_nodes($name, $scfg);
+        my $cp = ops_cp($nodes);
+        my $pdbs = kubectl_json($cp, 'get pdb -A')->{items} // [];
+        my @blocked = map { "$_->{metadata}{namespace}/$_->{metadata}{name}" }
+            grep { ($_->{status}{disruptionsAllowed} // 1) == 0 } $pdbs->@*;
+        @blocked
+            ? $add->('pdb', 'warn', 'PodDisruptionBudget(s) with no '
+                . 'disruptions left can stall node drains: '
+                . join(', ', @blocked))
+            : $add->('pdb', 'ok', 'no PodDisruptionBudget blocks eviction');
+        my $m = guest_exec($cp->{vmid},
+            'kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw '
+            . '/metrics 2>/dev/null | grep ^apiserver_requested_deprecated_apis');
+        my $dep = deprecated_apis_removed_by($m, $to);
+        $dep->@*
+            ? $add->('deprecated-apis', 'warn', 'APIs removed by Kubernetes '
+                . "$to are still being requested: " . join('; ', $dep->@*))
+            : $add->('deprecated-apis', 'ok',
+                "no removed-by-$to API was requested since the apiserver "
+                . 'started');
+        1;
+    };
+    $add->('cluster-read', 'warn', 'could not read the cluster for the '
+        . 'PDB and deprecated-API checks') if !$live;
+    return upgrade_check_summary(\@checks);
+}
+
 1;

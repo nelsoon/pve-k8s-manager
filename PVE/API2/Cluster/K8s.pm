@@ -738,6 +738,41 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'upgrade_check',
+    path => '{name}/upgrade-check',
+    method => 'GET',
+    protected => 1, # kubectl via qm guest exec needs root
+    description => "Read-only checks before a Kubernetes minor upgrade: "
+        . "version skew, template, host headroom for the surge node, "
+        . "etcd backup, certificates, PodDisruptionBudgets and "
+        . "deprecated APIs still in use. Changes nothing.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            to => {
+                type => 'string',
+                pattern => '^\\d+\\.\\d+(\\.\\d+)?$',
+                description => "Target Kubernetes minor version.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::upgrade_check(
+            $param->{name}, $param->{to});
+    }});
+
+__PACKAGE__->register_method({
     name => 'power',
     path => '{name}/power',
     method => 'POST',
