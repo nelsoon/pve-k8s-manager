@@ -326,6 +326,95 @@ sub confirm_scale_in {
         { host => $host, count => $count, at => $now });
 }
 
+# S10.3: would draining a node be refused by a PodDisruptionBudget?
+# Kubernetes already computes status.disruptionsAllowed; a PDB with
+# none left that selects any evictable pod on the node blocks the
+# drain. Returns the blocking "namespace/name" list. DaemonSet pods
+# are ignored (drain skips them).
+sub selector_matches {
+    my ($sel, $labels) = @_;
+
+    $labels //= {};
+    return 0 if !ref $sel || !%$sel;    # an empty selector selects nothing here
+    for my $k (keys %{$sel->{matchLabels} // {}}) {
+        return 0 if ($labels->{$k} // "\0") ne $sel->{matchLabels}{$k};
+    }
+    for my $e (($sel->{matchExpressions} // [])->@*) {
+        my ($k, $op, $vals) = ($e->{key}, $e->{operator} // '', $e->{values} // []);
+        my $has = exists $labels->{$k};
+        my $in = $has && grep { $_ eq $labels->{$k} } $vals->@*;
+        return 0 if $op eq 'In' && !$in;
+        return 0 if $op eq 'NotIn' && $in;
+        return 0 if $op eq 'Exists' && !$has;
+        return 0 if $op eq 'DoesNotExist' && $has;
+    }
+    return 1;
+}
+
+sub pdb_blockers {
+    my ($pods, $pdbs) = @_;
+
+    my %out;
+    for my $pod ($pods->@*) {
+        next if (($pod->{metadata}{ownerReferences}[0]{kind}) // '')
+            eq 'DaemonSet';
+        for my $pdb ($pdbs->@*) {
+            next if ($pdb->{metadata}{namespace} // '')
+                ne ($pod->{metadata}{namespace} // '');
+            next if ($pdb->{status}{disruptionsAllowed} // 1) > 0;
+            next if !selector_matches($pdb->{spec}{selector},
+                $pod->{metadata}{labels});
+            $out{"$pdb->{metadata}{namespace}/$pdb->{metadata}{name}"} = 1;
+        }
+    }
+    return [sort keys %out];
+}
+
+# S10.12: the scheduler's own reason a pod is unschedulable
+# (context for the log line, never a trigger).
+sub scheduling_reason {
+    my ($pod) = @_;
+
+    for my $c (($pod->{status}{conditions} // [])->@*) {
+        next if ($c->{type} // '') ne 'PodScheduled'
+            || ($c->{status} // '') ne 'False';
+        my $m = $c->{message} // '';
+        $m =~ s/\s+/ /g;
+        return length $m > 200 ? substr($m, 0, 197) . '...' : $m;
+    }
+    return '';
+}
+
+# S10.11: did a scale-out help? $rec = { pool, at, uids } recorded
+# when nodes were added. After $timeout seconds: 'ok' when none of
+# those pods is still pending, 'failed' when any is (the simulation
+# promised a placement the scheduler did not deliver).
+sub verify_outcome {
+    my ($rec, $pending_uids, $now, $timeout) = @_;
+
+    return 'none' if !$rec || !($rec->{uids} // [])->@*;
+    $timeout //= 900;
+    return 'waiting' if $now - ($rec->{at} // 0) < $timeout;
+    my %pending = map { $_ => 1 } $pending_uids->@*;
+    return (grep { $pending{$_} } $rec->{uids}->@*) ? 'failed' : 'ok';
+}
+
+# S10.11: exponential backoff for a pool whose scale-out did not
+# help: 1h, 2h, 4h, capped at 8h.
+sub backoff_seconds {
+    my ($level) = @_;
+
+    my $s = 3600 * (2 ** ($level // 0));
+    return $s > 8 * 3600 ? 8 * 3600 : $s;
+}
+
+sub pool_backed_off {
+    my ($state, $pool, $now) = @_;
+
+    my $b = ($state // {})->{'pool-backoff'}{$pool} or return 0;
+    return ($b->{until} // 0) > $now ? 1 : 0;
+}
+
 # Would pending pods benefit from more nodes of this pool?
 # Adds simulated nodes one at a time (up to $room) and
 # returns how many nodes would raise the placed count.

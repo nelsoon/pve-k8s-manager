@@ -3792,6 +3792,23 @@ sub record_retired_ghost {
 # wants nodes but placement cannot satisfy it right now.
 # Kept in scaler-state so the UI/API can show it; the next
 # successful pass clears it.
+# Update the scaler-state JSON of a cluster under the config lock.
+my sub scaler_state_update {
+    my ($name, $code) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $cfg = PVE::K8s::Config->config();
+        my $scfg = $cfg->{ids}->{$name} or return;
+        my $state = eval {
+            JSON::PP->new->decode($scfg->{'scaler-state'} // '{}')
+        } // {};
+        $code->($state);
+        $scfg->{'scaler-state'} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($cfg);
+    });
+}
+
 my sub set_parked_state {
     my ($name, $msg) = @_;
 
@@ -4175,6 +4192,32 @@ sub scale_reconcile {
         }
     }
 
+    # S10.11: verify the previous scale-out by outcome. If the pods it
+    # was meant to place are still pending after the timeout, the
+    # simulation was wrong for that pool: back it off (1h, 2h, 4h...)
+    # instead of adding nodes that do not help.
+    my @pending_uids = map { $_->{metadata}{uid} // () } @pending;
+    my $outcome = PVE::K8s::Scaler::verify_outcome(
+        $sstate->{'scale-out'}, \@pending_uids, $now);
+    if ($outcome eq 'ok') {
+        scaler_state_update($name, sub { delete $_[0]->{'scale-out'} });
+    } elsif ($outcome eq 'failed') {
+        my $rec = $sstate->{'scale-out'};
+        my $level = ($sstate->{'pool-backoff'}{$rec->{pool}}{level} // -1) + 1;
+        my $until = $now + PVE::K8s::Scaler::backoff_seconds($level);
+        print "scale: pool $rec->{pool} was grown for pending pods that "
+            . "are still pending after "
+            . int(($now - $rec->{at}) / 60) . " minutes (simulation "
+            . "disagreed with the scheduler); backing the pool off until "
+            . scalar(localtime $until) . "\n";
+        scaler_state_update($name, sub {
+            $_[0]->{'pool-backoff'}{$rec->{pool}}
+                = { until => $until, level => $level };
+            delete $_[0]->{'scale-out'};
+        });
+        $sstate->{'pool-backoff'}{$rec->{pool}} = { until => $until };
+    }
+
     # Scale out, one pool per pass. Every pool with room is
     # evaluated; among those the pending pods fit, the one adding
     # the least capacity wins (not config order), limited by what
@@ -4190,6 +4233,12 @@ sub scale_reconcile {
         for my $pool ($pools->@*) {
             my $room = ($pool->{max} // $pool->{size}) - $pool->{size};
             next if $room <= 0;
+            if (PVE::K8s::Scaler::pool_backed_off(
+                    $sstate, $pool->{name}, $now)) {
+                print "scale: pool $pool->{name} is backed off after "
+                    . "an ineffective scale-out; skipping\n";
+                next;
+            }
             my $tmpl = PVE::K8s::Scaler::pool_template(
                 $pool, \@sim_nodes, $ds_overhead);
             my $needed = PVE::K8s::Scaler::nodes_needed(
@@ -4227,6 +4276,10 @@ sub scale_reconcile {
                 return 0;
             }
             set_parked_state($name, undef);
+            scaler_state_update($name, sub {
+                $_[0]->{'scale-out'} = { pool => $pool->{name},
+                    at => time(), uids => [@pending_uids] };
+            });
             return 1;
         }
         if (@blocked) {
@@ -4238,8 +4291,12 @@ sub scale_reconcile {
             set_parked_state($name, $msg);
             print "scale: $name $msg; not scaling\n";
         } else {
+            my ($why) = grep { length }
+                map { PVE::K8s::Scaler::scheduling_reason($_) } @pending;
             print "scale: pending pods exist but no pool can host "
-                . "them (labels/taints/size/max); not scaling\n";
+                . "them (labels/taints/size/max); not scaling"
+                . (length($why // '') ? "; scheduler says: $why" : '')
+                . "\n";
         }
     }
 
@@ -4282,19 +4339,25 @@ sub scale_reconcile {
         # that is only transiently idle must not be removed.
         my ($confirmed, $rec) = PVE::K8s::Scaler::confirm_scale_in(
             $sstate, $host, $now);
-        PVE::K8s::Config::lock_config(sub {
-            my $c = PVE::K8s::Config->config();
-            my $sc = $c->{ids}->{$name} or return;
-            my $st = eval { JSON::PP->new->decode(
-                $sc->{'scaler-state'} // '{}') } // {};
-            $st->{'scale-in-candidate'} = $rec;
-            $sc->{'scaler-state'} = JSON::PP->new->canonical->encode($st);
-            PVE::K8s::Config::store_config($c);
-        });
+        scaler_state_update($name,
+            sub { $_[0]->{'scale-in-candidate'} = $rec });
         if (!$confirmed) {
             print "scale: $host is idle (pool $pool->{name}); "
                 . "confirming on the next pass before removal\n";
             return 0;
+        }
+        # S10.3: skip the candidate when a PodDisruptionBudget would
+        # refuse the drain, instead of cordoning and discovering that
+        # 200 seconds later. The time-boxed drain stays the backstop.
+        my ($simn) = grep { $_->{name} eq $host } @sim_nodes;
+        my $pdbs = eval { kubectl_json($cp, 'get pdb -A')->{items} } // [];
+        my $blockers = PVE::K8s::Scaler::pdb_blockers(
+            ($simn ? $simn->{pods} : []), $pdbs);
+        if ($blockers->@*) {
+            print "scale: not draining $host: PodDisruptionBudget "
+                . join(', ', $blockers->@*)
+                . " has no disruptions left; skipping this pass\n";
+            next;
         }
         print "scale: removing idle node $host "
             . "(pool $pool->{name} $pool->{size} -> "

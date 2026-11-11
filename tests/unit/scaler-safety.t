@@ -83,4 +83,53 @@ ok(!$ok && $rec->{count} == 1, 'a different node starts over');
     { 'scale-in-candidate' => { host => 'w4', count => 1, at => 1000 } }, 'w4', 5000);
 ok(!$ok, 'a stale sighting does not count');
 
+# S10.3 PDB awareness.
+sub pod { my ($ns, $labels, $kind) = @_; return { metadata => { namespace => $ns, labels => $labels,
+    ownerReferences => $kind ? [{ kind => $kind }] : [] } } }
+sub pdb { my ($ns, $name, $sel, $allowed) = @_; return { metadata => { namespace => $ns, name => $name },
+    spec => { selector => $sel }, status => { disruptionsAllowed => $allowed } } }
+my $web = pod('prod', { app => 'web' });
+is_deeply(PVE::K8s::Scaler::pdb_blockers([$web],
+    [pdb('prod', 'web', { matchLabels => { app => 'web' } }, 0)]), ['prod/web'],
+    'a PDB with no disruptions left blocks the drain');
+is_deeply(PVE::K8s::Scaler::pdb_blockers([$web],
+    [pdb('prod', 'web', { matchLabels => { app => 'web' } }, 1)]), [],
+    'a PDB with budget left does not block');
+is_deeply(PVE::K8s::Scaler::pdb_blockers([$web],
+    [pdb('other', 'web', { matchLabels => { app => 'web' } }, 0)]), [],
+    'a PDB in another namespace does not apply');
+is_deeply(PVE::K8s::Scaler::pdb_blockers([pod('prod', { app => 'web' }, 'DaemonSet')],
+    [pdb('prod', 'web', { matchLabels => { app => 'web' } }, 0)]), [],
+    'DaemonSet pods are ignored (drain skips them)');
+is_deeply(PVE::K8s::Scaler::pdb_blockers([$web],
+    [pdb('prod', 'x', { matchExpressions => [{ key => 'app', operator => 'In', values => ['web', 'api'] }] }, 0)]),
+    ['prod/x'], 'matchExpressions In selects the pod');
+is_deeply(PVE::K8s::Scaler::pdb_blockers([$web],
+    [pdb('prod', 'x', { matchExpressions => [{ key => 'app', operator => 'NotIn', values => ['web'] }] }, 0)]),
+    [], 'matchExpressions NotIn excludes the pod');
+is_deeply(PVE::K8s::Scaler::pdb_blockers([$web], [pdb('prod', 'x', {}, 0)]), [],
+    'an empty selector is not treated as matching');
+
+# S10.12 scheduler reason.
+is(PVE::K8s::Scaler::scheduling_reason({ status => { conditions => [
+    { type => 'PodScheduled', status => 'False',
+      message => "0/3 nodes are available:  3 Insufficient cpu." }] } }),
+    '0/3 nodes are available: 3 Insufficient cpu.', 'scheduler message surfaced, whitespace folded');
+is(PVE::K8s::Scaler::scheduling_reason({}), '', 'no condition, no reason');
+
+# S10.11 verify by outcome.
+my $orec = { pool => 'default', at => 1000, uids => ['a', 'b'] };
+is(PVE::K8s::Scaler::verify_outcome(undef, [], 5000), 'none', 'nothing recorded');
+is(PVE::K8s::Scaler::verify_outcome($orec, ['a'], 1300), 'waiting', 'too early to judge');
+is(PVE::K8s::Scaler::verify_outcome($orec, ['a'], 2000), 'failed', 'a pod is still pending: simulation disagreed');
+is(PVE::K8s::Scaler::verify_outcome($orec, ['zzz'], 2000), 'ok', 'the pods scheduled');
+is(PVE::K8s::Scaler::backoff_seconds(0), 3600, 'first backoff is one hour');
+is(PVE::K8s::Scaler::backoff_seconds(2), 14400, 'doubles each time');
+is(PVE::K8s::Scaler::backoff_seconds(9), 28800, 'capped at eight hours');
+ok(PVE::K8s::Scaler::pool_backed_off({ 'pool-backoff' => { default => { until => 3000 } } }, 'default', 2000),
+    'backed off until the deadline');
+ok(!PVE::K8s::Scaler::pool_backed_off({ 'pool-backoff' => { default => { until => 3000 } } }, 'default', 3000),
+    'back in service after the deadline');
+ok(!PVE::K8s::Scaler::pool_backed_off({}, 'default', 1), 'no record: not backed off');
+
 done_testing;
