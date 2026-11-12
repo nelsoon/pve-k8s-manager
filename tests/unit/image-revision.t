@@ -51,4 +51,8 @@ is($next, 7, 'with every template deleted the next build is r7, not r1');
 unlink $state;
 like($script, qr/\{ cluster_vm_names; recorded_template_names; \}/, 'the build script counts the history');
 
+like($script, qr/removing abandoned builder VM/, 'the next build clears a half-built VM left by an interrupted one');
+like($script, qr/grep -q '\^template: 1' && continue/, 'finished images (templates) are never touched');
+like($script, qr/pgrep -f 'build-template\\\.sh' \| grep -vx "\$\$"/, 'not while another build runs on this host');
+
 done_testing;

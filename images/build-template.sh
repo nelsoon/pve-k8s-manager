@@ -85,6 +85,20 @@ pvesm set local --content iso,backup,vztmpl,snippets 2>/dev/null || true
 sed -e "s|__K8S_MINOR__|$K8S_MINOR|g" -e "s|__K8S_REPO__|$K8S_REPO|g" \
     cloud-init/user-data.tmpl > /var/lib/vz/snippets/k8s-node-user-data.yaml
 
+# An interrupted build leaves a half-built VM behind: it is never
+# destroyed from a signal trap (see below). Clear such leftovers here,
+# at the start of the next build: a k8s-node-* VM on this host that is
+# not a template, and only while no other build runs on this host.
+# Finished images are templates and are never touched.
+if [ -z "$(pgrep -f 'build-template\.sh' | grep -vx "$$")" ]; then
+    for id in $(qm list | awk '$2 ~ /^k8s-node-/ {print $1}'); do
+        qm config "$id" | grep -q '^template: 1' && continue
+        echo "removing abandoned builder VM $id (interrupted build)"
+        qm stop "$id" >/dev/null 2>&1 || true
+        qm destroy "$id" --purge >/dev/null 2>&1 || true
+    done
+fi
+
 cleanup_builder() {
     qm stop "$VMID" >/dev/null 2>&1 || true
     qm destroy "$VMID" >/dev/null 2>&1 || true
