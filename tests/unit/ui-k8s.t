@@ -227,6 +227,8 @@ like($js, qr/if \(target\.lazyBuild\) \{/, 'showing a panel builds it once');
 like($js, qr/if \(fixedClusterName\) \{\s+fetchSummary\(fixedClusterName/,
     'opening a cluster page starts the summary request at once');
 like($js, qr/fetchSummary\(name, function\(r\) \{/, 'the Overview reuses that request');
+like($js, qr/Ext\.defer\(function\(\) \{ cb\(r\.resp\); \}, 1\);/,
+    'an already answered summary is handed over asynchronously (gauges must be rendered)');
 my $fos = () = $js =~ /fireOnStart: false/g;
 is($fos, 2, 'the 30 s polls do not load the list a second time on start');
 

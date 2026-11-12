@@ -979,7 +979,10 @@ Ext.define('PVE.dc.K8sView', {
                 });
             }
             if (r.done) {
-                (r.ok ? onOk : onFail)(r.resp);
+                // always asynchronous, like a network reply: the caller
+                // may still be building (and not rendering) its panel
+                let cb = r.ok ? onOk : onFail;
+                Ext.defer(function() { cb(r.resp); }, 1);
             } else {
                 r.waiters.push([onOk, onFail]);
             }
@@ -1073,6 +1076,12 @@ Ext.define('PVE.dc.K8sView', {
                 }
             } catch (e) {
                 poolsText = rec.pools || '';
+            }
+            if (!poolsText) {
+                // a new cluster has no explicit groups yet: the backend
+                // default is one group sized by 'workers' (as on Nodes)
+                poolsText = 'default: ' + (parseInt(rec.workers, 10) || 2)
+                    + gettext(' nodes');
             }
             let actionText = '';
             try {
