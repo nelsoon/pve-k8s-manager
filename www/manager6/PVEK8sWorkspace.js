@@ -4,339 +4,357 @@
 // wizard and provision-with-task-progress, in pve-manager style.
 // The REST API stays the contract; this panel is a thin client.
 
+// Create dialog: the stock Proxmox.window.Edit + InputPanel, so
+// validation, API errors, the Advanced checkbox and the reset
+// button behave like every other PVE create dialog. Only the name
+// (and, where it matters, a public subnet) is asked by default;
+// everything else is detected, shown in the summary line and
+// editable under Advanced. Create then provisions, as one step.
 Ext.define('PVE.dc.K8sCreateWindow', {
-    extend: 'Ext.window.Window',
+    extend: 'Proxmox.window.Edit',
     alias: 'widget.pveDcK8sCreateWindow',
 
-    title: gettext('Create Kubernetes Cluster'),
-    modal: true,
-    width: 520,
-    layout: 'fit',
+    subject: gettext('Kubernetes Cluster'),
+    isCreate: true,
+    url: '/cluster/k8s',
+    method: 'POST',
+    submitText: gettext('Create'),
+    width: 640,
 
-    // callback fired after create + provision task was started
+    // Minors this release can create. Kept in step with
+    // PVE::K8s::Config::supported_versions by tests/unit/ui-k8s.t.
+    supportedVersions: ['1.35', '1.36'],
+    // Backend defaults, only used for the summary line.
+    defaultControlPlane: 3,
+    defaultWorkers: 2,
+
+    // callback fired after the provision task was started
     onDone: undefined,
+
+    // Create only writes the config; provisioning is the second
+    // call. The window closes at once, the task viewer follows.
+    apiCallDone: function(success, response, options) {
+        let me = this;
+        if (!success) {
+            return;
+        }
+        let name = options.params.name;
+        Proxmox.Utils.API2Request({
+            url: '/cluster/k8s/' + encodeURIComponent(name) + '/provision',
+            method: 'POST',
+            failure: function(resp) {
+                Ext.Msg.alert(gettext('Error'),
+                    Proxmox.Utils.extractRequestError(resp, true));
+                if (me.onDone) {
+                    me.onDone();
+                }
+            },
+            success: function(resp) {
+                let upid = resp.result.data;
+                if (upid) {
+                    Ext.create('Proxmox.window.TaskViewer', {
+                        autoShow: true,
+                        upid: upid,
+                    });
+                }
+                if (me.onDone) {
+                    me.onDone();
+                }
+            },
+        });
+    },
 
     initComponent: function() {
         let me = this;
 
-        // The Resilience bundle keeps storage, profile
-        // and CP policy in agreement. One entry point
-        // for the preset combo and the storage store's
-        // first load (a setValue no-op must not skip
-        // the filter).
-        let applyResilience = function(win, preset) {
+        let versions = me.supportedVersions;
+        let latest = versions[versions.length - 1];
+
+        let zoneStore = Ext.create('Ext.data.Store', {
+            fields: ['zone'],
+            proxy: { type: 'proxmox', url: '/api2/json/cluster/sdn/zones' },
+            autoLoad: true,
+        });
+
+        let ipanel;
+        let get = function(name) {
+            return ipanel.down('[name=' + name + ']');
+        };
+
+        // Storage and availability agree by construction: shared
+        // storage means HA, local storage means rebuild. The
+        // mismatch state (HA on local storage) cannot be chosen;
+        // the backend refuses it too, for API callers.
+        let applyResilience = function(preset) {
             let shared = preset !== 'local-replace';
-            win.down('[name=storage-profile]')
-                .setValue(shared ? 'shared' : 'local');
-            win.down('[name=cp-policy]')
-                .setValue(shared ? 'ha' : 'replace');
-            let sc = win.down('[name=storage]');
+            get('storage-profile').setValue(shared ? 'shared' : 'local');
+            get('cp-policy').setValue(shared ? 'ha' : 'replace');
+            let sc = get('storage');
             let store = sc.getStore();
-            store.clearFilter();
-            store.filterBy(function(r) {
-                return (r.get('shared') ? 1 : 0)
-                    === (shared ? 1 : 0);
+            store.removeFilter('k8s-shared', true);
+            store.addFilter({
+                id: 'k8s-shared',
+                filterFn: function(r) {
+                    return (r.get('shared') ? 1 : 0) === (shared ? 1 : 0);
+                },
             });
-            let cur = store.findRecord(
-                'storage', sc.getValue());
-            if (!cur) {
+            if (!store.findRecord('storage', sc.getValue(), 0, false, true, true)) {
                 let first = store.getAt(0);
-                sc.setValue(first
-                    ? first.get('storage') : '');
+                sc.setValue(first ? first.get('storage') : '');
             }
         };
 
-        let form = Ext.create('Ext.form.Panel', {
-            bodyPadding: 10,
-            border: false,
-            fieldDefaults: {
-                labelWidth: 160,
-                anchor: '100%',
+        // Explain a blocked choice only when it is blocked.
+        let syncStorage = function() {
+            let sc = get('storage');
+            let combo = get('resilience');
+            let anyShared = false;
+            sc.getStore().each(function(r) {
+                if (r.get('shared') && !r.get('disable')) {
+                    anyShared = true;
+                }
+            });
+            let note = ipanel.down('#haNote');
+            note.setVisible(!anyShared);
+            combo.setDisabled(!anyShared);
+            let preset = anyShared ? 'shared-ha' : 'local-replace';
+            if (combo.getValue() !== preset && !combo.userChose) {
+                combo.setValue(preset);
+            }
+            applyResilience(combo.getValue());
+            updateSummary();
+        };
+
+        // One place decides how the network fields relate.
+        let syncNetwork = function() {
+            let zone = get('sdn-zone');
+            let subnet = get('public-subnet');
+            let count = zoneStore.getCount();
+            subnet.setVisible(count > 0);
+            subnet.setDisabled(count === 0);
+            zone.setVisible(count > 1);
+            zone.setDisabled(count < 2);
+            zone.allowBlank = !subnet.getValue();
+            zone.validate();
+            ipanel.down('#subnetHint').setVisible(count > 0);
+            ipanel.down('#subnetHint').setValue(count === 1
+                ? Ext.String.format(gettext('Optional. A free /24 that publishes '
+                    + 'LoadBalancer IPs and the API address through SDN zone {0}. '
+                    + 'Leave empty to stay on the shared cluster network.'),
+                    Ext.String.htmlEncode(zoneStore.getAt(0).get('zone')))
+                : gettext('Optional. A free /24 that publishes LoadBalancer IPs '
+                    + 'and the API address through an SDN zone. Leave empty to '
+                    + 'stay on the shared cluster network.'));
+            updateSummary();
+        };
+
+        let updateSummary = function() {
+            if (!ipanel || !ipanel.rendered) {
+                return;
+            }
+            let cp = get('cp') ? get('cp').getValue() : me.defaultControlPlane;
+            let ver = get('k8s-version') ? get('k8s-version').getValue() : latest;
+            let stor = get('storage') ? get('storage').getValue() : '';
+            let ha = get('cp-policy') && get('cp-policy').getValue() === 'ha';
+            let sub = get('public-subnet');
+            let net = sub && !sub.isDisabled() && sub.getValue()
+                ? Ext.String.format(gettext('LoadBalancer IPs from {0}'),
+                    Ext.String.htmlEncode(sub.getValue()))
+                : gettext('shared cluster network');
+            let line = Ext.String.format(
+                gettext('{0} control-plane nodes and {1} workers, Kubernetes {2}'),
+                cp, me.defaultWorkers, Ext.String.htmlEncode(ver || latest));
+            if (stor) {
+                line += ', ' + Ext.String.format(
+                    ha ? gettext('storage {0} (HA)') : gettext('storage {0}'),
+                    Ext.String.htmlEncode(stor));
+            }
+            line += ', ' + net;
+            let sum = ipanel.down('#summary');
+            if (sum) {
+                sum.setValue(line);
+            }
+        };
+
+        ipanel = Ext.create('Proxmox.panel.InputPanel', {
+            column1: [
+                {
+                    xtype: 'textfield',
+                    name: 'name',
+                    fieldLabel: gettext('Name'),
+                    emptyText: 'c1',
+                    allowBlank: false,
+                    regex: /^[A-Za-z][A-Za-z0-9_-]*$/,
+                    regexText: gettext('Letters, digits, - and _; must start with a letter'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'public-subnet',
+                    fieldLabel: gettext('Public Subnet'),
+                    emptyText: gettext('none (shared network)'),
+                    hidden: true,
+                    disabled: true,
+                    listeners: { change: function() { syncNetwork(); } },
+                },
+                {
+                    xtype: 'displayfield',
+                    itemId: 'subnetHint',
+                    userCls: 'pmx-hint',
+                    hidden: true,
+                    value: '',
+                },
+                {
+                    xtype: 'combobox',
+                    name: 'sdn-zone',
+                    fieldLabel: gettext('SDN Zone'),
+                    store: zoneStore,
+                    displayField: 'zone',
+                    valueField: 'zone',
+                    queryMode: 'local',
+                    editable: false,
+                    allowBlank: true,
+                    hidden: true,
+                    disabled: true,
+                    emptyText: gettext('select the zone'),
+                    listeners: { change: function() { syncNetwork(); } },
+                },
+            ],
+            columnB: [
+                {
+                    xtype: 'displayfield',
+                    itemId: 'summary',
+                    fieldLabel: gettext('This creates'),
+                    labelWidth: 100,
+                    value: '',
+                },
+            ],
+            advancedColumn1: [
+                {
+                    xtype: 'combobox',
+                    name: 'k8s-version',
+                    fieldLabel: gettext('Kubernetes Version'),
+                    store: versions,
+                    value: latest,
+                    editable: false,
+                    allowBlank: false,
+                    listeners: { change: function() { updateSummary(); } },
+                },
+                {
+                    xtype: 'combobox',
+                    name: 'cp',
+                    fieldLabel: gettext('Control Plane Nodes'),
+                    store: [1, 3, 5],
+                    value: me.defaultControlPlane,
+                    editable: false,
+                    listeners: { change: function() { updateSummary(); } },
+                },
+                {
+                    xtype: 'combobox',
+                    name: 'resilience',
+                    fieldLabel: gettext('Availability'),
+                    store: [
+                        ['shared-ha', gettext('High availability (shared storage)')],
+                        ['local-replace', gettext('Standard (local storage)')],
+                    ],
+                    value: 'shared-ha',
+                    editable: false,
+                    listeners: {
+                        select: function(combo) {
+                            combo.userChose = true;
+                        },
+                        change: function(combo, preset) {
+                            applyResilience(preset);
+                            updateSummary();
+                        },
+                    },
+                },
+                {
+                    xtype: 'displayfield',
+                    itemId: 'haNote',
+                    userCls: 'pmx-hint',
+                    hidden: true,
+                    value: gettext('No shared storage is configured, so a failed node '
+                        + 'is rebuilt instead of restarted by Proxmox HA.'),
+                },
+                {
+                    xtype: 'pveStorageSelector',
+                    name: 'storage',
+                    fieldLabel: gettext('Storage'),
+                    clusterView: true,
+                    storageContent: 'images',
+                    allowBlank: false,
+                    emptyText: gettext('Proxmox storage for node disks'),
+                    listeners: { change: function() { updateSummary(); } },
+                },
+                { xtype: 'hiddenfield', name: 'storage-profile', value: 'shared' },
+                { xtype: 'hiddenfield', name: 'cp-policy', value: 'ha' },
+            ],
+            advancedColumn2: [
+                {
+                    xtype: 'textfield',
+                    name: 'node-subnet',
+                    fieldLabel: gettext('Node Subnet'),
+                    emptyText: gettext('auto: first free 10.10.x.0/24'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'gateway',
+                    fieldLabel: gettext('Gateway'),
+                    emptyText: gettext('auto: .1 of the node subnet'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'lb-range',
+                    fieldLabel: gettext('LoadBalancer Range'),
+                    emptyText: gettext('auto: .100-.120 of the public subnet'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'builder-ip',
+                    fieldLabel: gettext('Template Builder IP'),
+                    emptyText: gettext('auto: DHCP on the host LAN'),
+                },
+                {
+                    xtype: 'combobox',
+                    name: 'cp-arch',
+                    fieldLabel: gettext('Control Plane Architecture'),
+                    store: ['amd64', 'arm64'],
+                    value: 'amd64',
+                    editable: false,
+                },
+            ],
+
+            onGetValues: function(values) {
+                // resilience is a dialog-only bundle: the profile
+                // and policy travel, it does not
+                delete values.resilience;
+                // one SDN zone needs no decision when a public
+                // subnet is given: use it
+                if (values['public-subnet'] && !values['sdn-zone']
+                    && zoneStore.getCount() === 1) {
+                    values['sdn-zone'] = zoneStore.getAt(0).get('zone');
+                }
+                // optional fields: omit blanks entirely
+                Object.keys(values).forEach(function(key) {
+                    if (values[key] === '' || values[key] === undefined) {
+                        delete values[key];
+                    }
+                });
+                return values;
             },
-            items: [
-                {
-                    xtype: 'fieldset',
-                    title: gettext('Basics'),
-                    collapsible: false,
-                    defaults: { anchor: '100%', labelWidth: 160 },
-                    items: [
-                        {
-                            xtype: 'textfield',
-                            name: 'name',
-                            fieldLabel: gettext('Name'),
-                            emptyText: 'c1',
-                            allowBlank: false,
-                        },
-                        {
-                            xtype: 'combobox',
-                            name: 'k8s-version',
-                            fieldLabel: gettext('Kubernetes Version'),
-                            // add-on-tested minors only; keep in sync
-                            // with PVE::K8s::Config supported list
-                            store: ['1.35', '1.36'],
-                            value: '1.36',
-                            editable: false,
-                            allowBlank: false,
-                        },
-                        {
-                            xtype: 'combobox',
-                            name: 'cp',
-                            fieldLabel: gettext('Control Plane Nodes'),
-                            store: [1, 3, 5],
-                            value: 3,
-                            editable: false,
-                        },
-                        {
-                            // One bundle, not three knobs:
-                            // storage, profile and CP policy
-                            // always agree, so the mismatch
-                            // state (HA on local storage) is
-                            // unreachable. The backend
-                            // refuses it too, as a second
-                            // net for API callers.
-                            xtype: 'combobox',
-                            name: 'resilience',
-                            fieldLabel: gettext('Availability'),
-                            store: [
-                                ['shared-ha', gettext('High availability (shared storage)')],
-                                ['local-replace', gettext('Standard (local storage)')],
-                            ],
-                            value: 'shared-ha',
-                            editable: false,
-                            listeners: {
-                                change: function(combo, preset) {
-                                    applyResilience(
-                                        combo.up('window'), preset);
-                                },
-                            },
-                        },
-                        {
-                            // select from existing storages,
-                            // never free text; filtered to
-                            // the Resilience preset above
-                            xtype: 'combobox',
-                            name: 'storage',
-                            fieldLabel: gettext('Storage'),
-                            store: Ext.create('Ext.data.Store', {
-                                fields: ['storage', 'shared'],
-                                proxy: {
-                                    type: 'proxmox',
-                                    url: '/api2/json/storage',
-                                },
-                                autoLoad: true,
-                                listeners: {
-                                    load: function(store) {
-                                        let wins = Ext.ComponentQuery
-                                            .query('window');
-                                        let win = wins.length
-                                            ? wins[wins.length - 1]
-                                            : null;
-                                        let combo = win && win.down(
-                                            '[name=resilience]');
-                                        if (!combo) { return; }
-                                        let anyShared = false;
-                                        store.each(function(r) {
-                                            if (r.get('shared')) {
-                                                anyShared = true;
-                                            }
-                                        });
-                                        let preset = anyShared
-                                            ? 'shared-ha'
-                                            : 'local-replace';
-                                        combo.setValue(preset);
-                                        applyResilience(win, preset);
-                                    },
-                                },
-                            }),
-                            displayField: 'storage',
-                            valueField: 'storage',
-                            queryMode: 'local',
-                            editable: false,
-                            emptyText: gettext('Proxmox storage for node disks'),
-                        },
-                        {
-                            xtype: 'hiddenfield',
-                            name: 'storage-profile',
-                            value: 'shared',
-                        },
-                        {
-                            xtype: 'hiddenfield',
-                            name: 'cp-policy',
-                            value: 'ha',
-                        },
-                        {
-                            xtype: 'displayfield',
-                            value: gettext('Shared storage enables Proxmox HA '
-                                + 'for all nodes; local storage rebuilds '
-                                + 'failed nodes instead. Control plane VMs '
-                                + 'always migrate on planned maintenance.'),
-                        },
-                        {
-                            // select from existing SDN zones
-                            xtype: 'combobox',
-                            name: 'sdn-zone',
-                            fieldLabel: gettext('SDN Zone'),
-                            store: Ext.create('Ext.data.Store', {
-                                fields: ['zone'],
-                                proxy: {
-                                    type: 'proxmox',
-                                    url: '/api2/json/cluster/sdn/zones',
-                                },
-                                autoLoad: true,
-                            }),
-                            displayField: 'zone',
-                            valueField: 'zone',
-                            queryMode: 'local',
-                            editable: false,
-                            emptyText: gettext('dedicated VNet mode (with Public Subnet)'),
-                            listeners: {
-                                // a single SDN zone needs no
-                                // decision: preselect it
-                                afterrender: function(combo) {
-                                    let pick = function(store) {
-                                        if (store.getCount() === 1
-                                            && !combo.getValue()) {
-                                            combo.setValue(store
-                                                .getAt(0).get('zone'));
-                                        }
-                                    };
-                                    combo.getStore().on('load', pick);
-                                    if (combo.getStore().isLoaded()) {
-                                        pick(combo.getStore());
-                                    }
-                                },
-                            },
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'public-subnet',
-                            fieldLabel: gettext('Public Subnet (LB/VIP)'),
-                            emptyText: '192.168.3.0/24',
-                        },
-                        {
-                            xtype: 'displayfield',
-                            value: gettext('A default worker group '
-                                + '(2 nodes) is created with the cluster. '
-                                + 'Add, edit or remove worker groups later '
-                                + 'under Nodes.'),
-                        },
-                    ],
-                },
-                {
-                    xtype: 'fieldset',
-                    title: gettext('Advanced (overrides)'),
-                    collapsible: true,
-                    collapsed: true,
-                    defaults: { anchor: '100%', labelWidth: 160 },
-                    items: [
-                        {
-                            xtype: 'textfield',
-                            name: 'node-subnet',
-                            fieldLabel: gettext('Node Subnet'),
-                            emptyText: gettext('auto: first free 10.10.x.0/24'),
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'gateway',
-                            fieldLabel: gettext('Gateway'),
-                            emptyText: gettext('auto: .1 of the node subnet'),
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'lb-range',
-                            fieldLabel: gettext('LoadBalancer Range'),
-                            emptyText: gettext('auto: .100-.120 of the public subnet'),
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'builder-ip',
-                            fieldLabel: gettext('Template Builder IP'),
-                            emptyText: gettext('auto: DHCP on the host LAN'),
-                        },
-                        {
-                            xtype: 'combobox',
-                            name: 'cp-arch',
-                            fieldLabel: gettext('Control Plane Architecture'),
-                            store: ['amd64', 'arm64'],
-                            value: 'amd64',
-                            editable: false,
-                        },
-                    ],
-                },
-            ],
         });
 
-        Ext.apply(me, {
-            items: [form],
-            buttons: [
-                {
-                    text: gettext('Create and Provision'),
-                    handler: function() {
-                        if (!form.isValid()) {
-                            return;
-                        }
-                        let values = form.getValues();
-                        // resilience is a dialog-only bundle:
-                        // profile and policy travel, it does not
-                        delete values.resilience;
-                        // optional fields: omit blanks entirely
-                        // (a blank node-subnet means the
-                        // backend allocates one)
-                        Object.keys(values).forEach(function(key) {
-                            if (values[key] === '') {
-                                delete values[key];
-                            }
-                        });
-                        // worker groups are managed after
-                        // creation, under Nodes; the backend
-                        // default (one group of 2) applies
-                        me.setLoading(true);
-                        Proxmox.Utils.API2Request({
-                            url: '/cluster/k8s',
-                            method: 'POST',
-                            params: values,
-                            failure: function(response) {
-                                me.setLoading(false);
-                                Ext.Msg.alert(gettext('Error'),
-                                    Proxmox.Utils.extractRequestError(response, true));
-                            },
-                            success: function() {
-                                Proxmox.Utils.API2Request({
-                                    url: '/cluster/k8s/' + values.name + '/provision',
-                                    method: 'POST',
-                                    failure: function(response) {
-                                        me.setLoading(false);
-                                        Ext.Msg.alert(gettext('Error'),
-                                            Proxmox.Utils.extractRequestError(response, true));
-                                    },
-                                    success: function(response) {
-                                        me.setLoading(false);
-                                        let upid = response.result.data;
-                                        if (upid) {
-                                            Ext.create('Proxmox.window.TaskViewer', {
-                                                upid: upid,
-                                            }).show();
-                                        }
-                                        if (me.onDone) {
-                                            me.onDone();
-                                        }
-                                        me.close();
-                                    },
-                                });
-                            },
-                        });
-                    },
-                },
-                {
-                    text: gettext('Cancel'),
-                    handler: function() {
-                        me.close();
-                    },
-                },
-            ],
-        });
-
+        Ext.apply(me, { items: [ipanel] });
         me.callParent();
+
+        // everything that depends on loaded stores waits for them
+        let sc = get('storage');
+        sc.getStore().on('load', syncStorage);
+        zoneStore.on('load', syncNetwork);
+        me.on('afterrender', function() {
+            syncStorage();
+            syncNetwork();
+        });
     },
 });
 

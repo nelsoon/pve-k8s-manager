@@ -127,7 +127,9 @@ __PACKAGE__->register_method({
             'k8s-version' => {
                 type => 'string',
                 pattern => '^\d+\.\d+(\.\d+)?$',
-                description => "Kubernetes version, e.g. '1.36'.",
+                optional => 1,
+                description => "Kubernetes version, e.g. '1.36'. "
+                    . "Default: the newest supported minor.",
             },
             cp => {
                 type => 'integer',
@@ -268,6 +270,8 @@ __PACKAGE__->register_method({
         my $name = $param->{name};
         my $cp = PVE::K8s::Config::assert_valid_cp_count($param->{cp} // 3);
         # new clusters only on upstream-supported minors
+        $param->{'k8s-version'} //=
+            PVE::K8s::Config::latest_supported_version();
         PVE::K8s::Config::assert_supported_version($param->{'k8s-version'});
         # Node networking needs no decision: first free
         # /24 in 10.10.0.0/16 unless the caller pins one.

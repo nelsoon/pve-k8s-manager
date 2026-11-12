@@ -43,12 +43,14 @@ my $js = do {
     local $/;
     <$fh>;
 };
-my ($store) = $js =~ /name: 'k8s-version',.*?store: \[([^\]]+)\]/s;
-ok(defined $store, 'wizard has a k8s-version dropdown store');
+my ($store) = $js =~ /supportedVersions: \[([^\]]+)\]/s;
+ok(defined $store, 'create dialog declares the creatable minors');
+like($js, qr/name: 'k8s-version',.*?store: versions,/s,
+    'the k8s-version dropdown offers exactly that list');
 my @offered = $store =~ /'(\d+\.\d+)'/g;
 is_deeply(\@offered, $supported,
     'wizard dropdown matches the supported version list');
-like($js, qr/name: 'k8s-version',.*?value: '\Q$supported->[-1]\E'/s,
+like($js, qr/let latest = versions\[versions\.length - 1\];.*?name: 'k8s-version',.*?value: latest,/s,
     'wizard defaults to the latest supported version');
 
 # The API enforces the same window at create time.

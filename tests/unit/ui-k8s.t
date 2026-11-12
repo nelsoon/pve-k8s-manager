@@ -30,8 +30,8 @@ like($js, qr/delete values\.resilience/,
 for my $field (qw(workers pools)) {
     unlike($js, qr/name: '\Q$field\E'/, "create wizard has no $field field");
 }
-like($js, qr|url: '/cluster/k8s/' \+ values\.name \+ '/provision'|,
-    'wizard provisions the cluster it just created');
+like($js, qr|'/cluster/k8s/' \+ encodeURIComponent\(name\) \+ '/provision'|,
+    'create provisions the cluster it just created');
 like($js, qr/Proxmox\.window\.TaskViewer/,
     'provisioning progress is shown as a PVE task');
 like($js, qr/dataIndex: 'state'/, 'grid shows cluster health/state');
@@ -123,8 +123,8 @@ unlike($js, qr/tabPosition/,
     'no tab strip on the cluster page');
 unlike($js, qr/'pool-min'/, 'create has no pool bounds fields');
 unlike($js, qr/Worker Pools \(JSON/, 'create has no pools JSON field');
-like($js, qr{/api2/json/storage},
-    'create selects storage from existing storages');
+like($js, qr/xtype: 'pveStorageSelector',\s+name: 'storage',\s+fieldLabel: gettext\('Storage'\),\s+clusterView: true/,
+    'create selects storage with the stock storage selector');
 like($js, qr{/api2/json/cluster/sdn/zones},
     'create selects the SDN zone from existing zones');
 like($js, qr{'cp-arch'}, 'create offers control-plane architecture');
@@ -162,5 +162,22 @@ like($js, qr|'/certificates'|,
     'overview shows certificate expiry');
 like($api, qr/name => 'workloads'/, 'workloads endpoint exists');
 like($api, qr/name => 'metrics'/, 'metrics endpoint exists');
+
+# UI polish step 1: the stock create dialog with one visible field.
+like($js, qr/Ext\.define\('PVE\.dc\.K8sCreateWindow', \{\s+extend: 'Proxmox\.window\.Edit'/,
+    'create is a stock Proxmox.window.Edit');
+like($js, qr/Ext\.create\('Proxmox\.panel\.InputPanel'/,
+    'create uses the stock InputPanel (Advanced checkbox included)');
+my ($create) = $js =~ /(Ext\.define\('PVE\.dc\.K8sCreateWindow'.*?\n\}\);)/s;
+my ($main) = $create =~ /column1: \[(.*?)\n            \],\n            columnB/s;
+my @shown = $main =~ /name: '([a-z-]+)'/g;
+is_deeply(\@shown, [qw(name public-subnet sdn-zone)],
+    'only the name and the optional network fields are in the default view');
+like($create, qr/advancedColumn1/, 'every other setting sits under Advanced');
+like($create, qr/This creates/, 'a summary line shows what the defaults will create');
+like($create, qr/No shared storage is configured/,
+    'the HA restriction is explained only when it applies');
+like($api, qr/'k8s-version' => \{[^}]*optional => 1/s,
+    'k8s-version is optional through the API (default: newest supported)');
 
 done_testing();
