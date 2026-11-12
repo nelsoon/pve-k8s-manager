@@ -108,8 +108,16 @@ Ext.define('PVE.dc.K8sCreateWindow', {
         let syncStorage = function() {
             let sc = get('storage');
             let combo = get('resilience');
+            let store = sc.getStore();
+            // wait for the list: deciding on an empty store would pick
+            // "local" and hide the shared storages that load next
+            if (!store.isLoaded()) {
+                return;
+            }
+            // look at all storages, not just those our own filter shows
+            let all = store.getData().getSource() || store.getData();
             let anyShared = false;
-            sc.getStore().each(function(r) {
+            all.each(function(r) {
                 if (r.get('shared') && !r.get('disable')) {
                     anyShared = true;
                 }
@@ -282,7 +290,10 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     fieldLabel: gettext('Storage'),
                     clusterView: true,
                     storageContent: 'images',
-                    allowBlank: false,
+                    // not required: the backend picks a default, and a
+                    // blank advanced field would make the stock window
+                    // pop the Advanced section open on its own
+                    allowBlank: true,
                     emptyText: gettext('Proxmox storage for node disks'),
                     listeners: { change: function() { updateSummary(); } },
                 },
@@ -352,6 +363,10 @@ Ext.define('PVE.dc.K8sCreateWindow', {
         sc.getStore().on('load', syncStorage);
         zoneStore.on('load', syncNetwork);
         me.on('afterrender', function() {
+            // follow the Advanced checkbox explicitly: with no stored
+            // state the stock window passes undefined, which shows it
+            let sp = Ext.state.Manager.getProvider();
+            ipanel.setAdvancedVisible(!!(sp && sp.get('proxmox-advanced-cb')));
             syncStorage();
             syncNetwork();
         });
