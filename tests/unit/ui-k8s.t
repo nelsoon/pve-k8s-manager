@@ -180,4 +180,14 @@ like($create, qr/No shared storage is configured/,
 like($api, qr/'k8s-version' => \{[^}]*optional => 1/s,
     'k8s-version is optional through the API (default: newest supported)');
 
+# Step 3: node group editor on the stock window; autoscale is one checkbox.
+like($js, qr/Ext\.define\('PVE\.dc\.K8sGroupWindow', \{\s+extend: 'Proxmox\.window\.Edit'/,
+    'node group editor is a stock Proxmox.window.Edit');
+like($js, qr/name: 'autoscale'/, 'autoscale is a single checkbox');
+like($js, qr/let min = autoscale \? parseInt\(v\.min, 10\) : size;/,
+    'without autoscale min and max equal the node count');
+my ($grp) = $js =~ /(Ext\.define\('PVE\.dc\.K8sGroupWindow'.*?\n\}\);)/s;
+is(scalar(() = $grp =~ /autoSelect: false/g), 2,
+    'stock selectors in the group editor do not auto-pick the first entry');
+
 done_testing();

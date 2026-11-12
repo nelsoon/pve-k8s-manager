@@ -374,6 +374,210 @@ Ext.define('PVE.dc.K8sCreateWindow', {
 });
 
 
+// Node group editor: stock Edit window. A group is a name and a
+// node count; autoscaling (Min/Max) is one checkbox away and
+// everything about placement and sizing is under Advanced.
+// Saving hands the entry to the caller, which writes all groups
+// and converges the cluster; nothing is submitted from here.
+Ext.define('PVE.dc.K8sGroupWindow', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pveDcK8sGroupWindow',
+
+    subject: gettext('Node Group'),
+    url: '/cluster/k8s',
+    width: 640,
+
+    existing: undefined,   // the group being edited, undefined for a new one
+    deviceStore: undefined,
+    onSave: undefined,     // function(entry)
+
+    submit: function() {
+        let me = this;
+        if (!me.isValid()) {
+            return;
+        }
+        let v = me.getValues();
+        let size = parseInt(v.size, 10);
+        let autoscale = !!v.autoscale;
+        let min = autoscale ? parseInt(v.min, 10) : size;
+        let max = autoscale ? parseInt(v.max, 10) : size;
+        if (!(min <= size && size <= max)) {
+            Ext.Msg.alert(gettext('Error'),
+                gettext('Min <= Nodes <= Max required'));
+            return;
+        }
+        let entry = { name: v.name, size: size, min: min, max: max };
+        let hosts = Ext.isArray(v.hosts) ? v.hosts.join(',') : v.hosts;
+        v.hosts = hosts;
+        ['labels', 'taints', 'hosts', 'storage', 'arch', 'policy',
+            'device-profile'].forEach(function(k) {
+                if (v[k]) { entry[k] = v[k]; }
+            });
+        ['cpu', 'memory', 'disk'].forEach(function(k) {
+            if (v[k] !== '' && v[k] !== null && v[k] !== undefined) {
+                entry[k] = parseInt(v[k], 10);
+            }
+        });
+        me.close();
+        me.onSave(entry);
+    },
+
+    initComponent: function() {
+        let me = this;
+        let ex = me.existing;
+        me.isCreate = !ex;
+        let autoscale = ex ? !(ex.min === ex.size && ex.max === ex.size) : false;
+
+        let sync = function(cb) {
+            let on = !!cb.getValue();
+            ['min', 'max'].forEach(function(n) {
+                let f = me.down('[name=' + n + ']');
+                f.setVisible(on);
+                f.setDisabled(!on);
+            });
+            me.down('#scaleHint').setVisible(on);
+        };
+
+        let ipanel = Ext.create('Proxmox.panel.InputPanel', {
+            column1: [
+                {
+                    xtype: 'textfield', name: 'name',
+                    fieldLabel: gettext('Name'),
+                    value: ex ? ex.name : '',
+                    readOnly: !!ex, allowBlank: false,
+                    regex: /^[a-z][a-z0-9-]*$/,
+                    regexText: gettext('Lowercase letters, digits and -'),
+                },
+                {
+                    xtype: 'numberfield', name: 'size',
+                    fieldLabel: gettext('Nodes'),
+                    value: ex ? ex.size : 2,
+                    minValue: 0, maxValue: 50, allowBlank: false,
+                },
+            ],
+            column2: [
+                {
+                    xtype: 'proxmoxcheckbox', name: 'autoscale',
+                    fieldLabel: gettext('Autoscale'),
+                    checked: autoscale, uncheckedValue: 0,
+                    listeners: {
+                        change: sync,
+                        afterrender: sync,
+                    },
+                },
+                {
+                    xtype: 'numberfield', name: 'min',
+                    fieldLabel: gettext('Min'),
+                    value: ex ? ex.min : 1,
+                    minValue: 0, maxValue: 50, allowBlank: false,
+                    hidden: !autoscale, disabled: !autoscale,
+                },
+                {
+                    xtype: 'numberfield', name: 'max',
+                    fieldLabel: gettext('Max'),
+                    value: ex ? ex.max : 3,
+                    minValue: 0, maxValue: 50, allowBlank: false,
+                    hidden: !autoscale, disabled: !autoscale,
+                },
+            ],
+            columnB: [
+                {
+                    xtype: 'displayfield', itemId: 'scaleHint',
+                    userCls: 'pmx-hint', hidden: !autoscale,
+                    value: gettext('The scaler adds nodes for pending pods up '
+                        + 'to Max and removes idle ones down to Min; Nodes is '
+                        + 'the size enforced when you save.'),
+                },
+            ],
+            advancedColumn1: [
+                {
+                    xtype: 'numberfield', name: 'cpu',
+                    fieldLabel: gettext('CPU Cores'),
+                    value: ex ? (ex.cpu || '') : '',
+                    minValue: 1, maxValue: 64, allowBlank: true,
+                    emptyText: gettext('default 2'),
+                },
+                {
+                    xtype: 'numberfield', name: 'memory',
+                    fieldLabel: gettext('Memory (MiB)'),
+                    value: ex ? (ex.memory || '') : '',
+                    minValue: 512, maxValue: 1048576, allowBlank: true,
+                    emptyText: gettext('default 4096'),
+                },
+                {
+                    xtype: 'numberfield', name: 'disk',
+                    fieldLabel: gettext('Disk (GiB)'),
+                    value: ex ? (ex.disk || '') : '',
+                    minValue: 8, maxValue: 4096, allowBlank: true,
+                    emptyText: gettext('template size'),
+                },
+                {
+                    xtype: 'combobox', name: 'arch',
+                    fieldLabel: gettext('Architecture'),
+                    store: [['', gettext('default')], 'amd64', 'arm64'],
+                    value: ex ? (ex.arch || '') : '',
+                    editable: false,
+                },
+                {
+                    // HA is refused by the backend unless this
+                    // group's storage (and the pod storage) is shared
+                    xtype: 'combobox', name: 'policy',
+                    fieldLabel: gettext('Failure Policy'),
+                    store: [
+                        ['replace', gettext('Replace')],
+                        ['ha', gettext('HA (shared storage only)')],
+                    ],
+                    value: ex ? (ex.policy || 'replace') : 'replace',
+                    editable: false,
+                },
+            ],
+            advancedColumn2: [
+                {
+                    // autoSelect off: the stock selectors pick the first
+                    // entry on load, which would silently pin the group
+                    xtype: 'pveNodeSelector', name: 'hosts',
+                    fieldLabel: gettext('PVE Hosts'),
+                    multiSelect: true, allowBlank: true, autoSelect: false,
+                    value: ex && ex.hosts ? ex.hosts.split(',') : [],
+                    emptyText: gettext('any host'),
+                },
+                {
+                    xtype: 'pveStorageSelector', name: 'storage',
+                    fieldLabel: gettext('Storage'),
+                    clusterView: true, storageContent: 'images',
+                    allowBlank: true, autoSelect: false,
+                    value: ex ? (ex.storage || '') : '',
+                    emptyText: gettext('cluster default'),
+                },
+                {
+                    xtype: 'combobox', name: 'device-profile',
+                    fieldLabel: gettext('Device Profile (GPU)'),
+                    store: me.deviceStore,
+                    displayField: 'id', valueField: 'id',
+                    editable: true, allowBlank: true,
+                    value: ex ? (ex['device-profile'] || '') : '',
+                    emptyText: gettext('PVE PCI resource mapping'),
+                },
+                {
+                    xtype: 'textfield', name: 'labels',
+                    fieldLabel: gettext('Labels'),
+                    value: ex ? (ex.labels || '') : '',
+                    emptyText: 'key=value,...',
+                },
+                {
+                    xtype: 'textfield', name: 'taints',
+                    fieldLabel: gettext('Taints'),
+                    value: ex ? (ex.taints || '') : '',
+                    emptyText: 'key=value:NoSchedule,...',
+                },
+            ],
+        });
+        Ext.apply(me, { items: [ipanel] });
+        me.callParent();
+    },
+});
+
+
 // Kubernetes views. At Datacenter level the entry is just
 // the cluster list with Create/Destroy; all detail lives
 // on each cluster's own page (PVE.k8s.Config, opened from
@@ -1096,184 +1300,18 @@ Ext.define('PVE.dc.K8sView', {
                 return store;
             };
             let groupWindow = function(existing) {
-                let isNew = !existing;
-                let win;
-                let gform = Ext.create('Ext.form.Panel', {
-                    bodyPadding: 10, border: false,
-                    fieldDefaults: { labelWidth: 130, anchor: '100%' },
-                    items: [
-                        {
-                            xtype: 'textfield', name: 'name',
-                            fieldLabel: gettext('Name'),
-                            value: existing ? existing.name : '',
-                            readOnly: !isNew, allowBlank: false,
-                        },
-                        {
-                            xtype: 'numberfield', name: 'size',
-                            fieldLabel: gettext('Nodes'),
-                            value: existing ? existing.size : 2,
-                            minValue: 0, maxValue: 50, allowBlank: false,
-                        },
-                        {
-                            xtype: 'numberfield', name: 'min',
-                            fieldLabel: gettext('Min (scaler)'),
-                            value: existing ? existing.min : 1,
-                            minValue: 0, maxValue: 50, allowBlank: false,
-                        },
-                        {
-                            xtype: 'numberfield', name: 'max',
-                            fieldLabel: gettext('Max (scaler)'),
-                            value: existing ? existing.max : 3,
-                            minValue: 0, maxValue: 50, allowBlank: false,
-                        },
-                        {
-                            xtype: 'combobox', name: 'arch',
-                            fieldLabel: gettext('Architecture'),
-                            store: ['', 'amd64', 'arm64'],
-                            value: existing ? (existing.arch || '') : '',
-                            editable: false,
-                        },
-                        {
-                            xtype: 'textfield', name: 'labels',
-                            fieldLabel: gettext('Labels'),
-                            value: existing ? (existing.labels || '') : '',
-                            emptyText: 'key=value,...',
-                        },
-                        {
-                            xtype: 'textfield', name: 'taints',
-                            fieldLabel: gettext('Taints'),
-                            value: existing ? (existing.taints || '') : '',
-                            emptyText: 'key=value:NoSchedule,...',
-                        },
-                        {
-                            xtype: 'combobox', name: 'hosts',
-                            fieldLabel: gettext('PVE Hosts'),
-                            store: pickStore('node', '/nodes'),
-                            displayField: 'node',
-                            valueField: 'node',
-                            multiSelect: true,
-                            editable: false,
-                            value: existing && existing.hosts
-                                ? existing.hosts.split(',') : [],
-                            emptyText: gettext('any host'),
-                        },
-                        {
-                            xtype: 'combobox', name: 'storage',
-                            fieldLabel: gettext('Storage'),
-                            store: pickStore('storage', '/storage'),
-                            displayField: 'storage',
-                            valueField: 'storage',
-                            editable: true,
-                            value: existing ? (existing.storage || '') : '',
-                            emptyText: gettext('cluster default'),
-                        },
-                        {
-                            xtype: 'numberfield', name: 'cpu',
-                            fieldLabel: gettext('CPU Cores'),
-                            value: existing ? (existing.cpu || '') : '',
-                            minValue: 1, maxValue: 64,
-                            allowBlank: true,
-                            emptyText: gettext('default 2'),
-                        },
-                        {
-                            xtype: 'numberfield', name: 'memory',
-                            fieldLabel: gettext('Memory (MiB)'),
-                            value: existing ? (existing.memory || '') : '',
-                            minValue: 512, maxValue: 1048576,
-                            allowBlank: true,
-                            emptyText: gettext('default 4096'),
-                        },
-                        {
-                            xtype: 'numberfield', name: 'disk',
-                            fieldLabel: gettext('Disk (GiB)'),
-                            value: existing ? (existing.disk || '') : '',
-                            minValue: 8, maxValue: 4096,
-                            allowBlank: true,
-                            emptyText: gettext('template size'),
-                        },
-                        {
-                            xtype: 'combobox', name: 'device-profile',
-                            fieldLabel: gettext('Device Profile (GPU)'),
-                            store: pickStore('id',
-                                '/cluster/mapping/pci'),
-                            displayField: 'id',
-                            valueField: 'id',
-                            editable: true,
-                            value: existing
-                                ? (existing['device-profile'] || '') : '',
-                            emptyText: gettext('PVE PCI resource mapping'),
-                        },
-                        {
-                            // HA is refused by the backend
-                            // unless this group's storage (and
-                            // the pod storage) is shared
-                            xtype: 'combobox', name: 'policy',
-                            fieldLabel: gettext('Failure Policy'),
-                            store: [
-                                ['replace', gettext('Replace')],
-                                ['ha', gettext('HA (shared storage only)')],
-                            ],
-                            value: existing
-                                ? (existing.policy || 'replace')
-                                : 'replace',
-                            editable: false,
-                        },
-                    ],
+                Ext.create('PVE.dc.K8sGroupWindow', {
+                    autoShow: true,
+                    existing: existing || undefined,
+                    deviceStore: pickStore('id', '/cluster/mapping/pci'),
+                    onSave: function(entry) {
+                        let groups = currentGroups().filter(function(gr) {
+                            return gr.name !== entry.name;
+                        });
+                        groups.push(entry);
+                        saveGroups(groups);
+                    },
                 });
-                win = Ext.create('Ext.window.Window', {
-                    title: isNew ? gettext('Create Node Group')
-                        : gettext('Edit Node Group'),
-                    modal: true, width: 460, layout: 'fit',
-                    items: [gform],
-                    buttons: [
-                        {
-                            text: gettext('Save'),
-                            handler: function() {
-                                if (!gform.isValid()) { return; }
-                                let v = gform.getValues();
-                                if (Ext.isArray(v.hosts)) {
-                                    v.hosts = v.hosts.join(',');
-                                }
-                                if (!(v.min <= v.size && v.size <= v.max)) {
-                                    Ext.Msg.alert(gettext('Error'),
-                                        gettext('Min <= Nodes <= Max required'));
-                                    return;
-                                }
-                                let entry = {
-                                    name: v.name,
-                                    size: parseInt(v.size, 10),
-                                    min: parseInt(v.min, 10),
-                                    max: parseInt(v.max, 10),
-                                };
-                                ['labels', 'taints', 'hosts',
-                                    'storage', 'arch', 'policy',
-                                    'device-profile']
-                                    .forEach(function(k) {
-                                        if (v[k]) { entry[k] = v[k]; }
-                                    });
-                                ['cpu', 'memory', 'disk']
-                                    .forEach(function(k) {
-                                        if (v[k] !== '' && v[k] !== null
-                                            && v[k] !== undefined) {
-                                            entry[k] = parseInt(v[k], 10);
-                                        }
-                                    });
-                                let groups = currentGroups().filter(
-                                    function(gr) {
-                                        return gr.name !== entry.name;
-                                    });
-                                groups.push(entry);
-                                win.close();
-                                saveGroups(groups);
-                            },
-                        },
-                        {
-                            text: gettext('Cancel'),
-                            handler: function() { win.close(); },
-                        },
-                    ],
-                });
-                win.show();
             };
             let groupBtn = function(text, fn, needsSel) {
                 return {
