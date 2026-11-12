@@ -123,6 +123,9 @@ like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
 like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
     qr/k8sdelete: \['Kubernetes Cluster', gettext\('Destroy'\)\]/,
     'task log gets a human description for k8s destroy');
+like(get('usr/share/pve-manager/js/pvemanagerlib.js'),
+    qr/k8srebuild: \['Kubernetes Cluster', gettext\('Rebuild Image'\)\],\n\s*k8sprovision:/,
+    'task log describes image rebuilds, patched separately from the first table');
 ok(-e "$dir/usr/share/perl5/PVE/Cluster.pm.pve-k8s.bak",
     'stock file backed up before patching');
 

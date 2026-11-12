@@ -192,4 +192,15 @@ my ($grp) = $js =~ /(Ext\.define\('PVE\.dc\.K8sGroupWindow'.*?\n\}\);)/s;
 is(scalar(() = $grp =~ /autoSelect: false/g), 2,
     'stock selectors in the group editor do not auto-pick the first entry');
 
+# Step 4: upgrade shows the pre-flight; rebuild-template is reachable.
+like($js, qr/Ext\.define\('PVE\.dc\.K8sUpgradeWindow', \{\s+extend: 'Proxmox\.window\.Edit'/,
+    'upgrade is a stock Edit window');
+like($js, qr{/upgrade-check'}, 'upgrade reads the pre-flight before running');
+like($js, qr/Resolve the blocking checks first/, 'blocking checks disable the Upgrade button');
+like($js, qr/submitValue: false/, 'gate and acknowledgement are never sent to the API');
+unlike($js, qr/Target version \(one minor up/,
+    'the target version is no longer typed by hand');
+like($js, qr{/rebuild-template'}, 'the image can be rebuilt from the UI');
+like($js, qr/name: 'severity'/, 'rebuild asks for the reason (severity)');
+
 done_testing();

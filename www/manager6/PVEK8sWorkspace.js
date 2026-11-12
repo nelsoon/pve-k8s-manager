@@ -578,6 +578,177 @@ Ext.define('PVE.dc.K8sGroupWindow', {
 });
 
 
+// Upgrade: runs the read-only pre-flight first and shows it, like an
+// upgrade-insights page. The Upgrade button stays disabled while a
+// check blocks; warnings need an explicit acknowledgement. The target
+// is always the next minor (kubeadm cannot skip one), so there is
+// nothing to type.
+Ext.define('PVE.dc.K8sUpgradeWindow', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pveDcK8sUpgradeWindow',
+
+    subject: gettext('Upgrade Kubernetes'),
+    title: gettext('Upgrade Kubernetes'),
+    isCreate: true,
+    method: 'POST',
+    showTaskViewer: true,
+    submitText: gettext('Upgrade'),
+    width: 640,
+    // a click on Upgrade is explicit: do not wait for the window
+    extraRequestParams: { force: 1 },
+
+    clusterName: undefined,
+    currentVersion: undefined,
+
+    initComponent: function() {
+        let me = this;
+        let name = me.clusterName;
+        me.url = '/cluster/k8s/' + encodeURIComponent(name) + '/upgrade';
+        let parts = String(me.currentVersion || '').split('.');
+        let target = parts[0] + '.' + (parseInt(parts[1], 10) + 1);
+        let icons = {
+            ok: 'fa fa-check good',
+            warn: 'fa fa-exclamation-triangle warning',
+            block: 'fa fa-times-circle critical',
+        };
+        let state = { loaded: false, blockers: 0, warnings: 0 };
+
+        let gate = function() {
+            if (!state.loaded) {
+                return gettext('Checking the cluster...');
+            }
+            if (state.blockers) {
+                return gettext('Resolve the blocking checks first.');
+            }
+            let ack = me.down('[name=ack]');
+            if (state.warnings && !ack.getValue()) {
+                return gettext('Confirm the warnings to continue.');
+            }
+            return true;
+        };
+        let revalidate = function() {
+            me.down('[name=gate]').validate();
+        };
+
+        let ipanel = Ext.create('Proxmox.panel.InputPanel', {
+            items: [
+                {
+                    xtype: 'displayfield',
+                    fieldLabel: gettext('Version'),
+                    value: Ext.String.format('{0} → {1}',
+                        Ext.String.htmlEncode(me.currentVersion),
+                        Ext.String.htmlEncode(target)),
+                },
+                { xtype: 'hiddenfield', name: 'to', value: target },
+                {
+                    xtype: 'component',
+                    itemId: 'checks',
+                    padding: '4 0 8 0',
+                    html: '<i class="fa fa-spinner fa-pulse"></i> '
+                        + gettext('Checking the cluster...'),
+                },
+                {
+                    xtype: 'proxmoxcheckbox',
+                    name: 'ack',
+                    boxLabel: gettext('I have read the warnings and want to continue'),
+                    submitValue: false,
+                    hidden: true,
+                    uncheckedValue: 0,
+                    listeners: { change: revalidate },
+                },
+                {
+                    // keeps the Upgrade button disabled while a check
+                    // blocks; never submitted
+                    xtype: 'textfield',
+                    name: 'gate',
+                    hidden: true,
+                    submitValue: false,
+                    validator: gate,
+                },
+            ],
+        });
+        Ext.apply(me, { items: [ipanel] });
+        me.callParent();
+
+        me.on('afterrender', function() {
+            Proxmox.Utils.API2Request({
+                url: '/cluster/k8s/' + encodeURIComponent(name) + '/upgrade-check',
+                method: 'GET',
+                params: { to: target },
+                success: function(resp) {
+                    let res = resp.result.data || {};
+                    state.loaded = true;
+                    state.blockers = res.blockers || 0;
+                    state.warnings = res.warnings || 0;
+                    let rows = (res.checks || []).map(function(c) {
+                        return '<div style="padding:2px 0"><i class="' + (icons[c.level] || icons.ok)
+                            + '"></i> ' + Ext.String.htmlEncode(c.message) + '</div>';
+                    });
+                    me.down('#checks').update(rows.join(''));
+                    me.down('[name=ack]').setVisible(!!state.warnings && !state.blockers);
+                    revalidate();
+                },
+                failure: function(resp) {
+                    state.loaded = false;
+                    me.down('#checks').update(Ext.String.htmlEncode(
+                        Proxmox.Utils.extractRequestError(resp, true)));
+                },
+            });
+            revalidate();
+        });
+    },
+});
+
+// Rebuild the node image now. The severity is the operator's call (no
+// CVE feed): it only sets how long nodes may stay on the old image.
+Ext.define('PVE.dc.K8sRebuildWindow', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pveDcK8sRebuildWindow',
+
+    subject: gettext('Node Image'),
+    title: gettext('Rebuild Node Image'),
+    isCreate: true,
+    method: 'POST',
+    showTaskViewer: true,
+    submitText: gettext('Rebuild'),
+    width: 560,
+    clusterName: undefined,
+
+    initComponent: function() {
+        let me = this;
+        me.url = '/cluster/k8s/' + encodeURIComponent(me.clusterName) + '/rebuild-template';
+        Ext.apply(me, {
+            items: [{
+                xtype: 'inputpanel',
+                items: [
+                    {
+                        xtype: 'displayfield',
+                        userCls: 'pmx-hint',
+                        value: gettext('Builds a fresh node image (current OS and '
+                            + 'security updates). Nodes move to it in the next '
+                            + 'maintenance window, or when you run Roll.'),
+                    },
+                    {
+                        xtype: 'combobox',
+                        name: 'severity',
+                        fieldLabel: gettext('Reason'),
+                        store: [
+                            ['routine', gettext('Routine refresh')],
+                            ['high', gettext('Security fix: nodes updated within 30 days')],
+                            ['critical', gettext('Critical security fix: within 7 days')],
+                        ],
+                        value: 'routine',
+                        editable: false,
+                        allowBlank: false,
+                    },
+                ],
+            }],
+        });
+        me.callParent();
+    },
+});
+
+
 // Kubernetes views. At Datacenter level the entry is just
 // the cluster list with Create/Destroy; all detail lives
 // on each cluster's own page (PVE.k8s.Config, opened from
@@ -1022,6 +1193,15 @@ Ext.define('PVE.dc.K8sView', {
                                 'Roll cluster {0} onto the latest node image?'), n),
                             '/cluster/k8s/' + n + '/roll', { force: 1 });
                     }),
+                    act(gettext('Rebuild Image'), 'fa fa-fw fa-wrench', function(n) {
+                        Ext.create('PVE.dc.K8sRebuildWindow', {
+                            autoShow: true,
+                            clusterName: n,
+                            apiCallDone: function(ok) {
+                                if (ok) { me.reloadClusters(); }
+                            },
+                        });
+                    }),
                     act(gettext('Scale'), 'fa fa-fw fa-arrows-alt', function(n) {
                         api({
                             url: '/cluster/k8s/' + n + '/scale',
@@ -1032,19 +1212,14 @@ Ext.define('PVE.dc.K8sView', {
                         });
                     }),
                     act(gettext('Upgrade'), 'fa fa-fw fa-arrow-circle-up', function(n) {
-                        Ext.Msg.prompt(gettext('Upgrade Kubernetes'),
-                            gettext('Target version (one minor up, e.g. 1.36):'),
-                            function(answer, value) {
-                                if (answer !== 'ok' || !value) { return; }
-                                api({
-                                    url: '/cluster/k8s/' + n + '/upgrade',
-                                    method: 'POST',
-                                    params: { to: value, force: 1 },
-                                    success: function(r) {
-                                        task(r.result.data); me.reloadClusters();
-                                    },
-                                });
-                            });
+                        Ext.create('PVE.dc.K8sUpgradeWindow', {
+                            autoShow: true,
+                            clusterName: n,
+                            currentVersion: (me.clusterIndex[n] || {})['k8s-version'],
+                            apiCallDone: function(ok) {
+                                if (ok) { me.reloadClusters(); }
+                            },
+                        });
                     }),
                     act(gettext('Start VMs'), 'fa fa-fw fa-play-circle', function(n) {
                         api({

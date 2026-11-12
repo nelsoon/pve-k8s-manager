@@ -396,6 +396,26 @@ run_patch({
     },
 });
 
+# Task types added after the first release get their own patch, so an
+# upgrade that finds the original table still gains them. The line sits
+# directly before k8sprovision, outside the block removed above.
+run_patch({
+    file => "$js/pvemanagerlib.js",
+    marker => "k8srebuild: ['Kubernetes Cluster'",
+    apply => sub {
+        my ($src) = @_;
+        return undef if $src !~ /^([ \t]*)k8sprovision: /m;
+        my $ind = $1;
+        $src =~ s/^([ \t]*k8sprovision: )/${ind}k8srebuild: ['Kubernetes Cluster', gettext('Rebuild Image')],\n$1/m;
+        return $src;
+    },
+    remove => sub {
+        my ($src) = @_;
+        $src =~ s/^[ \t]*k8srebuild: \['Kubernetes Cluster', gettext\('Rebuild Image'\)\],\n//m;
+        return $src;
+    },
+});
+
 my $resource_route = "\t\t\t    k8s: 'pveK8sConfig',\n";
 run_patch({
     file => "$js/pvemanagerlib.js",
