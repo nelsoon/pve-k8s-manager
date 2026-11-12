@@ -132,6 +132,11 @@ ok(!PVE::K8s::Scaler::pool_backed_off({ 'pool-backoff' => { default => { until =
     'back in service after the deadline');
 ok(!PVE::K8s::Scaler::pool_backed_off({}, 'default', 1), 'no record: not backed off');
 
+# Scale-in must be reachable: after a scale-out live == size.
+open my $pf2, '<', 'PVE/K8s/Provision.pm' or die $!;
+my $prov2 = do { local $/; <$pf2> };
+like($prov2, qr/next if \$live < \$pool->\{size\};/, 'scale-in guard is the strict comparison');
+
 # U4: both automatic repair paths record themselves (the Summary shows them).
 open my $pf, '<', 'PVE/K8s/Provision.pm' or die $!;
 my $prov = do { local $/; <$pf> };

@@ -4336,9 +4336,11 @@ sub scale_reconcile {
         next if !$node || $node->{role} ne 'worker';
         my $pool = $pool_by_name{$node->{pool}} or next;
         next if $pool->{size} <= ($pool->{min} // $pool->{size});
-        # Never scale in at or below the desired size: an
-        # idle-looking node is still a wanted member when
-        # the pool is under-provisioned (T4.2: a pass at
+        # Never scale in while under the desired size (live <
+        # size): an idle-looking node is still a wanted member
+        # when the pool is under-provisioned. live == size is
+        # the normal case - the pass retires one and lowers
+        # size; a `<=` here made scale-in unreachable (T4.2: a pass at
         # size 3 with 2 live workers removed one instead
         # of converging up). Count live k8s nodes, not the
         # record - a deleted Node object must not read as
@@ -4348,7 +4350,7 @@ sub scale_reconcile {
                 {'pve-k8s.proxmox.com/pool'} // '';
             $pl eq $node->{pool};
         } values %k8s_node;
-        next if $live <= $pool->{size};
+        next if $live < $pool->{size};
         my @pool_nodes = grep { $_->{pool} eq $node->{pool} } @nodes;
         my $last = (sort { $b->{idx} <=> $a->{idx} } @pool_nodes)[0];
         next if $last->{host} ne $host;

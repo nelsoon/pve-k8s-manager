@@ -131,8 +131,8 @@ unlike($prov, qr/manual_clone_shared/,
 # scale-in gate both read LIVE state, not records.
 like($prov, qr/Locations come from the LIVE inventory/,
     'offline-host guard uses live VM locations');
-like($prov, qr/Never scale in at or below the desired size/,
-    'scaler never scales in at or below desired size');
+like($prov, qr/Never scale in while under the desired size/,
+    'scaler never scales in while under the desired size');
 like($prov, qr/any_tpl_rev/,
     'provision looks for the template cluster-wide');
 like($prov, qr/not visible on any/,
