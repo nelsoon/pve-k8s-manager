@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep the pve-k8s Overview summary cache fresh
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=10s
+
+[Install]
+WantedBy=timers.target

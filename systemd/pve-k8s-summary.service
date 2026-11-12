@@ -1,0 +1,7 @@
+[Unit]
+Description=pve-k8s Overview summary cache refresh
+After=pvedaemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-k8s-summary-refresh

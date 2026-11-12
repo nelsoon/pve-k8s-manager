@@ -3,8 +3,17 @@ PVE_K8S_INTEGRATE_EOF
     # write; harmless when the fs is not mounted yet.
     mkdir -p /etc/pve/k8s 2>/dev/null || true
     if [ -d /run/systemd/system ]; then
-        systemctl try-restart pvedaemon.service \
+        # reload, never restart: pvedaemon runs with
+        # KillMode=control-group, so a restart kills every running
+        # task (a provision or roll in flight died this way)
+        systemctl reload-or-try-restart pvedaemon.service \
             pveproxy.service >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # the scaler (autoscaling, repair, image adoption) and the
+        # Overview cache are part of the product; backup and template
+        # timers stay opt-in
+        systemctl enable --now pve-k8s-scaler.timer \
+            pve-k8s-summary.timer >/dev/null 2>&1 || true
     fi
 fi
 

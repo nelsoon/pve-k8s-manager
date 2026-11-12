@@ -954,6 +954,40 @@ Ext.define('PVE.dc.K8sView', {
                 },
             }, opts));
         };
+        // One summary request per cluster at a time, shared by whoever
+        // asks within a few seconds. Opening a cluster page starts it at
+        // once, so the Overview does not wait for the cluster list first.
+        let summaryReq = {};
+        let fetchSummary = function(name, onOk, onFail) {
+            let r = summaryReq[name];
+            if (!r || (r.done && Date.now() - r.done > 5000)) {
+                r = summaryReq[name] = { waiters: [] };
+                Proxmox.Utils.API2Request({
+                    url: '/cluster/k8s/' + encodeURIComponent(name) + '/summary',
+                    method: 'GET',
+                    timeout: 120000,
+                    success: function(resp) {
+                        r.done = Date.now(); r.ok = true; r.resp = resp;
+                        r.waiters.forEach(function(w) { w[0](resp); });
+                        r.waiters = [];
+                    },
+                    failure: function(resp) {
+                        r.done = Date.now(); r.ok = false; r.resp = resp;
+                        r.waiters.forEach(function(w) { w[1](resp); });
+                        r.waiters = [];
+                    },
+                });
+            }
+            if (r.done) {
+                (r.ok ? onOk : onFail)(r.resp);
+            } else {
+                r.waiters.push([onOk, onFail]);
+            }
+        };
+        if (fixedClusterName) {
+            fetchSummary(fixedClusterName, Ext.emptyFn, Ext.emptyFn);
+        }
+
         let task = function(upid) {
             if (upid) {
                 Ext.create('Proxmox.window.TaskViewer', {
@@ -1193,11 +1227,7 @@ Ext.define('PVE.dc.K8sView', {
                 gettext('Node VMs memory (cluster average %)'));
             let summaryChartCpu = summaryChart(
                 gettext('Node VMs CPU (cluster average %)'));
-            api({
-                url: '/cluster/k8s/' + name + '/summary',
-                method: 'GET',
-                timeout: 120000,
-                success: function(r) {
+            fetchSummary(name, function(r) {
                     let s = r.result.data || {};
                     let icons = {
                         ok: 'fa fa-check good',
@@ -1319,15 +1349,13 @@ Ext.define('PVE.dc.K8sView', {
                         summaryChartCpu.getStore().loadData(
                             toRows(s.series.cpu));
                     }
-                },
-                failure: function() {
+            }, function() {
                     healthInfo.setValue(gettext('unknown'));
                     nodesInfo.setValue(gettext('unknown'));
                     podsInfo.setValue(gettext('unknown'));
                     lbInfo.setValue(gettext('unknown'));
                     backupInfo.setValue(gettext('unknown'));
                     imageInfo.setValue(gettext('unknown'));
-                },
             });
             let act = function(label, icon, fn) {
                 return {
@@ -2511,6 +2539,7 @@ Ext.define('PVE.dc.K8sView', {
                         me.pollTask = Ext.util.TaskManager.start({
                             run: function() { clusterStore.load(); },
                             interval: 30000,
+                            fireOnStart: false,
                         });
                     },
                     beforedestroy: function() {
@@ -2554,6 +2583,8 @@ Ext.define('PVE.dc.K8sView', {
                     me.pollTask = Ext.util.TaskManager.start({
                         run: function() { me.reloadClusters(); },
                         interval: 30000,
+                        // the load above already ran: no second one
+                        fireOnStart: false,
                     });
                 },
                 beforedestroy: function() {

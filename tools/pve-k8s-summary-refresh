@@ -1,0 +1,19 @@
+#!/usr/bin/perl
+# Keeps each ready cluster's Overview summary cache fresh, so opening
+# the page reads a cache (milliseconds) instead of computing it. Runs
+# from pve-k8s-summary.timer on every host; a host only refreshes a
+# cache older than 25 seconds, so the hosts share the work.
+use strict;
+use warnings;
+
+use PVE::K8s::Config;
+use PVE::K8s::Provision;
+
+my $cfg = PVE::K8s::Config->config();
+for my $name (sort keys $cfg->{ids}->%*) {
+    next if ($cfg->{ids}->{$name}->{state} // '') ne 'ready';
+    next if !PVE::K8s::Provision::summary_refresh_due(
+        PVE::K8s::Provision::summary_cache_age($name));
+    eval { PVE::K8s::Provision::summary_cluster($name, refresh => 1) };
+    print "cluster $name: summary refresh failed: $@" if $@;
+}

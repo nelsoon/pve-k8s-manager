@@ -7008,6 +7008,19 @@ sub summary_cache_path {
     return "/etc/pve/k8s/summary-$name.json";
 }
 
+# Pure: should the warm timer refresh a summary cached $age seconds
+# ago? Any host may run it; the first one to see an old cache wins.
+sub summary_refresh_due {
+    my ($age) = @_;
+    return !defined $age || $age >= 25 ? 1 : 0;
+}
+
+sub summary_cache_age {
+    my ($name, $now) = @_;
+    my @st = stat summary_cache_path($name);
+    return @st ? ($now // time()) - $st[9] : undef;
+}
+
 sub summary_cache_read {
     my ($name) = @_;
 
@@ -7072,10 +7085,12 @@ sub image_status {
 }
 
 sub summary_cluster {
-    my ($name) = @_;
+    my ($name, %opts) = @_;
 
-    my $cached = summary_cache_read($name);
-    return $cached if $cached;
+    if (!$opts{refresh}) {
+        my $cached = summary_cache_read($name);
+        return $cached if $cached;
+    }
 
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}

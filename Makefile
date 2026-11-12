@@ -70,9 +70,11 @@ deb:
 	@install -m 0755 tools/pve-k8s-vsock-get $(STAGE)/usr/sbin/pve-k8s-vsock-get
 	@install -m 0755 tools/pve-k8s-backup $(STAGE)/usr/sbin/pve-k8s-backup
 	@install -m 0755 tools/pve-k8s-template-refresh $(STAGE)/usr/sbin/pve-k8s-template-refresh
+	@install -m 0755 tools/pve-k8s-summary-refresh $(STAGE)/usr/sbin/pve-k8s-summary-refresh
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
 		systemd/pve-k8s-backup.service systemd/pve-k8s-backup.timer \
 		systemd/pve-k8s-template.service systemd/pve-k8s-template.timer \
+		systemd/pve-k8s-summary.service systemd/pve-k8s-summary.timer \
 		$(STAGE)/lib/systemd/system/
 	@mkdir -p $(STAGE)/etc/sysctl.d
 	@install -m 0644 systemd/99-pve-k8s-vrf.conf \
@@ -81,6 +83,7 @@ deb:
 		debian/postinst.tail > $(STAGE)/DEBIAN/postinst
 	@cat debian/postrm.head debian/integrate.pl \
 		debian/postrm.tail > $(STAGE)/DEBIAN/postrm
+	@install -m 0755 debian/prerm $(STAGE)/DEBIAN/prerm
 	@chmod 0755 $(STAGE)/DEBIAN/postinst $(STAGE)/DEBIAN/postrm
 	@printf 'Package: $(PACKAGE)\nVersion: $(VERSION)\nArchitecture: all\nMaintainer: pve-k8s contributors\nDepends: pve-manager, perl\nDescription: Kubernetes cluster management for Proxmox VE\n Provisions and manages kubeadm Kubernetes clusters on Proxmox\n VMs from the Proxmox web UI, using Proxmox SDN and storage.\n' > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEB) >/dev/null

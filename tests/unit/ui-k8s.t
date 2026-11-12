@@ -223,4 +223,11 @@ like($js, qr/lazyBuild: function\(\) \{\s+return buildPanel\(clusterName, key, r
     'menu entries are placeholders built on first view');
 like($js, qr/if \(target\.lazyBuild\) \{/, 'showing a panel builds it once');
 
+# The Overview's summary starts with the page, not after the list.
+like($js, qr/if \(fixedClusterName\) \{\s+fetchSummary\(fixedClusterName/,
+    'opening a cluster page starts the summary request at once');
+like($js, qr/fetchSummary\(name, function\(r\) \{/, 'the Overview reuses that request');
+my $fos = () = $js =~ /fireOnStart: false/g;
+is($fos, 2, 'the 30 s polls do not load the list a second time on start');
+
 done_testing();

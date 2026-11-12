@@ -1,0 +1,8 @@
+#!/bin/sh
+# pve-k8s-manager prerm: stop and disable the timers while their unit
+# files still exist (postrm runs after they are gone).
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now pve-k8s-scaler.timer pve-k8s-summary.timer \
+        pve-k8s-backup.timer pve-k8s-template.timer >/dev/null 2>&1 || true
+fi
+exit 0
