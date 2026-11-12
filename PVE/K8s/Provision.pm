@@ -3523,6 +3523,23 @@ my sub label_node {
     }
 }
 
+# Stop a VM and wait until it is really stopped. `qm stop` returns
+# before the guest has finished stopping, so a destroy issued right
+# after it can fail and leave a stopped ghost VM behind (lab,
+# 2026-11-09 roll, and again 2026-11-11 on scale-in). Plain package
+# sub: scale_reconcile and remove_node both call it.
+sub stop_vm_and_wait {
+    my ($vhost, $vmid) = @_;
+
+    eval { qm_on($vhost, 'stop', $vmid) };
+    for (1 .. 30) {
+        my $st = eval { qm_on($vhost, 'status', $vmid) } // '';
+        return 1 if $st =~ /^status:\s*stopped/m;
+        sleep 2;
+    }
+    return 0;
+}
+
 # Plain package sub (not lexical): provision_cluster
 # calls it from above this declaration, and a lexical
 # defined below its caller is invisible there (same trap
@@ -3561,17 +3578,7 @@ sub remove_node {
     }
     eval { kubectl_on($cp, "delete node $old->{host}") };
     if ($vmid) {
-        eval { qm_on($vhost, 'stop', $vmid) };
-        # qm stop is asynchronous: destroying while the
-        # guest is still stopping fails and silently
-        # leaves a stopped ghost VM behind (seen in the
-        # lab retiring a sized test group, 2026-11-09).
-        for (1 .. 30) {
-            my $st = eval {
-                qm_on($vhost, 'status', $vmid) } // '';
-            last if $st =~ /^status:\s*stopped/m;
-            sleep 2;
-        }
+        stop_vm_and_wait($vhost, $vmid);
         my $ok = eval {
             qm_on($vhost, 'destroy', $vmid, '--purge',
                 '--destroy-unreferenced-disks', 1);
@@ -4414,7 +4421,7 @@ sub scale_reconcile {
         }
         kubectl_on($cp, "delete node $host");
         if ($svmid) {
-            eval { qm_on($svhost, 'stop', $svmid) };
+            stop_vm_and_wait($svhost, $svmid);
             qm_on($svhost, 'destroy', $svmid,
                 '--purge', '--destroy-unreferenced-disks', 1);
         } else {

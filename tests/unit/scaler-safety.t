@@ -137,6 +137,12 @@ open my $pf2, '<', 'PVE/K8s/Provision.pm' or die $!;
 my $prov2 = do { local $/; <$pf2> };
 like($prov2, qr/next if \$live < \$pool->\{size\};/, 'scale-in guard is the strict comparison');
 
+# Scale-in and roll both wait for the VM to be stopped before destroying it.
+like($prov2, qr/sub stop_vm_and_wait/, 'one stop-and-wait helper exists');
+my $uses = () = $prov2 =~ /stop_vm_and_wait\(\$(?:vhost|svhost), \$(?:vmid|svmid)\)/g;
+is($uses, 2, 'roll and scale-in both use it');
+unlike($prov2, qr/eval \{ qm_on\(\$svhost, 'stop', \$svmid\) \};/, 'scale-in no longer destroys right after an async stop');
+
 # U4: both automatic repair paths record themselves (the Summary shows them).
 open my $pf, '<', 'PVE/K8s/Provision.pm' or die $!;
 my $prov = do { local $/; <$pf> };

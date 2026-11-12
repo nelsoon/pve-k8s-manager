@@ -92,7 +92,7 @@ like($prov, qr/PVE::RRD::create_rrd_data/,
     'node RRD is read in-process, no ssh/pvesh spawn');
 like($prov, qr/SUMMARY_CACHE_TTL = 60/,
     'summary aggregate is cached for 60s');
-like($prov, qr/qm stop is asynchronous/,
+like($prov, qr/`qm stop` returns\s+# before the guest has finished stopping/,
     'node removal waits for the stop before destroy');
 like($prov, qr/map \{ kubectl_cmd\("\$_ -o json"\) \}/,
     'every batched segment carries the kubectl prefix');
