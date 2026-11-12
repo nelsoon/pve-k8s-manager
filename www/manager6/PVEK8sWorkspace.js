@@ -749,6 +749,169 @@ Ext.define('PVE.dc.K8sRebuildWindow', {
 });
 
 
+// Settings: the stock ObjectGrid, one property per row with its own
+// small Edit window (like the VM Options tab). An emptied value is
+// cleared through the API's `delete` parameter, so every setting that
+// can be set can also be unset. Read-only rows show what was decided
+// at creation.
+Ext.define('PVE.dc.K8sSettings', {
+    extend: 'Proxmox.grid.ObjectGrid',
+    alias: 'widget.pveDcK8sSettings',
+
+    clusterName: undefined,
+    onChanged: undefined,
+    cwidth1: 260,
+
+    initComponent: function() {
+        let me = this;
+        let name = encodeURIComponent(me.clusterName);
+        me.url = '/api2/json/cluster/k8s/' + name;
+        me.interval = 10000;
+        me.editorConfig = {
+            url: '/cluster/k8s/' + name,
+            method: 'PUT',
+            apiCallDone: function(ok) {
+                if (ok && me.onChanged) {
+                    me.onChanged();
+                }
+            },
+        };
+
+        let hint = function(text) {
+            return { xtype: 'displayfield', userCls: 'pmx-hint', value: text };
+        };
+        let edit = function(subject, items) {
+            return {
+                xtype: 'proxmoxWindowEdit',
+                subject: subject,
+                fieldDefaults: { labelWidth: 150 },
+                width: 520,
+                items: items,
+            };
+        };
+        let readonly = function(header, renderer) {
+            return { header: header, required: false, renderer: renderer };
+        };
+        let policy = function(v) {
+            return v === 'ha' ? gettext('HA (Proxmox restarts the VM)')
+                : gettext('Replace (a failed node is rebuilt)');
+        };
+
+        me.rows = {
+            description: {
+                header: gettext('Description'),
+                required: true,
+                defaultValue: '',
+                editor: edit(gettext('Description'), [{
+                    xtype: 'proxmoxtextfield', name: 'description',
+                    fieldLabel: gettext('Description'), deleteEmpty: true,
+                }]),
+            },
+            'maintenance-window': {
+                header: gettext('Maintenance Window'),
+                required: true,
+                defaultValue: '',
+                renderer: function(v) {
+                    return v ? Ext.htmlEncode(v) : gettext('none (updates only when you run Roll)');
+                },
+                editor: edit(gettext('Maintenance Window'), [
+                    {
+                        xtype: 'proxmoxtextfield', name: 'maintenance-window',
+                        fieldLabel: gettext('Window'), deleteEmpty: true,
+                        emptyText: 'HH:MM-HH:MM',
+                        regex: /^\d{2}:\d{2}-\d{2}:\d{2}$/,
+                        regexText: gettext('Use HH:MM-HH:MM, local time of the host'),
+                    },
+                    hint(gettext('Nodes move to a new image on their own only '
+                        + 'inside this window. Leave empty to update nodes only '
+                        + 'when you run Roll.')),
+                ]),
+            },
+            'backup-retention': {
+                header: gettext('etcd Backups Kept'),
+                required: true,
+                defaultValue: '',
+                renderer: function(v) {
+                    return v ? Ext.htmlEncode(String(v)) : gettext('default');
+                },
+                editor: edit(gettext('etcd Backups Kept'), [{
+                    xtype: 'proxmoxintegerfield', name: 'backup-retention',
+                    fieldLabel: gettext('Backups'), minValue: 1, maxValue: 100,
+                    deleteEmpty: true, emptyText: gettext('default'),
+                }]),
+            },
+            'cp-policy': {
+                header: gettext('Control Plane Failure Policy'),
+                required: false,
+                renderer: policy,
+                editor: edit(gettext('Control Plane Failure Policy'), [
+                    {
+                        xtype: 'proxmoxKVComboBox', name: 'cp-policy',
+                        fieldLabel: gettext('Policy'),
+                        comboItems: [
+                            ['replace', gettext('Replace (a failed node is rebuilt)')],
+                            ['ha', gettext('HA (Proxmox restarts the VM)')],
+                        ],
+                        value: 'replace', allowBlank: false,
+                    },
+                    hint(gettext('HA needs shared storage; the API refuses it otherwise.')),
+                ]),
+            },
+            'storage-profile': {
+                header: gettext('Storage Profile'),
+                required: false,
+                renderer: function(v) {
+                    return v === 'local' ? gettext('Local disks') : gettext('Shared (Ceph)');
+                },
+                editor: edit(gettext('Storage Profile'), [{
+                    xtype: 'proxmoxKVComboBox', name: 'storage-profile',
+                    fieldLabel: gettext('Profile'),
+                    comboItems: [
+                        ['shared', gettext('Shared (Ceph)')],
+                        ['local', gettext('Local disks')],
+                    ],
+                    value: 'shared', allowBlank: false,
+                }]),
+            },
+            'k8s-version': readonly(gettext('Kubernetes Version')),
+            state: readonly(gettext('State')),
+            cp: readonly(gettext('Control Plane Nodes')),
+            storage: readonly(gettext('Storage')),
+            'node-subnet': readonly(gettext('Node Subnet')),
+            'public-subnet': readonly(gettext('Public Subnet')),
+            'sdn-zone': readonly(gettext('SDN Zone')),
+            'template-rev': readonly(gettext('Image Revision')),
+            'cp-arch': readonly(gettext('Control Plane Architecture')),
+        };
+        let order = ['description', 'maintenance-window', 'backup-retention',
+            'cp-policy', 'storage-profile', 'k8s-version', 'state', 'cp',
+            'storage', 'node-subnet', 'public-subnet', 'sdn-zone',
+            'template-rev', 'cp-arch'];
+        me.sorterFn = function(a, b) {
+            return order.indexOf(a.data.key) - order.indexOf(b.data.key);
+        };
+
+        let editBtn = Ext.create('Ext.button.Button', {
+            text: gettext('Edit'),
+            disabled: true,
+            handler: function() { me.run_editor(); },
+        });
+        me.tbar = [editBtn];
+        me.callParent();
+
+        me.on('selectionchange', function(sm, sel) {
+            let key = sel && sel.length ? sel[0].data.key : null;
+            editBtn.setDisabled(!key || !me.rows[key] || !me.rows[key].editor);
+        });
+        me.on('itemdblclick', function() { me.run_editor(); });
+        me.on('activate', function() { me.rstore.startUpdate(); });
+        me.on('deactivate', function() { me.rstore.stopUpdate(); });
+        me.on('destroy', function() { me.rstore.stopUpdate(); });
+        me.rstore.startUpdate();
+    },
+});
+
+
 // Kubernetes views. At Datacenter level the entry is just
 // the cluster list with Create/Destroy; all detail lives
 // on each cluster's own page (PVE.k8s.Config, opened from
@@ -1995,109 +2158,10 @@ Ext.define('PVE.dc.K8sView', {
         };
 
         let settingsPanel = function(rec) {
-            let name = rec.name;
-            let form = Ext.create('Ext.form.Panel', {
+            return Ext.create('PVE.dc.K8sSettings', {
+                clusterName: rec.name,
                 border: false,
-                fieldDefaults: { labelWidth: 200, anchor: '100%' },
-                items: [
-                    {
-                        xtype: 'textfield',
-                        name: 'maintenance-window',
-                        fieldLabel: gettext('Maintenance Window'),
-                        value: rec['maintenance-window'] || '',
-                        emptyText: 'HH:MM-HH:MM (empty = always)',
-                    },
-                    {
-                        xtype: 'numberfield',
-                        name: 'backup-retention',
-                        fieldLabel: gettext('Backup Retention'),
-                        value: rec['backup-retention'] || '',
-                        minValue: 1, maxValue: 100,
-                        emptyText: gettext('etcd backups to keep'),
-                    },
-                    {
-                        xtype: 'combobox',
-                        name: 'cp-policy',
-                        fieldLabel: gettext('Control Plane Failure Policy'),
-                        store: [
-                            ['replace', gettext('Replace (plugin rebuilds)')],
-                            ['ha', gettext('HA (Proxmox reboots VM)')],
-                        ],
-                        value: rec['cp-policy'] || 'replace',
-                        editable: false,
-                    },
-                    {
-                        xtype: 'combobox',
-                        name: 'storage-profile',
-                        fieldLabel: gettext('Storage Profile'),
-                        store: [
-                            ['shared', gettext('Shared (Ceph)')],
-                            ['local', gettext('Local disks')],
-                        ],
-                        value: rec['storage-profile'] || '',
-                        editable: false,
-                    },
-                    {
-                        xtype: 'textfield',
-                        name: 'description',
-                        fieldLabel: gettext('Description'),
-                        value: rec.description || '',
-                    },
-                ],
-                buttons: [{
-                    text: gettext('Save'),
-                    handler: function() {
-                        if (!form.isValid()) { return; }
-                        let values = form.getValues();
-                        let params = {};
-                        Object.keys(values).forEach(function(k) {
-                            if (values[k] !== '') {
-                                params[k] = values[k];
-                            }
-                        });
-                        if (!Object.keys(params).length) { return; }
-                        api({
-                            url: '/cluster/k8s/' + name, method: 'PUT',
-                            params: params,
-                            success: function() {
-                                Ext.Msg.alert(gettext('Settings'),
-                                    gettext('Saved.'));
-                                me.reloadClusters();
-                            },
-                        });
-                    },
-                }],
-            });
-            let infoKeys = ['state', 'k8s-version', 'cp', 'workers',
-                'node-subnet', 'public-subnet', 'sdn-zone', 'sdn-vnet',
-                'storage', 'template-rev', 'cp-arch'];
-            let info = infoKeys.filter(function(k) {
-                return rec[k] !== undefined && rec[k] !== '';
-            }).map(function(k) {
-                return {
-                    xtype: 'displayfield',
-                    fieldLabel: k,
-                    value: Ext.htmlEncode(String(rec[k])),
-                    labelWidth: 200,
-                };
-            });
-            return Ext.create('Ext.panel.Panel', {
-                header: false,
-                border: false, bodyPadding: 10, scrollable: true,
-                items: [
-                    {
-                        xtype: 'fieldset',
-                        title: gettext('Cluster Settings'),
-                        items: [form],
-                    },
-                    {
-                        xtype: 'fieldset',
-                        title: gettext('Details (read-only)'),
-                        items: [{
-                            xtype: 'form', border: false, items: info,
-                        }],
-                    },
-                ],
+                onChanged: function() { me.reloadClusters(); },
             });
         };
 

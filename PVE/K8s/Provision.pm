@@ -3260,6 +3260,64 @@ sub assert_maintenance_window {
 
 # Update the mutable rollout options of a cluster (the S3
 # scenario narrows and opens the window around a roll).
+# Settings that may be cleared again (PVE `delete` semantics).
+our @CLEARABLE_OPTIONS = qw(maintenance-window backup-retention description);
+
+# Pure: apply validated option changes to one cluster record. Kept apart
+# from the locking and storing so the rules are testable.
+sub apply_cluster_options {
+    my ($record, $opts) = @_;
+
+    # work on a copy: a refused change leaves the record untouched
+    my $scfg = { $record->%* };
+
+    if (defined $opts->{'maintenance-window'}) {
+        $scfg->{'maintenance-window'} = assert_maintenance_window(
+            $opts->{'maintenance-window'});
+    }
+    if (defined $opts->{pools}) {
+        # validate eagerly; the next scale/provision
+        # pass converges membership to the new groups
+        PVE::K8s::Config::parse_pools(
+            $opts->{pools}, $scfg->{workers} // 2);
+        $scfg->{pools} = $opts->{pools};
+    }
+    if (defined $opts->{'backup-retention'}) {
+        my $ret = $opts->{'backup-retention'};
+        die "backup-retention must be 1..100\n"
+            if "$ret" !~ /^\d+$/ || $ret < 1 || $ret > 100;
+        $scfg->{'backup-retention'} = int $ret;
+    }
+    if (defined $opts->{description}) {
+        $scfg->{description} = $opts->{description};
+    }
+    if (defined $opts->{'cp-policy'}) {
+        die "cp-policy must be ha or replace\n"
+            if $opts->{'cp-policy'} !~ /^(ha|replace)$/;
+        $scfg->{'cp-policy'} = $opts->{'cp-policy'};
+    }
+    if (defined $opts->{'storage-profile'}) {
+        die "storage-profile must be shared or local\n"
+            if $opts->{'storage-profile'} !~ /^(shared|local)$/;
+        $scfg->{'storage-profile'} = $opts->{'storage-profile'};
+    }
+    for my $key (($opts->{delete} // [])->@*) {
+        die "cannot clear '$key' (clearable: "
+            . join(', ', @CLEARABLE_OPTIONS) . ")\n"
+            if !grep { $_ eq $key } @CLEARABLE_OPTIONS;
+        delete $scfg->{$key};
+    }
+    # the same refusal as create: HA needs shared storage
+    if ((defined $opts->{'cp-policy'} || defined $opts->{'storage-profile'})
+        && ($scfg->{'cp-policy'} // '') eq 'ha'
+        && ($scfg->{'storage-profile'} // 'shared') eq 'local') {
+        die "cp-policy 'ha' needs the shared storage profile; "
+            . "this cluster uses local storage\n";
+    }
+    %$record = %$scfg;
+    return $record;
+}
+
 sub set_cluster_options {
     my ($name, $opts) = @_;
 
@@ -3281,36 +3339,7 @@ sub set_cluster_options {
         my $cfg = PVE::K8s::Config->config();
         my $scfg = $cfg->{ids}->{$name}
             or die "cluster '$name' does not exist\n";
-        if (defined $opts->{'maintenance-window'}) {
-            $scfg->{'maintenance-window'} = assert_maintenance_window(
-                $opts->{'maintenance-window'});
-        }
-        if (defined $opts->{pools}) {
-            # validate eagerly; the next scale/provision
-            # pass converges membership to the new groups
-            PVE::K8s::Config::parse_pools(
-                $opts->{pools}, $scfg->{workers} // 2);
-            $scfg->{pools} = $opts->{pools};
-        }
-        if (defined $opts->{'backup-retention'}) {
-            my $ret = $opts->{'backup-retention'};
-            die "backup-retention must be 1..100\n"
-                if "$ret" !~ /^\d+$/ || $ret < 1 || $ret > 100;
-            $scfg->{'backup-retention'} = int $ret;
-        }
-        if (defined $opts->{description}) {
-            $scfg->{description} = $opts->{description};
-        }
-        if (defined $opts->{'cp-policy'}) {
-            die "cp-policy must be ha or replace\n"
-                if $opts->{'cp-policy'} !~ /^(ha|replace)$/;
-            $scfg->{'cp-policy'} = $opts->{'cp-policy'};
-        }
-        if (defined $opts->{'storage-profile'}) {
-            die "storage-profile must be shared or local\n"
-                if $opts->{'storage-profile'} !~ /^(shared|local)$/;
-            $scfg->{'storage-profile'} = $opts->{'storage-profile'};
-        }
+        apply_cluster_options($scfg, $opts);
         PVE::K8s::Config::store_config($cfg);
     });
     return undef;

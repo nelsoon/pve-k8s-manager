@@ -627,6 +627,12 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Description of the cluster.",
             },
+            delete => {
+                type => 'string',
+                optional => 1,
+                description => "Comma-separated settings to clear: "
+                    . "maintenance-window, backup-retention, description.",
+            },
         },
     },
     returns => { type => 'null' },
@@ -634,8 +640,9 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         die "nothing to update: pass maintenance-window, pools, "
-            . "backup-retention or description\n"
-            if !defined $param->{'maintenance-window'}
+            . "backup-retention, description or delete\n"
+            if !defined $param->{delete}
+            && !defined $param->{'maintenance-window'}
             && !defined $param->{pools}
             && !defined $param->{'backup-retention'}
             && !defined $param->{description}
@@ -649,6 +656,8 @@ __PACKAGE__->register_method({
             description => $param->{description},
             'cp-policy' => $param->{'cp-policy'},
             'storage-profile' => $param->{'storage-profile'},
+            delete => [ grep { length } split /\s*,\s*/,
+                $param->{delete} // '' ],
         });
 
         return undef;

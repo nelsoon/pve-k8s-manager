@@ -69,8 +69,8 @@ my $src = do {
     local $/;
     <$fh>;
 };
-like($src, qr{set_cluster_options.*?opts->\{pools\}}s,
-    'set_cluster_options stores validated pools');
+like($src, qr{sub apply_cluster_options.*?opts->\{pools\}}s,
+    'cluster option updates store validated pools');
 unlike($src, qr{linux/amd64/kubeadm},
     'kubeadm download is not hardcoded to amd64');
 

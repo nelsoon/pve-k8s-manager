@@ -203,4 +203,12 @@ unlike($js, qr/Target version \(one minor up/,
 like($js, qr{/rebuild-template'}, 'the image can be rebuilt from the UI');
 like($js, qr/name: 'severity'/, 'rebuild asks for the reason (severity)');
 
+# Step 5: Settings is a stock ObjectGrid with per-row editing and `delete`.
+like($js, qr/Ext\.define\('PVE\.dc\.K8sSettings', \{\s+extend: 'Proxmox\.grid\.ObjectGrid'/,
+    'settings are a stock ObjectGrid');
+my $nd = () = $js =~ /deleteEmpty: true/g;
+ok($nd >= 3, 'settings that can be set can be cleared (deleteEmpty)');
+unlike($js, qr/Details \(read-only\)/, 'no second read-only block next to the settings');
+like($api, qr/delete => \{/, 'the update API accepts delete');
+
 done_testing();
