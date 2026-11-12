@@ -218,4 +218,9 @@ my @hc = $hc =~ /(\w+Info)/g;
 my @oc = $oc =~ /(\w+Info)/g;
 is(scalar @hc, scalar @oc, 'overview columns have the same number of rows');
 
+# Cluster panels are built on first view, not all at once.
+like($js, qr/lazyBuild: function\(\) \{\s+return buildPanel\(clusterName, key, rec\);/,
+    'menu entries are placeholders built on first view');
+like($js, qr/if \(target\.lazyBuild\) \{/, 'showing a panel builds it once');
+
 done_testing();

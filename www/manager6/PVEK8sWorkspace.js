@@ -2177,19 +2177,30 @@ Ext.define('PVE.dc.K8sView', {
         let menu;
         let navList;
         let navStore;
+        let buildPanel = function(clusterName, key, rec) {
+            if (key === 'overview') { return overviewPanel(rec); }
+            if (key === 'nodes') { return nodesPanel(clusterName); }
+            if (key === 'workloads') { return workloadsPanel(clusterName); }
+            if (key === 'metrics') { return metricsPanel(clusterName); }
+            if (key === 'addons') { return addonsPanel(clusterName); }
+            if (key === 'events') { return eventsPanel(clusterName); }
+            if (key === 'backups') { return backupsPanel(clusterName); }
+            return settingsPanel(rec);
+        };
+        // Each menu entry is a light placeholder; its panel (and its
+        // API reads) is built the first time it is shown. Building all
+        // eight at once queued the Overview's summary behind workloads,
+        // metrics and events in pvedaemon's few workers.
         let panelFor = function(clusterName, key, rec) {
             let id = clusterName + ':' + key;
             if (panels[id]) { return panels[id]; }
-            let p;
-            if (key === 'overview') { p = overviewPanel(rec); }
-            else if (key === 'nodes') { p = nodesPanel(clusterName); }
-            else if (key === 'workloads') { p = workloadsPanel(clusterName); }
-            else if (key === 'metrics') { p = metricsPanel(clusterName); }
-            else if (key === 'addons') { p = addonsPanel(clusterName); }
-            else if (key === 'events') { p = eventsPanel(clusterName); }
-            else if (key === 'backups') { p = backupsPanel(clusterName); }
-            else { p = settingsPanel(rec); }
-            p.itemId = id;
+            let p = Ext.create('Ext.container.Container', {
+                layout: 'fit',
+                itemId: id,
+                lazyBuild: function() {
+                    return buildPanel(clusterName, key, rec);
+                },
+            });
             panels[id] = p;
             return p;
         };
@@ -2205,6 +2216,11 @@ Ext.define('PVE.dc.K8sView', {
                 return c.panelKey === key;
             });
             if (target) {
+                if (target.lazyBuild) {
+                    let build = target.lazyBuild;
+                    target.lazyBuild = null;
+                    target.add(build());
+                }
                 outer.getLayout().setActiveItem(target);
                 let node = navStore.getNodeById('k8snav-' + key);
                 if (node && navList.getSelection() !== node) {

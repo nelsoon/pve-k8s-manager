@@ -3759,6 +3759,19 @@ my sub k8s_api_get_many_retry {
     return k8s_api_get_many($name, $cp, @paths);
 }
 
+# Read several API paths the fast way: vsock, control planes on this
+# host first, no guest-exec probe. undef when no control plane answers
+# that way; the caller then falls back to a kubectl batch via ops_cp.
+sub k8s_read_fast {
+    my ($name, $nodes, @paths) = @_;
+
+    for my $cand (cp_read_order($nodes, local_node_name())->@*) {
+        my $res = eval { k8s_api_get_many_retry($name, $cand, @paths) };
+        return $res if $res;
+    }
+    return undef;
+}
+
 sub k8s_api_get {
     my ($name, $cp, $path) = @_;
 
@@ -6807,16 +6820,13 @@ sub workloads_cluster {
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
     my $nodes = load_nodes($name, $scfg);
-    my $cp = ops_cp($nodes);
     my ($dep, $pods, $svc);
-    my $via_api = eval {
-        $dep = k8s_api_get($name, $cp,
-            '/apis/apps/v1/deployments');
-        $pods = k8s_api_get($name, $cp, '/api/v1/pods');
-        $svc = k8s_api_get($name, $cp, '/api/v1/services');
-        1;
-    } // 0;
-    if (!$via_api) {
+    my $fast = k8s_read_fast($name, $nodes,
+        '/apis/apps/v1/deployments', '/api/v1/pods', '/api/v1/services');
+    if ($fast) {
+        ($dep, $pods, $svc) = $fast->@*;
+    } else {
+        my $cp = ops_cp($nodes);
         my $batch = kubectl_json_batch($cp,
             'get deployments -A', 'get pods -A',
             'get services -A');
@@ -7089,21 +7099,15 @@ sub summary_cluster {
         my ($data, $both);
         # vsock first, local control plane first: no guest-exec probe
         # and no ssh hop on the fast path
-        my $via_api = 0;
-        for my $cand (cp_read_order($nodes, local_node_name())->@*) {
-            $via_api = eval {
-                my ($n, $p, $s) = k8s_api_get_many_retry($name, $cand,
-                    '/api/v1/nodes', '/api/v1/pods',
-                    '/api/v1/services')->@*;
-                $data = $n;
-                $both = { items => [
-                    ($p->{items} // [])->@*,
-                    ($s->{items} // [])->@*] };
-                1;
-            } // 0;
-            last if $via_api;
-        }
-        if (!$via_api) {
+        my $fast = k8s_read_fast($name, $nodes,
+            '/api/v1/nodes', '/api/v1/pods', '/api/v1/services');
+        if ($fast) {
+            my ($n, $p, $s) = $fast->@*;
+            $data = $n;
+            $both = { items => [
+                ($p->{items} // [])->@*,
+                ($s->{items} // [])->@*] };
+        } else {
             my $cp = ops_cp($nodes);
             my $batch = kubectl_json_batch($cp,
                 'get nodes', 'get pods,services -A');
