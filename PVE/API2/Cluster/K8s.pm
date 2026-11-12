@@ -747,7 +747,7 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        return PVE::K8s::Provision::cert_expiry($param->{name});
+        return PVE::K8s::Provision::cert_expiry_cached($param->{name});
     }});
 
 __PACKAGE__->register_method({

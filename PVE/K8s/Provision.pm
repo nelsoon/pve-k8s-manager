@@ -1752,6 +1752,10 @@ sub delete_cluster {
         # it must not outlive the cluster it protects
         my $key_file = "/etc/pve/k8s/keys/$name.key";
         unlink $key_file if -e $key_file;
+        # nor its API token and cached reads: a cluster recreated
+        # under the same name would otherwise read with the old
+        # token (and fall back to the slow path) for up to an hour
+        unlink grep { -e } cluster_state_files($name);
     });
     print "cluster '$name' deleted: no orphan VMs, disks or users\n";
 }
@@ -3719,23 +3723,87 @@ sub api_credentials {
     return ($tf, $cf);
 }
 
-sub k8s_api_get {
-    my ($name, $cp, $path) = @_;
+# Several API paths in one helper process (and at most one ssh hop):
+# returns one decoded body per path.
+sub k8s_api_get_many {
+    my ($name, $cp, @paths) = @_;
 
     my ($tf, $cf) = api_credentials($name);
     my $cid = $cp->{vmid};
+    my @args = map { ('--path', $_) } @paths;
     my $out;
     if (!$cp->{pvehost} || $cp->{pvehost} eq local_node_name()) {
         $out = run(['env', "PVE_K8S_TOKEN_FILE=$tf",
             "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
-            '--cid', $cid, '--path', $path], timeout => 60);
+            '--cid', $cid, @args], timeout => 60);
     } else {
         $out = run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
             "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
-            . "pve-k8s-vsock-get --cid $cid --path "
-            . shq($path)], timeout => 60);
+            . "pve-k8s-vsock-get --cid $cid "
+            . join(' ', map { shq($_) } @args)], timeout => 60);
     }
-    return JSON::PP->new->decode($out);
+    my $data = JSON::PP->new->decode($out);
+    return @paths == 1 ? [$data] : $data;
+}
+
+# A rejected token (401: cluster recreated, token revoked) is dropped
+# so the next read mints a fresh one instead of failing for an hour.
+my sub k8s_api_get_many_retry {
+    my ($name, $cp, @paths) = @_;
+
+    my $res = eval { k8s_api_get_many($name, $cp, @paths) };
+    return $res if $res;
+    my $err = $@;
+    die $err if $err !~ /returned 401/;
+    unlink "/etc/pve/k8s/api-$name.token";
+    return k8s_api_get_many($name, $cp, @paths);
+}
+
+sub k8s_api_get {
+    my ($name, $cp, $path) = @_;
+
+    return k8s_api_get_many($name, $cp, $path)->[0];
+}
+
+# Control planes in the order a read should try them: the ones on
+# this host first (vsock needs no ssh hop there). No probing - the
+# caller falls back to ops_cp when the read fails.
+sub cp_read_order {
+    my ($nodes, $here) = @_;
+
+    my @cp = grep { $_->{role} eq 'cp' } $nodes->@*;
+    return [ (grep { ($_->{pvehost} // '') eq $here } @cp),
+        (grep { ($_->{pvehost} // '') ne $here } @cp) ];
+}
+
+# Template names cluster-wide straight from pmxcfs (one IPC call), in
+# the `qm list` line shape find_template_in_list parses. Only for
+# read paths that need the revision, not a specific copy's vmid.
+sub cluster_template_names {
+    my $props = eval {
+        require PVE::Cluster;
+        PVE::Cluster::get_guest_config_properties(['name', 'template']);
+    };
+    return cluster_template_lists() if ref $props ne 'HASH';
+    return join "\n", map { "  $_ $props->{$_}{name} stopped" }
+        grep { ($props->{$_}{template} // 0) && defined $props->{$_}{name} }
+        sort { $a <=> $b } keys $props->%*;
+}
+
+# HA services in error state, from the HA manager's status file on
+# pmxcfs (what `ha-manager status` reads) instead of spawning it.
+sub ha_error_services {
+    my $st = eval {
+        open my $fh, '<', '/etc/pve/ha/manager_status' or die $!;
+        local $/;
+        JSON::PP->new->decode(<$fh>);
+    };
+    if (ref $st eq 'HASH') {
+        my $svc = $st->{service_status} // {};
+        return [ sort grep { ($svc->{$_}{state} // '') eq 'error' } keys $svc->%* ];
+    }
+    my $out = eval { run(['ha-manager', 'status'], timeout => 60) } // '';
+    return [ $out =~ /^service (vm:\d+) \(\w+, error\)/gm ];
 }
 
 my sub kubectl_json_batch {
@@ -4991,6 +5059,8 @@ sub roll_cluster {
     store_inventory($name, \@nodes, $want_rev);
     eval { sync_ha_resources($name, $scfg, \@nodes) };
     print "warning: HA resource sync failed: $@" if $@;
+    # new control planes carry new certificates
+    unlink cert_cache_path($name);
     set_state($name, 'ready');
     print "cluster '$name' rolled: all nodes on $version r$want_rev\n";
     return 1;
@@ -6915,6 +6985,14 @@ sub lb_pool_size {
 # hosts) instead of recomputing on every open.
 my $SUMMARY_CACHE_TTL = 60;
 
+# Per-cluster files on pmxcfs besides clusters.cfg; all go with the
+# cluster.
+sub cluster_state_files {
+    my ($name) = @_;
+    return ("/etc/pve/k8s/api-$name.token", "/etc/pve/k8s/api-$name.ca",
+        summary_cache_path($name), cert_cache_path($name));
+}
+
 sub summary_cache_path {
     my ($name) = @_;
     return "/etc/pve/k8s/summary-$name.json";
@@ -7008,19 +7086,25 @@ sub summary_cluster {
     };
 
     my $live = eval {
-        my $cp = ops_cp($nodes);
         my ($data, $both);
-        my $via_api = eval {
-            my $n = k8s_api_get($name, $cp, '/api/v1/nodes');
-            my $p = k8s_api_get($name, $cp, '/api/v1/pods');
-            my $s = k8s_api_get($name, $cp, '/api/v1/services');
-            $data = $n;
-            $both = { items => [
-                ($p->{items} // [])->@*,
-                ($s->{items} // [])->@*] };
-            1;
-        } // 0;
+        # vsock first, local control plane first: no guest-exec probe
+        # and no ssh hop on the fast path
+        my $via_api = 0;
+        for my $cand (cp_read_order($nodes, local_node_name())->@*) {
+            $via_api = eval {
+                my ($n, $p, $s) = k8s_api_get_many_retry($name, $cand,
+                    '/api/v1/nodes', '/api/v1/pods',
+                    '/api/v1/services')->@*;
+                $data = $n;
+                $both = { items => [
+                    ($p->{items} // [])->@*,
+                    ($s->{items} // [])->@*] };
+                1;
+            } // 0;
+            last if $via_api;
+        }
         if (!$via_api) {
+            my $cp = ops_cp($nodes);
             my $batch = kubectl_json_batch($cp,
                 'get nodes', 'get pods,services -A');
             $data = $batch->[0];
@@ -7114,24 +7198,21 @@ sub summary_cluster {
         $out->{backup} = { count => scalar $backups->@*,
             last => $last };
     }
-    my $certs = eval { cert_expiry($name) } // [];
+    my $certs = eval { cert_expiry_cached($name) } // [];
     my $worst = worst_cert_days($certs);
     $out->{cert_days} = $worst if defined $worst;
     # HA services in error state are invisible in every
     # other view and silently stop HA recovery (T4.2:
     # two services sat in error until reset by hand).
     # Surface them; the scaler does not auto-reset them.
-    my $ha_status = eval {
-        run(['ha-manager', 'status'], timeout => 60) } // '';
-    my @ha_errors = $ha_status =~
-        /^service (vm:\d+) \(\w+, error\)/gm;
-    $out->{ha_errors} = \@ha_errors if @ha_errors;
+    my $ha_errors = ha_error_services();
+    $out->{ha_errors} = $ha_errors if $ha_errors->@*;
     my $rstate = eval {
         JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
     $out->{repairs} = $rstate->{repairs} if ($rstate->{repairs} // [])->@*;
     eval {
         my (undef, $best) = find_template_in_list(
-            cluster_template_lists(), $scfg->{'k8s-version'},
+            cluster_template_names(), $scfg->{'k8s-version'},
             $scfg->{'cp-arch'} // 'amd64');
         $out->{image} = image_status($scfg, $best,
             PVE::K8s::Templates::read_state(), time());
@@ -7144,6 +7225,39 @@ sub summary_cluster {
     # whole TTL (seen in the lab, 2026-11-09).
     summary_cache_write($name, $out) if $out->{live};
     return $out;
+}
+
+# Certificates change only on renewal, but reading them is a guest
+# exec of kubeadm: cache the parsed rows for six hours.
+my $CERT_CACHE_TTL = 6 * 3600;
+
+sub cert_cache_path {
+    my ($name) = @_;
+    return "/etc/pve/k8s/certs-$name.json";
+}
+
+sub cert_expiry_cached {
+    my ($name, $now) = @_;
+
+    $now //= time();
+    my $path = cert_cache_path($name);
+    my @st = stat $path;
+    if (@st && $now - $st[9] < $CERT_CACHE_TTL) {
+        my $rows = eval {
+            open my $fh, '<', $path or die $!;
+            local $/;
+            JSON::PP->new->decode(<$fh>);
+        };
+        return $rows if ref $rows eq 'ARRAY' && $rows->@*;
+    }
+    my $rows = cert_expiry($name);
+    eval {
+        open my $fh, '>', "$path.tmp" or die $!;
+        print $fh JSON::PP->new->encode($rows);
+        close $fh;
+        rename "$path.tmp", $path or die $!;
+    };
+    return $rows;
 }
 
 sub cert_expiry {

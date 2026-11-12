@@ -41,4 +41,25 @@ my $odd = { 'cp-policy' => 'ha', 'storage-profile' => 'local' };
 $apply->($odd, { description => 'edited' });
 is($odd->{description}, 'edited', 'editing the description does not re-judge an old record');
 
+# Fast summary paths (pure pieces).
+my $order = PVE::K8s::Provision::cp_read_order([
+    { role => 'cp', host => 'cp1', pvehost => 'a' },
+    { role => 'worker', host => 'w1', pvehost => 'b' },
+    { role => 'cp', host => 'cp2', pvehost => 'b' },
+    { role => 'cp', host => 'cp3', pvehost => 'c' },
+], 'b');
+is_deeply([map { $_->{host} } @$order], [qw(cp2 cp1 cp3)],
+    'reads try the control plane on this host first (no ssh hop)');
+my @files = PVE::K8s::Provision::cluster_state_files('c1');
+ok((grep { m{/api-c1\.token$} } @files) && (grep { m{/summary-c1\.json$} } @files)
+    && (grep { m{/certs-c1\.json$} } @files),
+    'a deleted cluster takes its token and cached reads with it');
+open my $pf, '<', 'PVE/K8s/Provision.pm' or die $!;
+my $src = do { local $/; <$pf> };
+like($src, qr/unlink grep \{ -e \} cluster_state_files\(\$name\)/, 'delete removes them');
+like($src, qr/unlink cert_cache_path\(\$name\);\n\s+set_state\(\$name, 'ready'\);/,
+    'a roll drops the certificate cache (new control planes, new certificates)');
+unlike(($src =~ /(sub summary_cluster \{.*?\n\}\n)/s)[0], qr/ha-manager|cluster_template_lists\(\)|cert_expiry\(\$name\)/,
+    'the summary spawns no ha-manager, no per-host qm list and no uncached kubeadm exec');
+
 done_testing;

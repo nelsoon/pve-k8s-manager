@@ -211,4 +211,11 @@ ok($nd >= 3, 'settings that can be set can be cleared (deleteEmpty)');
 unlike($js, qr/Details \(read-only\)/, 'no second read-only block next to the settings');
 like($api, qr/delete => \{/, 'the update API accepts delete');
 
+# Overview columns stay balanced.
+my ($hc) = $js =~ /itemId: 'healthCol',\s+items: \[(.*?)\]/s;
+my ($oc) = $js =~ /itemId: 'opsCol',\s+items: \[(.*?)\]/s;
+my @hc = $hc =~ /(\w+Info)/g;
+my @oc = $oc =~ /(\w+Info)/g;
+is(scalar @hc, scalar @oc, 'overview columns have the same number of rows');
+
 done_testing();

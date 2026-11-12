@@ -59,7 +59,8 @@ fi
 CACHE_DIR=/var/lib/vz/template/cache
 IMAGE=$CACHE_DIR/$DEBIAN_IMAGE_NAME
 if [ -z "$IMAGE_REVISION" ]; then
-    IMAGE_REVISION=$(cluster_vm_names | next_revision "$K8S_MINOR" "$ARCH")
+    IMAGE_REVISION=$( { cluster_vm_names; recorded_template_names; } \
+        | next_revision "$K8S_MINOR" "$ARCH")
 fi
 # Templates are immutable and keyed by VMID: never reuse a taken one.
 if ! pvesh get /cluster/nextid --vmid "$VMID" >/dev/null 2>&1; then

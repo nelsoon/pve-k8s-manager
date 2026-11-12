@@ -38,4 +38,17 @@ for my $f (glob 'images/versions/*.env') {
 open my $bt, '<', 'images/build-template.sh' or die $!;
 my $script = do { local $/; <$bt> };
 like($script, qr/next_revision/, 'build script derives the revision');
+# Revisions are never reused: the build history counts as well.
+my $state = '/tmp/pvek8s-tstate-' . $$ . '.json';
+open my $sf, '>', $state or die $!;
+print $sf '{"builds":{"1.36/amd64/r5":{"at":1},"1.36/amd64/r6":{"at":2},"1.36/arm64/r9":{"at":3}}}';
+close $sf;
+my $names = `sh -c '. images/revision.sh; recorded_template_names $state'`;
+is($names, "k8s-node-1.36-r5\nk8s-node-1.36-r6\nk8s-node-1.36-r9-arm64\n", 'build history yields template names');
+my $next = `sh -c '. images/revision.sh; recorded_template_names $state | next_revision 1.36 amd64'`;
+chomp $next;
+is($next, 7, 'with every template deleted the next build is r7, not r1');
+unlink $state;
+like($script, qr/\{ cluster_vm_names; recorded_template_names; \}/, 'the build script counts the history');
+
 done_testing;

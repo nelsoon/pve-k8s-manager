@@ -22,3 +22,18 @@ cluster_vm_names() {
     pvesh get /cluster/resources --type vm --output-format json \
         | grep -o '"name":"[^"]*"' | cut -d'"' -f4
 }
+
+# Template names from the build history on pmxcfs. A revision is never
+# reused, even after every template copy was deleted (a recreated
+# cluster rebuilt r1 while r5 and r6 had shipped).
+recorded_template_names() {
+    _state=${1:-/etc/pve/k8s/template-state.json}
+    [ -r "$_state" ] || return 0
+    perl -MJSON::PP -e '
+        local $/; my $s = eval { decode_json(<STDIN>) } || {};
+        for (sort keys %{ $s->{builds} || {} }) {
+            my ($minor, $arch, $rev) = m{^([\d.]+)/(\w+)/r(\d+)$} or next;
+            print "k8s-node-$minor-r$rev", ($arch eq "arm64" ? "-arm64" : ""), "\n";
+        }' < "$_state"
+}
+

@@ -1468,18 +1468,22 @@ Ext.define('PVE.dc.K8sView', {
                             layout: 'column',
                             defaults: { columnWidth: 0.5 },
                             items: [
+                                // two balanced columns: the cluster's
+                                // health on the left, operations on
+                                // the right (7 rows each)
                                 {
                                     xtype: 'container',
-                                    items: [healthInfo,
-                                        versionInfo, nodesInfo,
-                                        podsInfo, lbInfo],
+                                    itemId: 'healthCol',
+                                    items: [healthInfo, versionInfo,
+                                        nodesInfo, podsInfo, lbInfo,
+                                        certInfo, backupInfo],
                                 },
                                 {
                                     xtype: 'container',
-                                    items: [storageInfo,
-                                        groupsInfo, actionInfo,
-                                        parkedInfo, imageInfo, repairInfo, haInfo,
-                                        backupInfo, certInfo],
+                                    itemId: 'opsCol',
+                                    items: [groupsInfo, storageInfo,
+                                        imageInfo, actionInfo, parkedInfo,
+                                        repairInfo, haInfo],
                                 },
                             ],
                         },
