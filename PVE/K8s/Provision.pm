@@ -7260,6 +7260,29 @@ sub cert_expiry_cached {
     return $rows;
 }
 
+# Keep the slow-to-make read inputs fresh from the timer, so a page
+# view never pays for them: the API token is re-issued before readers
+# would (40 of its 50 cached minutes), certificates before their 6h
+# cache runs out. Both are guest execs of several seconds.
+sub warm_read_caches {
+    my ($name, $now) = @_;
+
+    $now //= time();
+    my $tf = "/etc/pve/k8s/api-$name.token";
+    my @st = stat $tf;
+    if (!@st || $now - $st[9] > 2400) {
+        unlink $tf;
+        eval { api_credentials($name) };
+    }
+    my $cp = cert_cache_path($name);
+    my @cs = stat $cp;
+    if (!@cs || $now - $cs[9] > 5 * 3600) {
+        unlink $cp;
+        eval { cert_expiry_cached($name, $now) };
+    }
+    return 1;
+}
+
 sub cert_expiry {
     my ($name) = @_;
 

@@ -25,4 +25,7 @@ for my $name (sort keys $cfg->{ids}->%*) {
     } elsif ($acted) {
         print "cluster $name: action taken\n";
     }
+    # keep the Overview's slow inputs warm (token, certificates)
+    eval { PVE::K8s::Provision::warm_read_caches($name) }
+        if ($cfg->{ids}->{$name}->{state} // '') eq 'ready';
 }

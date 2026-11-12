@@ -62,4 +62,9 @@ like($src, qr/unlink cert_cache_path\(\$name\);\n\s+set_state\(\$name, 'ready'\)
 unlike(($src =~ /(sub summary_cluster \{.*?\n\}\n)/s)[0], qr/ha-manager|cluster_template_lists\(\)|cert_expiry\(\$name\)/,
     'the summary spawns no ha-manager, no per-host qm list and no uncached kubeadm exec');
 
+open my $sc, '<', 'tools/pve-k8s-scaler' or die $!;
+my $scaler = do { local $/; <$sc> };
+like($scaler, qr/warm_read_caches\(\$name\)/, 'the timer keeps token and certificates warm');
+like($src, qr/\$now - \$st\[9\] > 2400/, 'the token is re-issued before readers would (50 min)');
+
 done_testing;
