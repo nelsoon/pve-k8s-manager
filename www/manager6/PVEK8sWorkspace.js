@@ -641,6 +641,26 @@ Ext.define('PVE.dc.K8sView', {
             });
         };
 
+        // Destroying a cluster deletes every node VM and disk: the stock
+        // type-the-name dialog, like removing a VM, not a yes/no box.
+        let destroyCluster = function(name, done) {
+            Ext.create('Proxmox.window.SafeDestroy', {
+                autoShow: true,
+                url: '/cluster/k8s/' + encodeURIComponent(name),
+                item: { id: name },
+                taskName: 'k8sdelete',
+                showProgress: true,
+                note: gettext('All node VMs of this cluster and their disks '
+                    + 'are deleted.'),
+                taskDone: done,
+                apiCallDone: function(success) {
+                    if (success) {
+                        done();
+                    }
+                },
+            });
+        };
+
         let clusterStore = Ext.create('Ext.data.Store', {
             fields: ['name', 'state', 'k8s-version', 'template-rev',
                 'cp', 'workers', 'node-subnet', 'gateway', 'lb-range',
@@ -2036,25 +2056,14 @@ Ext.define('PVE.dc.K8sView', {
             handler: function() {
                 let name = me.currentCluster;
                 if (!name) { return; }
-                Ext.Msg.confirm(gettext('Confirm'),
-                    Ext.String.format(gettext(
-                        'Delete cluster {0} and all its VMs?'), name),
-                    function(answer) {
-                        if (answer !== 'yes') { return; }
-                        api({
-                            url: '/cluster/k8s/' + name,
-                            method: 'DELETE',
-                            success: function(r) {
-                                task(r.result.data);
-                                me.currentCluster = null;
-                                if (fixedClusterName && me.workspace) {
-                                    me.workspace.selectById('root');
-                                } else {
-                                    me.reloadClusters();
-                                }
-                            },
-                        });
-                    });
+                destroyCluster(name, function() {
+                    me.currentCluster = null;
+                    if (fixedClusterName && me.workspace) {
+                        me.workspace.selectById('root');
+                    } else {
+                        me.reloadClusters();
+                    }
+                });
             },
         });
 
@@ -2200,20 +2209,9 @@ Ext.define('PVE.dc.K8sView', {
                     let sel = home.getSelection();
                     if (!sel || !sel.length) { return; }
                     let name = sel[0].data.name;
-                    Ext.Msg.confirm(gettext('Confirm'),
-                        Ext.String.format(gettext(
-                            'Delete cluster {0} and all its VMs?'), name),
-                        function(answer) {
-                            if (answer !== 'yes') { return; }
-                            api({
-                                url: '/cluster/k8s/' + name,
-                                method: 'DELETE',
-                                success: function(r) {
-                                    task(r.result.data);
-                                    clusterStore.load();
-                                },
-                            });
-                        });
+                    destroyCluster(name, function() {
+                        clusterStore.load();
+                    });
                 },
             });
             home.getSelectionModel().on('selectionchange',

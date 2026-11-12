@@ -44,8 +44,10 @@ my $api = do {
 };
 like($api, qr/fork_cluster_worker\('k8sprovision'/,
     'provision endpoint runs as a k8sprovision PVE task (UPID)');
-like($js, qr/method: 'DELETE'/,
-    'grid Remove button deletes through the REST API');
+like($js, qr/Ext\.create\('Proxmox\.window\.SafeDestroy'.*?url: '\/cluster\/k8s\/' \+ encodeURIComponent\(name\)/s,
+    'destroy deletes through the REST API behind the stock type-the-name dialog');
+unlike($js, qr/Delete cluster \{0\} and all its VMs\?/,
+    'no plain yes/no box guards cluster destruction');
 like($api, qr/fork_cluster_worker\('k8sdelete'/,
     'delete endpoint runs as a k8sdelete PVE task (UPID)');
 
