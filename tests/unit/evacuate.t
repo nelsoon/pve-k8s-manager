@@ -88,7 +88,7 @@ my $js = do {
     local $/;
     <$fh>;
 };
-like($js, qr|'/hosts/'\s*\+ value \+ '/evacuate'|,
+like($js, qr|'/hosts/';[\s\S]*?encodeURIComponent\(host\) \+ '/evacuate'|,
     'UI evacuate action calls the hosts endpoint');
 
 done_testing();

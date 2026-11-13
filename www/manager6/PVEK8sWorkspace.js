@@ -749,6 +749,57 @@ Ext.define('PVE.dc.K8sRebuildWindow', {
 });
 
 
+// Evacuate a PVE host: pick it (stock node selector) instead of
+// typing its name; the API runs it as a task.
+Ext.define('PVE.dc.K8sEvacuateWindow', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pveDcK8sEvacuateWindow',
+
+    subject: gettext('PVE Host'),
+    title: gettext('Evacuate PVE Host'),
+    isCreate: true,
+    method: 'POST',
+    showTaskViewer: true,
+    submitText: gettext('Evacuate'),
+    width: 480,
+    clusterName: undefined,
+
+    initComponent: function() {
+        let me = this;
+        let base = '/cluster/k8s/' + encodeURIComponent(me.clusterName) + '/hosts/';
+        me.url = base;
+        // the host is part of the URL, not a request parameter
+        me.submitUrl = function(url, values) {
+            let host = values.host;
+            delete values.host;
+            return base + encodeURIComponent(host) + '/evacuate';
+        };
+        Ext.apply(me, {
+            items: [{
+                xtype: 'inputpanel',
+                items: [
+                    {
+                        xtype: 'pveNodeSelector',
+                        name: 'host',
+                        fieldLabel: gettext('Host'),
+                        allowBlank: false,
+                        autoSelect: false,
+                        onlineValidator: true,
+                    },
+                    {
+                        xtype: 'displayfield',
+                        userCls: 'pmx-hint',
+                        value: gettext('Live-migrates every VM of this cluster '
+                            + 'off the host, e.g. before host maintenance.'),
+                    },
+                ],
+            }],
+        });
+        me.callParent();
+    },
+});
+
+
 // Settings: the stock ObjectGrid, one property per row with its own
 // small Edit window (like the VM Options tab). An emptied value is
 // cleared through the API's `delete` parameter, so every setting that
@@ -1609,39 +1660,38 @@ Ext.define('PVE.dc.K8sView', {
                 fields: ['name', 'pool', 'pvehost', 'vmid', 'ip', 'rev'],
             });
             let g;
-            let nodeAct = function(action, label, extra, confirmText) {
+            // Stock selection buttons: disabled without a selection,
+            // the stock confirm box (No focused for dangerous ones).
+            let sm = Ext.create('Ext.selection.RowModel', {});
+            let nodeAct = function(action, label, extra, confirmText, dangerous) {
                 return {
+                    xtype: 'proxmoxButton',
                     text: label,
                     disabled: true,
-                    // a shared marker property, NOT itemId:
-                    // this Ext build drops toolbar items that
-                    // share an itemId (only the last survives,
-                    // which ate Drain and Replace)
-                    nodebtn: true,
-                    handler: function() {
-                        let sel = g.getSelection();
-                        if (!sel || !sel.length) { return; }
-                        let node = sel[0].data.name;
-                        Ext.Msg.confirm(gettext('Confirm'),
-                            Ext.String.format(confirmText
-                                || gettext('{0} node {1}?'), label, node),
-                            function(answer) {
-                                if (answer !== 'yes') { return; }
-                                api({
-                                    url: '/cluster/k8s/' + name + '/nodes/' + node + action,
-                                    method: 'POST',
-                                    params: extra || {},
-                                    success: function(r) {
-                                        task(r.result.data);
-                                    },
-                                });
-                            });
+                    selModel: sm,
+                    dangerous: !!dangerous,
+                    confirmMsg: function(rec) {
+                        return Ext.String.format(confirmText
+                            || gettext('{0} node {1}?'), label,
+                            Ext.htmlEncode(rec.data.name));
+                    },
+                    handler: function(btn, event, rec) {
+                        api({
+                            url: '/cluster/k8s/' + name + '/nodes/'
+                                + encodeURIComponent(rec.data.name) + action,
+                            method: 'POST',
+                            params: extra || {},
+                            success: function(r) {
+                                task(r.result.data);
+                            },
+                        });
                     },
                 };
             };
             g = Ext.create('Ext.grid.Panel', {
                 border: false,
                 store: store,
+                selModel: sm,
                 columns: [
                     { text: gettext('Node'), dataIndex: 'name', flex: 1 },
                     { text: gettext('Pool'), dataIndex: 'pool', flex: 1 },
@@ -1657,7 +1707,7 @@ Ext.define('PVE.dc.K8sView', {
                         { force: 1, replace: 1 },
                         gettext('Force-retire DEAD node {1}? Only if its VM '
                             + 'is powered off or lost. A replacement will '
-                            + 'be provisioned.')),
+                            + 'be provisioned.'), true),
                     {
                         text: gettext('Reload'),
                         k8sReadOnly: true,
@@ -1667,31 +1717,13 @@ Ext.define('PVE.dc.K8sView', {
                         text: gettext('Evacuate Host'),
                         iconCls: 'fa fa-fw fa-sign-out',
                         handler: function() {
-                            Ext.Msg.prompt(gettext('Evacuate PVE Host'),
-                                gettext('Host to empty by live-migrating all '
-                                    + 'managed cluster VMs off it:'),
-                                function(answer, value) {
-                                    if (answer !== 'ok' || !value) { return; }
-                                    api({
-                                        url: '/cluster/k8s/' + name
-                                            + '/hosts/' + value + '/evacuate',
-                                        method: 'POST',
-                                        success: function(r) {
-                                            task(r.result.data);
-                                        },
-                                    });
-                                });
+                            Ext.create('PVE.dc.K8sEvacuateWindow', {
+                                autoShow: true,
+                                clusterName: name,
+                            });
                         },
                     },
                 ],
-                listeners: {
-                    selectionchange: function(model, selected) {
-                        let dis = !selected || !selected.length;
-                        g.query('button[nodebtn]').forEach(function(b) {
-                            b.setDisabled(dis);
-                        });
-                    },
-                },
             });
             // --- node groups (pools): create/edit/delete
             // over the same record; saving stores the new
@@ -1775,18 +1807,9 @@ Ext.define('PVE.dc.K8sView', {
                     },
                 });
             };
-            let groupBtn = function(text, fn, needsSel) {
-                return {
-                    text: text,
-                    disabled: !!needsSel,
-                    groupbtn: !!needsSel,
-                    handler: function() {
-                        let sel = groupsGrid.getSelection();
-                        fn(sel && sel.length ? sel[0].data : null);
-                    },
-                };
-            };
+            let gsm = Ext.create('Ext.selection.RowModel', {});
             groupsGrid = Ext.create('Ext.grid.Panel', {
+                selModel: gsm,
                 header: false,
                 height: 190,
                 border: false,
@@ -1805,33 +1828,42 @@ Ext.define('PVE.dc.K8sView', {
                     { text: gettext('Policy'), dataIndex: 'policy', width: 70 },
                 ],
                 tbar: [
-                    groupBtn(gettext('Create'), function() {
-                        groupWindow(null);
-                    }),
-                    groupBtn(gettext('Edit'), function(data) {
-                        if (data) { groupWindow(data); }
-                    }, true),
-                    groupBtn(gettext('Delete'), function(data) {
-                        if (!data) { return; }
-                        Ext.Msg.confirm(gettext('Confirm'),
-                            Ext.String.format(gettext(
+                    {
+                        text: gettext('Create'),
+                        handler: function() { groupWindow(null); },
+                    },
+                    {
+                        xtype: 'proxmoxButton',
+                        text: gettext('Edit'),
+                        disabled: true,
+                        selModel: gsm,
+                        handler: function(btn, event, rec) {
+                            groupWindow(rec.data);
+                        },
+                    },
+                    {
+                        xtype: 'proxmoxButton',
+                        text: gettext('Delete'),
+                        disabled: true,
+                        selModel: gsm,
+                        dangerous: true,
+                        confirmMsg: function(rec) {
+                            return Ext.String.format(gettext(
                                 'Delete node group {0}? Its nodes are '
-                                + 'drained and retired on save.'), data.name),
-                            function(answer) {
-                                if (answer !== 'yes') { return; }
-                                saveGroups(currentGroups().filter(
-                                    function(gr) {
-                                        return gr.name !== data.name;
-                                    }));
-                            });
-                    }, true),
+                                + 'drained and retired on save.'),
+                                Ext.htmlEncode(rec.data.name));
+                        },
+                        handler: function(btn, event, rec) {
+                            saveGroups(currentGroups().filter(function(gr) {
+                                return gr.name !== rec.data.name;
+                            }));
+                        },
+                    },
                 ],
                 listeners: {
-                    selectionchange: function(model, selected) {
-                        let dis = !selected || !selected.length;
-                        groupsGrid.query('button[groupbtn]').forEach(function(b) {
-                            b.setDisabled(dis);
-                        });
+                    // like every stock grid: double-click edits
+                    itemdblclick: function(view, rec) {
+                        if (canModify) { groupWindow(rec.data); }
                     },
                 },
             });

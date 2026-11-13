@@ -63,7 +63,7 @@ like($js, qr|'/kubeconfig'|,
     'UI fetches the kubeconfig from the REST API');
 like($js, qr|'/events'|,
     'UI events view reads the events endpoint');
-like($js, qr|'/nodes/' \+ node|,
+like($js, qr|'/nodes/'\s*\+ encodeURIComponent\(rec\.data\.name\) \+ action|,
     'UI node actions call the per-node endpoints');
 like($js, qr/create token|a\.download = name \+ '\.kubeconfig'/,
     'UI offers the kubeconfig as a download');
@@ -147,11 +147,17 @@ ok((grep { /header: false/ } split /\n/, $js) >= 8,
     'section panels render without header bars');
 # this Ext build drops toolbar items sharing an itemId
 # (only the last survives: Drain/Replace/Edit vanished);
-# selection-scoped buttons use a marker property instead
+# selection-scoped buttons are stock proxmoxButtons bound to a
+# selection model, with no shared itemId
 unlike($js, qr/itemId: 'nodebtn'/, 'node buttons share no itemId');
 unlike($js, qr/itemId: needsSel/, 'group buttons share no itemId');
-like($js, qr/button\[nodebtn\]/, 'node buttons toggle via marker query');
-like($js, qr/button\[groupbtn\]/, 'group buttons toggle via marker query');
+unlike($js, qr/button\[(?:node|group)btn\]/, 'no hand-made selection toggling left');
+my $sel = () = $js =~ /xtype: 'proxmoxButton',/g;
+is($sel, 3, 'node actions (one builder) and group Edit/Delete are stock selection buttons');
+like($js, qr/selModel: sm,\s+dangerous: !!dangerous,/, 'node actions use the stock confirm box');
+like($js, qr/'be provisioned\.'\), true\),/, 'Force Retire is marked dangerous');
+unlike($js, qr/Ext\.Msg\.prompt/, 'no typed-in host names: evacuate picks the host');
+like($js, qr/Ext\.define\('PVE\.dc\.K8sEvacuateWindow'/, 'evacuate is a stock Edit window');
 for my $panel (qw(overview nodes workloads metrics addons
     events backups settings)) {
     like($js, qr/'\Q$panel\E'/, "tree offers the $panel panel");
