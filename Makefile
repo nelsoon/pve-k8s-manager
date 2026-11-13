@@ -44,6 +44,7 @@ test: lint deb
 	@perl -I. -Itests/stubs tests/unit/scaler-safety.t
 	@perl -I. -Itests/stubs tests/unit/cluster-options.t
 	@perl -I. -Itests/stubs tests/unit/kubeconfig-access.t
+	@perl -I. -Itests/stubs tests/unit/kubectl-vsock.t
 	@perl -I. -Itests/stubs tests/unit/upgrade-check.t
 	@perl -I. -Itests/stubs tests/unit/surge-cp-ip.t
 	@perl -I. -Itests/stubs tests/unit/roll-plan.t

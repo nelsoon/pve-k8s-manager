@@ -41,7 +41,7 @@ my @reqs = $requests ? $requests->@*
 die "usage: pve-k8s-vsock-get --cid <id> --path </api/...> [--path ...]\n"
     . "       pve-k8s-vsock-get --cid <id> --requests <base64 JSON>\n"
     if !$cid || $cid !~ /^\d+$/ || !@reqs
-        || grep { ($_->{path} // '') !~ m|^/api|
+        || grep { ($_->{path} // '') !~ m{^/(?:apis?/|version$)}
             || ($_->{method} // '') !~ /^(GET|POST|PUT|PATCH|DELETE)$/ } @reqs;
 my $token_file = $ENV{PVE_K8S_TOKEN_FILE}
     or die "PVE_K8S_TOKEN_FILE not set\n";

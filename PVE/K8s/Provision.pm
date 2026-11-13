@@ -3472,6 +3472,190 @@ my sub etcd_member_remove {
     print "etcd member $old_host ($id) removed\n";
 }
 
+# --- vsock API transport --------------------------------
+# CP VMs carry a virtio-vsock device (CID = VMID); the
+# guest proxies vsock:10244 to the apiserver. HTTPS over
+# that channel is ~70x faster than a guest-agent exec
+# and needs no IP route into the SDN zone. Credentials
+# are the pve-k8s-manager SA token + cluster CA, cached
+# on pmxcfs for 50 minutes (the token lives 1h). The
+# first token is minted by guest exec (kubeconfig_cluster);
+# after that the still-valid token renews itself through
+# a TokenRequest over vsock. Every caller falls back to
+# guest exec when vsock is not available (old nodes,
+# proxy unit missing).
+my $VSOCK_PORT = 10244;
+
+# Kubernetes identities (see below)
+our $USER_NS = 'pve-k8s-users';
+our $MANAGER_SA = 'pve-k8s-manager';
+our $USER_LABEL = 'pve-k8s.proxmox.com/user-sa';
+our $USER_ANNOTATION = 'pve-k8s.proxmox.com/user';
+our $DEFAULT_KUBECONFIG_MAX_HOURS = 24;
+my $API_TOKEN_REFRESH = 3000;   # renew after 50 min
+# set while pve-k8s's own token is minted by guest exec: that path
+# picks its control plane with ops_cp, which must not try vsock
+# (it would mint again)
+my %MINTING;
+my $API_TOKEN_LIFE = 3600;
+
+my sub write_private {
+    my ($path, $data) = @_;
+
+    sysopen my $fh, "$path.tmp",
+        Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(),
+        0600 or die "credential cache: $!\n";
+    print $fh $data;
+    close $fh;
+    rename "$path.tmp", $path or die "credential cache rename: $!\n";
+}
+
+# One helper process on the host that has the VM's vsock (an ssh hop
+# when that is another host); returns its stdout.
+my sub vsock_run {
+    my ($cp, $tf, $cf, @args) = @_;
+
+    my $cid = $cp->{vmid};
+    if (!$cp->{pvehost} || $cp->{pvehost} eq local_node_name()) {
+        return run(['env', "PVE_K8S_TOKEN_FILE=$tf",
+            "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
+            '--cid', $cid, @args], timeout => 60);
+    }
+    return run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
+        "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
+        . "pve-k8s-vsock-get --cid $cid "
+        . join(' ', map { shq($_) } @args)], timeout => 60);
+}
+
+my sub vsock_requests {
+    my ($cp, $tf, $cf, @reqs) = @_;
+
+    my $plain = [ map { my %r = $_->%*; delete $r{ok}; \%r } @reqs ];
+    my $b64 = MIME::Base64::encode_base64(
+        JSON::PP->new->canonical->utf8->encode($plain), '');
+    my $out = vsock_run($cp, $tf, $cf, '--requests', $b64);
+    my $res = JSON::PP->new->utf8->decode($out);
+    die "vsock: expected " . scalar(@reqs) . " results\n"
+        if ref $res ne 'ARRAY' || @$res != @reqs;
+    return $res;
+}
+
+# Pure: a TokenRequest for one service account.
+sub token_request {
+    my ($ns, $sa, $seconds) = @_;
+
+    return {
+        method => 'POST', ok => [201],
+        path => "/api/v1/namespaces/$ns/serviceaccounts/$sa/token",
+        body => { apiVersion => 'authentication.k8s.io/v1',
+            kind => 'TokenRequest',
+            spec => { expirationSeconds => $seconds + 0 } },
+    };
+}
+
+# Pure: the first request whose answer is not one it accepts, as an
+# error message; undef when all went through.
+sub api_failure {
+    my ($reqs, $res) = @_;
+
+    for my $i (0 .. $#$reqs) {
+        my $r = $reqs->[$i];
+        my $code = ($res->[$i] // {})->{code} // 0;
+        next if grep { $_ == $code } ($r->{ok} // [200])->@*;
+        my $body = ($res->[$i] // {})->{body};
+        my $msg = ref $body eq 'HASH' ? ($body->{message} // '') : ($body // '');
+        return "$r->{method} $r->{path} returned $code"
+            . ($msg ne '' ? ": $msg" : '') . "\n";
+    }
+    return undef;
+}
+
+my sub renew_manager_token {
+    my ($name, $cp, $tf, $cf) = @_;
+
+    my $req = token_request('kube-system', $MANAGER_SA, $API_TOKEN_LIFE);
+    my $res = vsock_requests($cp, $tf, $cf, $req);
+    my $err = api_failure([$req], $res);
+    die $err if $err;
+    my $token = $res->[0]{body}{status}{token}
+        or die "token renewal returned no token\n";
+    write_private($tf, $token);
+}
+
+sub api_credentials {
+    my ($name, $cp) = @_;
+
+    my $tf = "/etc/pve/k8s/api-$name.token";
+    my $cf = "/etc/pve/k8s/api-$name.ca";
+    my @st = stat $tf;
+    my $age = @st ? time() - $st[9] : undef;
+    return ($tf, $cf)
+        if defined $age && $age < $API_TOKEN_REFRESH && -s $cf;
+    if ($cp && defined $age && $age < $API_TOKEN_LIFE - 60 && -s $cf) {
+        return ($tf, $cf)
+            if eval { renew_manager_token($name, $cp, $tf, $cf); 1 };
+    }
+    local $MINTING{$name} = 1;
+    my $kc = kubeconfig_cluster($name)->{kubeconfig};
+    my ($token) = $kc =~ /token: (\S+)/;
+    my ($ca_b64) = $kc =~ /certificate-authority-data: (\S+)/;
+    die "could not parse issued kubeconfig for '$name'\n"
+        if !$token || !$ca_b64;
+    write_private($cf, MIME::Base64::decode_base64($ca_b64));
+    write_private($tf, $token);
+    return ($tf, $cf);
+}
+
+# Several API paths in one helper process (and at most one ssh hop):
+# returns one decoded body per path.
+sub k8s_api_get_many {
+    my ($name, $cp, @paths) = @_;
+
+    my ($tf, $cf) = api_credentials($name, $cp);
+    my $out = vsock_run($cp, $tf, $cf, map { ('--path', $_) } @paths);
+    my $data = JSON::PP->new->decode($out);
+    return @paths == 1 ? [$data] : $data;
+}
+
+# A rejected token (401: cluster recreated, token revoked) is dropped
+# so the next read mints a fresh one instead of failing for an hour.
+my sub k8s_api_get_many_retry {
+    my ($name, $cp, @paths) = @_;
+
+    my $res = eval { k8s_api_get_many($name, $cp, @paths) };
+    return $res if $res;
+    my $err = $@;
+    die $err if $err !~ /returned 401/;
+    unlink "/etc/pve/k8s/api-$name.token";
+    return k8s_api_get_many($name, $cp, @paths);
+}
+
+# Requests (reads or writes) over vsock, control planes on this host
+# first: one {code, body} per request, or undef when no control plane
+# answers that way (the caller then uses guest exec). Requests must be
+# safe to repeat (server-side apply, deletes, token requests): a
+# transport failure halfway moves on to the next control plane. A
+# rejected manager token (every answer 401, so nothing was applied)
+# is dropped and minted again once.
+sub k8s_api_fast {
+    my ($name, $nodes, @reqs) = @_;
+
+    for my $cp (cp_read_order($nodes, local_node_name())->@*) {
+        my $res = eval {
+            my ($tf, $cf) = api_credentials($name, $cp);
+            my $r = vsock_requests($cp, $tf, $cf, @reqs);
+            if (!grep { $_->{code} != 401 } @$r) {
+                unlink $tf;
+                ($tf, $cf) = api_credentials($name, $cp);
+                $r = vsock_requests($cp, $tf, $cf, @reqs);
+            }
+            $r;
+        };
+        return $res if $res;
+    }
+    return undef;
+}
+
 # Plain package sub (not lexical): joined_names calls it
 # from above this declaration, and a lexical defined
 # below its caller is invisible there.
@@ -3482,9 +3666,194 @@ my sub kubectl_cmd {
     return "kubectl --kubeconfig /etc/kubernetes/admin.conf $args";
 }
 
+# --- kubectl over vsock ------------------------------------
+# The kubectl commands pve-k8s runs, as Kubernetes API requests:
+# kubectl_on / kubectl_json send a known command over vsock to the
+# same control plane and only fall back to guest exec (seconds per
+# call) when that channel does not answer. An API refusal is final,
+# like kubectl's own error. Unknown commands (drain, taint, apply...)
+# always go through guest exec.
+my $DNS = qr/[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/;
+
+# Pure: the API plan for one kubectl command line, or undef.
+# {reqs => [...], out => json|none|nodes-text|version,
+#  wait_gone => path, sort => field}
+sub kubectl_api_plan {
+    my ($args) = @_;
+
+    my $get = sub { { reqs => [{ method => 'GET', path => $_[0] }],
+        out => 'json' } };
+    my $merge = sub {
+        my ($path, $patch) = @_;
+        return { method => 'PATCH', path => $path, body => $patch,
+            type => 'application/merge-patch+json' };
+    };
+    $args //= '';
+    return { %{ $get->('/api/v1/nodes') }, out => 'nodes-text' }
+        if $args eq 'get nodes --no-headers';
+    return $get->('/api/v1/nodes') if $args eq 'get nodes -o json';
+    return { %{ $get->('/version') }, out => 'version' }
+        if $args eq 'version -o json';
+    return $get->('/api/v1/pods') if $args eq 'get pods -A -o json';
+    return $get->('/apis/policy/v1/poddisruptionbudgets')
+        if $args eq 'get pdb -A -o json';
+    return $get->('/api/v1/persistentvolumes') if $args eq 'get pv -o json';
+    return $get->('/apis/storage.k8s.io/v1/volumeattachments')
+        if $args eq 'get volumeattachments -o json';
+    return { %{ $get->('/api/v1/events') }, sort => 'lastTimestamp' }
+        if $args eq 'get events -A --sort-by=.lastTimestamp -o json';
+    return $get->("/api/v1/persistentvolumes/$1")
+        if $args =~ /^get pv ($DNS) -o json$/;
+    return $get->("/api/v1/namespaces/$1/persistentvolumeclaims/$2")
+        if $args =~ /^get pvc -n ($DNS) ($DNS) -o json$/;
+    return $get->("/api/v1/namespaces/$1/pods")
+        if $args =~ /^get pods -n ($DNS) -o json$/;
+    if ($args =~ /^(un)?cordon ($DNS)$/) {
+        return { out => 'none', reqs => [$merge->("/api/v1/nodes/$2",
+            { spec => { unschedulable => $1 ? JSON::PP::false()
+                : JSON::PP::true() } })] };
+    }
+    return { out => 'none', reqs => [{ method => 'DELETE',
+        path => "/api/v1/nodes/$1", ok => [200, 202] }] }
+        if $args =~ /^delete node ($DNS)$/;
+    if ($args =~ /^label nodes? ($DNS) (.+) --overwrite$/) {
+        my ($host, %labels) = ($1);
+        for my $kv (split / /, $2) {
+            my ($k, $v) = $kv =~ m{^([A-Za-z0-9][A-Za-z0-9./_-]*)=([A-Za-z0-9._-]*)$}
+                or return undef;
+            $labels{$k} = $v;
+        }
+        return { out => 'none', reqs => [$merge->("/api/v1/nodes/$host",
+            { metadata => { labels => \%labels } })] };
+    }
+    if ($args =~ /^patch pv ($DNS) --type merge -p '(\{[^']*\})'$/) {
+        my ($pv, $json) = ($1, $2);
+        my $patch = eval { JSON::PP->new->decode($json) } or return undef;
+        return { out => 'none',
+            reqs => [$merge->("/api/v1/persistentvolumes/$pv", $patch)] };
+    }
+    if ($args =~ /^delete pvc -n ($DNS) ($DNS) --ignore-not-found --wait=true$/) {
+        my $path = "/api/v1/namespaces/$1/persistentvolumeclaims/$2";
+        return { out => 'none', wait_gone => $path,
+            reqs => [{ method => 'DELETE', path => $path, ok => [200, 202, 404] }] };
+    }
+    if ($args =~ /^delete pv ($DNS) --ignore-not-found --wait=true$/) {
+        my $path = "/api/v1/persistentvolumes/$1";
+        return { out => 'none', wait_gone => $path,
+            reqs => [{ method => 'DELETE', path => $path, ok => [200, 202, 404] }] };
+    }
+    return undef;
+}
+
+# Pure: `kubectl get nodes --no-headers` lines from a NodeList.
+sub nodes_text {
+    my ($list) = @_;
+
+    my @lines;
+    for my $n ((($list // {})->{items} // [])->@*) {
+        my ($ready) = grep { ($_->{type} // '') eq 'Ready' }
+            (($n->{status} // {})->{conditions} // [])->@*;
+        my $st = (($ready // {})->{status} // '') eq 'True' ? 'Ready' : 'NotReady';
+        $st .= ',SchedulingDisabled' if ($n->{spec} // {})->{unschedulable};
+        my $labels = ($n->{metadata} // {})->{labels} // {};
+        my @roles = sort map { m{^node-role\.kubernetes\.io/(.+)$} ? $1 : () }
+            keys %$labels;
+        push @lines, join('   ', $n->{metadata}{name}, $st,
+            (@roles ? join(',', @roles) : '<none>'), '-',
+            (($n->{status} // {})->{nodeInfo} // {})->{kubeletVersion} // '');
+    }
+    return join('', map { "$_\n" } @lines);
+}
+
+# Pure: items sorted like kubectl --sort-by (missing values first).
+sub sort_items_by {
+    my ($data, $field) = @_;
+
+    my $key = sub {
+        my ($i) = @_;
+        return $i->{$field} // $i->{eventTime}
+            // ($i->{metadata} // {})->{creationTimestamp} // '';
+    };
+    $data->{items} = [ sort { $key->($a) cmp $key->($b) }
+        ($data->{items} // [])->@* ];
+    return $data;
+}
+
+# vsock is skipped for a while once it failed for a cluster or a
+# control plane, so a cluster without it (or still coming up) pays
+# for the failed attempt once, not on every call.
+my %VSOCK_SKIP;
+my $VSOCK_SKIP_SECONDS = 120;
+
+# Run a plan on one control plane over vsock: the decoded result, or
+# undef when vsock does not answer (the caller uses guest exec). Dies
+# with kubectl's kind of message when the API refuses.
+my sub kubectl_api_run {
+    my ($cp, $plan) = @_;
+
+    my $name = $cp->{cluster};
+    return undef if !$name || $MINTING{$name};
+    my $now = time();
+    for my $k ($name, "vm:$cp->{vmid}") {
+        return undef if ($VSOCK_SKIP{$k} // 0) > $now;
+    }
+    my @reqs = $plan->{reqs}->@*;
+    my ($tf, $cf) = eval { api_credentials($name, $cp) };
+    if (!$tf) {
+        # no credentials (cluster still coming up, API down): minting
+        # costs guest execs, so not again on every call
+        $VSOCK_SKIP{$name} = $now + $VSOCK_SKIP_SECONDS;
+        return undef;
+    }
+    my $res = eval {
+        my $r = vsock_requests($cp, $tf, $cf, @reqs);
+        if (!grep { $_->{code} != 401 } @$r) {
+            unlink $tf;
+            ($tf, $cf) = api_credentials($name, $cp);
+            $r = vsock_requests($cp, $tf, $cf, @reqs);
+        }
+        $r;
+    };
+    if (!$res) {
+        $VSOCK_SKIP{"vm:$cp->{vmid}"} = $now + $VSOCK_SKIP_SECONDS;
+        return undef;
+    }
+    if (my $err = api_failure(\@reqs, $res)) {
+        my $body = $res->[-1]{body};
+        my $why = ref $body eq 'HASH' ? ($body->{reason} // '') : '';
+        die "Error from server" . ($why ne '' ? " ($why)" : '') . ": $err";
+    }
+    if (my $path = $plan->{wait_gone}) {
+        for (1 .. 300) {
+            my $r = vsock_requests($cp, $tf, $cf,
+                { method => 'GET', path => $path });
+            last if $r->[0]{code} == 404;
+            sleep 1;
+        }
+    }
+    my $data = $res->[-1]{body};
+    $data = sort_items_by($data, $plan->{sort}) if $plan->{sort};
+    return { data => $data };
+}
+
+my sub kubectl_api_text {
+    my ($plan, $data) = @_;
+
+    my $out = $plan->{out} // 'json';
+    return '' if $out eq 'none';
+    return nodes_text($data) if $out eq 'nodes-text';
+    my $json = JSON::PP->new->canonical;
+    return $json->encode({ serverVersion => $data }) if $out eq 'version';
+    return $json->encode($data);
+}
+
 sub kubectl_on {
     my ($cp, $args) = @_;
 
+    if (my $plan = kubectl_api_plan($args)) {
+        my $r = kubectl_api_run($cp, $plan);
+        return kubectl_api_text($plan, $r->{data}) if $r;
+    }
     return guest_exec($cp->{vmid}, kubectl_cmd($args));
 }
 
@@ -3695,7 +4064,11 @@ my sub iso_epoch {
 my sub kubectl_json {
     my ($cp, $args) = @_;
 
-    my $out = kubectl_on($cp, "$args -o json");
+    if (my $plan = kubectl_api_plan("$args -o json")) {
+        my $r = kubectl_api_run($cp, $plan);
+        return $r->{data} if $r;
+    }
+    my $out = guest_exec($cp->{vmid}, kubectl_cmd("$args -o json"));
     my $start = index($out, '{');
     $out = substr($out, $start) if $start > 0;
     return JSON::PP->new->decode($out);
@@ -3707,185 +4080,6 @@ my sub kubectl_json {
 # invocation. The PVE host has no direct route to the
 # node subnet (SDN-isolated), so guest exec remains
 # the bridge - batching is the speed lever.
-# --- vsock API transport --------------------------------
-# CP VMs carry a virtio-vsock device (CID = VMID); the
-# guest proxies vsock:10244 to the apiserver. HTTPS over
-# that channel is ~70x faster than a guest-agent exec
-# and needs no IP route into the SDN zone. Credentials
-# are the pve-k8s-manager SA token + cluster CA, cached
-# on pmxcfs for 50 minutes (the token lives 1h). The
-# first token is minted by guest exec (kubeconfig_cluster);
-# after that the still-valid token renews itself through
-# a TokenRequest over vsock. Every caller falls back to
-# guest exec when vsock is not available (old nodes,
-# proxy unit missing).
-my $VSOCK_PORT = 10244;
-
-# Kubernetes identities (see below)
-our $USER_NS = 'pve-k8s-users';
-our $MANAGER_SA = 'pve-k8s-manager';
-our $USER_LABEL = 'pve-k8s.proxmox.com/user-sa';
-our $USER_ANNOTATION = 'pve-k8s.proxmox.com/user';
-our $DEFAULT_KUBECONFIG_MAX_HOURS = 24;
-my $API_TOKEN_REFRESH = 3000;   # renew after 50 min
-my $API_TOKEN_LIFE = 3600;
-
-my sub write_private {
-    my ($path, $data) = @_;
-
-    sysopen my $fh, "$path.tmp",
-        Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(),
-        0600 or die "credential cache: $!\n";
-    print $fh $data;
-    close $fh;
-    rename "$path.tmp", $path or die "credential cache rename: $!\n";
-}
-
-# One helper process on the host that has the VM's vsock (an ssh hop
-# when that is another host); returns its stdout.
-my sub vsock_run {
-    my ($cp, $tf, $cf, @args) = @_;
-
-    my $cid = $cp->{vmid};
-    if (!$cp->{pvehost} || $cp->{pvehost} eq local_node_name()) {
-        return run(['env', "PVE_K8S_TOKEN_FILE=$tf",
-            "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
-            '--cid', $cid, @args], timeout => 60);
-    }
-    return run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
-        "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
-        . "pve-k8s-vsock-get --cid $cid "
-        . join(' ', map { shq($_) } @args)], timeout => 60);
-}
-
-my sub vsock_requests {
-    my ($cp, $tf, $cf, @reqs) = @_;
-
-    my $plain = [ map { my %r = $_->%*; delete $r{ok}; \%r } @reqs ];
-    my $b64 = MIME::Base64::encode_base64(
-        JSON::PP->new->canonical->utf8->encode($plain), '');
-    my $out = vsock_run($cp, $tf, $cf, '--requests', $b64);
-    my $res = JSON::PP->new->utf8->decode($out);
-    die "vsock: expected " . scalar(@reqs) . " results\n"
-        if ref $res ne 'ARRAY' || @$res != @reqs;
-    return $res;
-}
-
-# Pure: a TokenRequest for one service account.
-sub token_request {
-    my ($ns, $sa, $seconds) = @_;
-
-    return {
-        method => 'POST', ok => [201],
-        path => "/api/v1/namespaces/$ns/serviceaccounts/$sa/token",
-        body => { apiVersion => 'authentication.k8s.io/v1',
-            kind => 'TokenRequest',
-            spec => { expirationSeconds => $seconds + 0 } },
-    };
-}
-
-# Pure: the first request whose answer is not one it accepts, as an
-# error message; undef when all went through.
-sub api_failure {
-    my ($reqs, $res) = @_;
-
-    for my $i (0 .. $#$reqs) {
-        my $r = $reqs->[$i];
-        my $code = ($res->[$i] // {})->{code} // 0;
-        next if grep { $_ == $code } ($r->{ok} // [200])->@*;
-        my $body = ($res->[$i] // {})->{body};
-        my $msg = ref $body eq 'HASH' ? ($body->{message} // '') : ($body // '');
-        return "$r->{method} $r->{path} returned $code"
-            . ($msg ne '' ? ": $msg" : '') . "\n";
-    }
-    return undef;
-}
-
-my sub renew_manager_token {
-    my ($name, $cp, $tf, $cf) = @_;
-
-    my $req = token_request('kube-system', $MANAGER_SA, $API_TOKEN_LIFE);
-    my $res = vsock_requests($cp, $tf, $cf, $req);
-    my $err = api_failure([$req], $res);
-    die $err if $err;
-    my $token = $res->[0]{body}{status}{token}
-        or die "token renewal returned no token\n";
-    write_private($tf, $token);
-}
-
-sub api_credentials {
-    my ($name, $cp) = @_;
-
-    my $tf = "/etc/pve/k8s/api-$name.token";
-    my $cf = "/etc/pve/k8s/api-$name.ca";
-    my @st = stat $tf;
-    my $age = @st ? time() - $st[9] : undef;
-    return ($tf, $cf)
-        if defined $age && $age < $API_TOKEN_REFRESH && -s $cf;
-    if ($cp && defined $age && $age < $API_TOKEN_LIFE - 60 && -s $cf) {
-        return ($tf, $cf)
-            if eval { renew_manager_token($name, $cp, $tf, $cf); 1 };
-    }
-    my $kc = kubeconfig_cluster($name)->{kubeconfig};
-    my ($token) = $kc =~ /token: (\S+)/;
-    my ($ca_b64) = $kc =~ /certificate-authority-data: (\S+)/;
-    die "could not parse issued kubeconfig for '$name'\n"
-        if !$token || !$ca_b64;
-    write_private($cf, MIME::Base64::decode_base64($ca_b64));
-    write_private($tf, $token);
-    return ($tf, $cf);
-}
-
-# Several API paths in one helper process (and at most one ssh hop):
-# returns one decoded body per path.
-sub k8s_api_get_many {
-    my ($name, $cp, @paths) = @_;
-
-    my ($tf, $cf) = api_credentials($name, $cp);
-    my $out = vsock_run($cp, $tf, $cf, map { ('--path', $_) } @paths);
-    my $data = JSON::PP->new->decode($out);
-    return @paths == 1 ? [$data] : $data;
-}
-
-# A rejected token (401: cluster recreated, token revoked) is dropped
-# so the next read mints a fresh one instead of failing for an hour.
-my sub k8s_api_get_many_retry {
-    my ($name, $cp, @paths) = @_;
-
-    my $res = eval { k8s_api_get_many($name, $cp, @paths) };
-    return $res if $res;
-    my $err = $@;
-    die $err if $err !~ /returned 401/;
-    unlink "/etc/pve/k8s/api-$name.token";
-    return k8s_api_get_many($name, $cp, @paths);
-}
-
-# Requests (reads or writes) over vsock, control planes on this host
-# first: one {code, body} per request, or undef when no control plane
-# answers that way (the caller then uses guest exec). Requests must be
-# safe to repeat (server-side apply, deletes, token requests): a
-# transport failure halfway moves on to the next control plane. A
-# rejected manager token (every answer 401, so nothing was applied)
-# is dropped and minted again once.
-sub k8s_api_fast {
-    my ($name, $nodes, @reqs) = @_;
-
-    for my $cp (cp_read_order($nodes, local_node_name())->@*) {
-        my $res = eval {
-            my ($tf, $cf) = api_credentials($name, $cp);
-            my $r = vsock_requests($cp, $tf, $cf, @reqs);
-            if (!grep { $_->{code} != 401 } @$r) {
-                unlink $tf;
-                ($tf, $cf) = api_credentials($name, $cp);
-                $r = vsock_requests($cp, $tf, $cf, @reqs);
-            }
-            $r;
-        };
-        return $res if $res;
-    }
-    return undef;
-}
-
 # Read several API paths the fast way: vsock, control planes on this
 # host first, no guest-exec probe. undef when no control plane answers
 # that way; the caller then falls back to a kubectl batch via ops_cp.
@@ -4234,6 +4428,7 @@ sub scale_reconcile {
         my ($ip) = ($item->{ip} // '') =~ /^(\d+\.\d+\.\d+\.\d+)$/;
         my $pool = $item->{pool} // 'default';
         push @nodes, {
+            cluster => $name,
             host => $host,
             role => $pool eq 'control-plane' ? 'cp' : 'worker',
             pool => $pool, idx => $idx // 1, ip => $ip,
@@ -4247,9 +4442,21 @@ sub scale_reconcile {
     }
 
     my ($cp) = grep { $_->{role} eq 'cp' } @nodes;
+    # vsock first (no guest exec spent on the probe), as in ops_cp
+    my $fast;
     for my $candidate (grep { $_->{role} eq 'cp' } @nodes) {
-        my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
-        if ($ok) { $cp = $candidate; last }
+        next if !eval { kubectl_api_run($candidate,
+            { reqs => [{ method => 'GET', path => '/version' }] }) };
+        $fast = $candidate;
+        last;
+    }
+    if ($fast) {
+        $cp = $fast;
+    } else {
+        for my $candidate (grep { $_->{role} eq 'cp' } @nodes) {
+            my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
+            if ($ok) { $cp = $candidate; last }
+        }
     }
     die "no control-plane node answers for '$name'\n" if !$cp;
 
@@ -5277,6 +5484,7 @@ my sub load_nodes {
         my ($ip) = ($item->{ip} // '') =~ /^(\d+\.\d+\.\d+\.\d+)$/;
         my $pool = $item->{pool} // 'default';
         push @nodes, {
+            cluster => $name,
             host => $host,
             role => $pool eq 'control-plane' ? 'cp' : 'worker',
             pool => $pool, idx => $idx // 1, ip => $ip,
@@ -5296,7 +5504,15 @@ my sub load_nodes {
 my sub ops_cp {
     my ($nodes) = @_;
 
-    for my $candidate (grep { $_->{role} eq 'cp' } $nodes->@*) {
+    my @cps = grep { $_->{role} eq 'cp' } $nodes->@*;
+    # an answering vsock proxy runs inside the guest: alive, and no
+    # guest exec (seconds) spent on the probe
+    for my $candidate (@cps) {
+        return $candidate if eval {
+            kubectl_api_run($candidate, { reqs => [{ method => 'GET',
+                path => '/version' }] }) };
+    }
+    for my $candidate (@cps) {
         my $ok = eval { guest_exec($candidate->{vmid}, 'true'); 1 } // 0;
         return $candidate if $ok;
     }
