@@ -67,4 +67,21 @@ my $scaler = do { local $/; <$sc> };
 like($scaler, qr/warm_read_caches\(\$name\)/, 'the timer keeps token and certificates warm');
 like($src, qr/\$now - \$st\[9\] > 2400/, 'the token is re-issued before readers would (50 min)');
 
+# Scale-in cooldown: minutes in the record, seconds for the scaler.
+my $sc = {};
+$apply->($sc, { 'scale-in-cooldown' => 30 });
+is($sc->{'scale-in-cooldown'}, 30, 'the scale-in cooldown is stored in minutes');
+is(PVE::K8s::Provision::scale_in_cooldown_seconds($sc), 1800, 'the scaler gets seconds');
+eval { $apply->($sc, { 'scale-in-cooldown' => 0 }) };
+like($@, qr/1\.\.1440 minutes/, 'a zero cooldown is refused');
+is($sc->{'scale-in-cooldown'}, 30, 'a refused value changes nothing');
+$apply->($sc, { delete => ['scale-in-cooldown'] });
+ok(!exists $sc->{'scale-in-cooldown'}, 'the cooldown can be cleared');
+is(PVE::K8s::Provision::scale_in_cooldown_seconds($sc), undef,
+    'unset: the scaler uses its own default');
+open my $pf, '<', 'PVE/K8s/Provision.pm' or die $!;
+my $prov = do { local $/; <$pf> };
+like($prov, qr/scale_in_allowed\(\s*\$sstate, \$now, scale_in_cooldown_seconds\(\$scfg\)\)/,
+    'the scaler pass uses the converted cooldown');
+
 done_testing;

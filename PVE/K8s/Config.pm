@@ -257,6 +257,14 @@ my $defaultData = {
             maximum => 100,
             optional => 1,
         },
+        'scale-in-cooldown' => {
+            type => 'integer',
+            description => "Minutes after any scale action before the "
+                . "scaler may remove a node (default 10).",
+            minimum => 1,
+            maximum => 1440,
+            optional => 1,
+        },
         state => {
             type => 'string',
             description => "Lifecycle state recorded by pve-k8sd.",
@@ -311,6 +319,7 @@ sub options {
         'sdn-vni' => { optional => 1 },
         'backup-dir' => { optional => 1 },
         'backup-retention' => { optional => 1 },
+        'scale-in-cooldown' => { optional => 1 },
         storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },

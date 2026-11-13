@@ -609,6 +609,14 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Etcd backups to keep.",
             },
+            'scale-in-cooldown' => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 1440,
+                optional => 1,
+                description => "Minutes after any scale action before "
+                    . "the scaler may remove a node (default 10).",
+            },
             'cp-policy' => {
                 type => 'string',
                 enum => ['ha', 'replace'],
@@ -631,7 +639,8 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "Comma-separated settings to clear: "
-                    . "maintenance-window, backup-retention, description.",
+                    . "maintenance-window, backup-retention, "
+                    . "scale-in-cooldown, description.",
             },
         },
     },
@@ -640,11 +649,12 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         die "nothing to update: pass maintenance-window, pools, "
-            . "backup-retention, description or delete\n"
+            . "backup-retention, scale-in-cooldown, description or delete\n"
             if !defined $param->{delete}
             && !defined $param->{'maintenance-window'}
             && !defined $param->{pools}
             && !defined $param->{'backup-retention'}
+            && !defined $param->{'scale-in-cooldown'}
             && !defined $param->{description}
             && !defined $param->{'cp-policy'}
             && !defined $param->{'storage-profile'};
@@ -653,6 +663,7 @@ __PACKAGE__->register_method({
             'maintenance-window' => $param->{'maintenance-window'},
             pools => $param->{pools},
             'backup-retention' => $param->{'backup-retention'},
+            'scale-in-cooldown' => $param->{'scale-in-cooldown'},
             description => $param->{description},
             'cp-policy' => $param->{'cp-policy'},
             'storage-profile' => $param->{'storage-profile'},

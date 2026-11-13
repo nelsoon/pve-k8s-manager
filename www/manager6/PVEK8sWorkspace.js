@@ -842,6 +842,21 @@ Ext.define('PVE.dc.K8sSettings', {
                     deleteEmpty: true, emptyText: gettext('default'),
                 }]),
             },
+            'scale-in-cooldown': {
+                header: gettext('Scale-in Cooldown'),
+                required: true,
+                defaultValue: '',
+                renderer: function(v) {
+                    return v ? Ext.String.format(gettext('{0} min'), v)
+                        : gettext('default') + ' (10 min)';
+                },
+                editor: edit(gettext('Scale-in Cooldown'), [{
+                    xtype: 'proxmoxintegerfield', name: 'scale-in-cooldown',
+                    fieldLabel: gettext('Minutes'), minValue: 1, maxValue: 1440,
+                    deleteEmpty: true, emptyText: '10',
+                }, hint(gettext('After any scale action, the scaler waits '
+                    + 'this long before it removes a node.'))]),
+            },
             'cp-policy': {
                 header: gettext('Control Plane Failure Policy'),
                 required: false,
@@ -886,7 +901,8 @@ Ext.define('PVE.dc.K8sSettings', {
             'cp-arch': readonly(gettext('Control Plane Architecture')),
         };
         let order = ['description', 'maintenance-window', 'backup-retention',
-            'cp-policy', 'storage-profile', 'k8s-version', 'state', 'cp',
+            'scale-in-cooldown', 'cp-policy', 'storage-profile',
+            'k8s-version', 'state', 'cp',
             'storage', 'node-subnet', 'public-subnet', 'sdn-zone',
             'template-rev', 'cp-arch'];
         me.sorterFn = function(a, b) {

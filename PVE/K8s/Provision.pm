@@ -3265,7 +3265,18 @@ sub assert_maintenance_window {
 # Update the mutable rollout options of a cluster (the S3
 # scenario narrows and opens the window around a roll).
 # Settings that may be cleared again (PVE `delete` semantics).
-our @CLEARABLE_OPTIONS = qw(maintenance-window backup-retention description);
+our @CLEARABLE_OPTIONS = qw(maintenance-window backup-retention
+    scale-in-cooldown description);
+
+# The record keeps the scale-in cooldown in minutes (what the API and
+# Settings show); the scaler wants seconds. Unset: the scaler default.
+sub scale_in_cooldown_seconds {
+    my ($scfg) = @_;
+
+    my $min = ($scfg // {})->{'scale-in-cooldown'};
+    return undef if !defined $min || "$min" !~ /^\d+$/ || $min < 1;
+    return $min * 60;
+}
 
 # Pure: apply validated option changes to one cluster record. Kept apart
 # from the locking and storing so the rules are testable.
@@ -3291,6 +3302,12 @@ sub apply_cluster_options {
         die "backup-retention must be 1..100\n"
             if "$ret" !~ /^\d+$/ || $ret < 1 || $ret > 100;
         $scfg->{'backup-retention'} = int $ret;
+    }
+    if (defined $opts->{'scale-in-cooldown'}) {
+        my $min = $opts->{'scale-in-cooldown'};
+        die "scale-in-cooldown must be 1..1440 minutes\n"
+            if "$min" !~ /^\d+$/ || $min < 1 || $min > 1440;
+        $scfg->{'scale-in-cooldown'} = int $min;
     }
     if (defined $opts->{description}) {
         $scfg->{description} = $opts->{description};
@@ -4484,7 +4501,7 @@ sub scale_reconcile {
         \@sim_nodes, 0.3);
     if ($candidates->@*
         && !PVE::K8s::Scaler::scale_in_allowed(
-            $sstate, $now, $scfg->{'scale-in-cooldown'})) {
+            $sstate, $now, scale_in_cooldown_seconds($scfg))) {
         print "scale: scale-in cooldown after the last scale action; "
             . "not removing nodes yet\n";
         $candidates = [];

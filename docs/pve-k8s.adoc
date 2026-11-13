@@ -379,7 +379,9 @@ enabled - or one pass on demand with the Scale button /
   under 30% CPU and memory, all its non-DaemonSet pods
   fit on the survivors in simulation (affinity, PDBs
   and topology included), the group stays above `min`,
-  and the node is over 30 minutes old. Removal drains
+  the node is over 30 minutes old, and no scale action
+  ran within the cooldown (10 minutes; Settings,
+  `scale-in-cooldown`, in minutes). Removal drains
   through the eviction API with a time box; a drain
   blocked by a PodDisruptionBudget uncordons the node
   and ends the pass - nodes are never force-drained
