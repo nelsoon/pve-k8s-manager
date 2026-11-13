@@ -67,6 +67,18 @@ backend accept exactly the add-on-tested minors. Newer
 minors are admitted only after add-on compatibility is
 proven; 1.37 is held for that reason.
 
+Each minor shows its upstream support window: the
+create dialog shows the end-of-life date, and the
+cluster Overview shows the running minor's status.
+That status is a warning once the minor is in upstream
+maintenance (critical fixes only, the last two months)
+and critical after its end of life. A minor past its end
+of life is refused for new clusters unless `--allow-eol 1`
+is passed. The upgrade check warns when the target is
+already in maintenance. The dates are recorded in
+`PVE::K8s::Config` (from kubernetes.io/releases) and
+updated with each release.
+
 === Provision
 
 `pvesh create /cluster/k8s/c1/provision` (or the

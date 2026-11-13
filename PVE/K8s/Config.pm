@@ -494,16 +494,62 @@ sub supported_versions {
     return [@SUPPORTED_VERSIONS];
 }
 
+# Upstream support dates per minor (kubernetes.io/releases): patch
+# releases until 'maintenance' (critical fixes only after), none
+# after 'eol'. Update with each new minor; tests/unit/
+# supported-versions.t requires dates for every supported minor.
+our %VERSION_DATES = (
+    '1.35' => { maintenance => '2026-12-28', eol => '2027-02-28' },
+    '1.36' => { maintenance => '2027-04-28', eol => '2027-06-28' },
+    '1.37' => { maintenance => '2027-08-28', eol => '2027-10-28' },
+);
+
+my sub ymd_epoch {
+    my ($ymd) = @_;
+
+    my ($y, $m, $d) = $ymd =~ /^(\d{4})-(\d\d)-(\d\d)$/ or return undef;
+    require Time::Local;
+    return Time::Local::timegm(0, 0, 0, $d, $m - 1, $y);
+}
+
+# Pure: where a version stands in its upstream support window.
+# status: supported | maintenance (patches for critical issues only,
+# plan the upgrade) | eol | unknown (no dates recorded).
+sub version_support {
+    my ($version, $now) = @_;
+
+    $now //= time();
+    my ($minor) = ($version // '') =~ /^v?(\d+\.\d+)/;
+    my $d = defined $minor ? $VERSION_DATES{$minor} : undef;
+    return { minor => $minor, status => 'unknown' } if !$d;
+    my $eol = ymd_epoch($d->{eol});
+    my $status = $now >= $eol ? 'eol'
+        : $now >= ymd_epoch($d->{maintenance}) ? 'maintenance' : 'supported';
+    return { minor => $minor, status => $status,
+        maintenance => $d->{maintenance}, eol => $d->{eol},
+        days => int(($eol - $now) / 86400) };
+}
+
 sub latest_supported_version {
     return $SUPPORTED_VERSIONS[-1];
 }
 
+# A minor this release can create. A listed minor past its upstream
+# end of life is refused too, unless allow_eol (an explicit choice:
+# no more patches, upgrade right after).
 sub assert_supported_version {
-    my ($version) = @_;
+    my ($version, %o) = @_;
 
     my ($minor) = ($version // '') =~ /^(\d+\.\d+)(?:\.\d+)?$/;
     die "invalid Kubernetes version '$version'\n" if !defined $minor;
-    return $minor if grep { $_ eq $minor } @SUPPORTED_VERSIONS;
+    if (grep { $_ eq $minor } @SUPPORTED_VERSIONS) {
+        my $vs = version_support($minor, $o{now});
+        die "Kubernetes $minor reached its upstream end of life on "
+            . "$vs->{eol} (no more security patches); choose a newer "
+            . "version, or allow end-of-life versions explicitly\n"
+            if $vs->{status} eq 'eol' && !$o{allow_eol};
+        return $minor;
+    }
     die "Kubernetes $minor is not supported for new clusters "
         . "(end of life, or add-on testing still pending); "
         . "supported versions: " . join(', ', @SUPPORTED_VERSIONS) . "\n";

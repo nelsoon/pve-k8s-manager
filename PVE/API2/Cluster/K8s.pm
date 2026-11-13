@@ -132,6 +132,13 @@ __PACKAGE__->register_method({
                 description => "Kubernetes version, e.g. '1.36'. "
                     . "Default: the newest supported minor.",
             },
+            'allow-eol' => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => "Create on a supported minor that is past "
+                    . "its upstream end of life (no more security patches).",
+            },
             cp => {
                 type => 'integer',
                 minimum => 1,
@@ -273,7 +280,8 @@ __PACKAGE__->register_method({
         # new clusters only on upstream-supported minors
         $param->{'k8s-version'} //=
             PVE::K8s::Config::latest_supported_version();
-        PVE::K8s::Config::assert_supported_version($param->{'k8s-version'});
+        PVE::K8s::Config::assert_supported_version($param->{'k8s-version'},
+            allow_eol => delete $param->{'allow-eol'});
         # Node networking needs no decision: first free
         # /24 in 10.10.0.0/16 unless the caller pins one.
         # (The dialog shows the same suggestion, computed

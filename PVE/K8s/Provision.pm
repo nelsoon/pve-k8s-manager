@@ -8102,6 +8102,8 @@ sub summary_cluster {
             cluster_action_record($name)),
         'storage-profile' => $scfg->{'storage-profile'},
         'cp-policy' => $scfg->{'cp-policy'} // 'replace',
+        'version-support' => PVE::K8s::Config::version_support(
+            $scfg->{'k8s-version'}),
     };
 
     my $live = eval {
@@ -8782,7 +8784,13 @@ sub upgrade_check {
         $e =~ s/\s+$//;
         $add->('supported', 'block', $e);
     } else {
-        $add->('supported', 'ok', "Kubernetes $to is supported");
+        my $vs = PVE::K8s::Config::version_support($to);
+        $vs->{status} eq 'maintenance'
+            ? $add->('supported', 'warn', "Kubernetes $to is in upstream "
+                . "maintenance (critical fixes only) and reaches end of "
+                . "life on $vs->{eol}")
+            : $add->('supported', 'ok', "Kubernetes $to is supported"
+                . ($vs->{eol} ? " (upstream until $vs->{eol})" : ''));
     }
     ($scfg->{state} // '') eq 'ready'
         ? $add->('cluster-state', 'ok', 'cluster is ready')

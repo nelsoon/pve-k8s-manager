@@ -24,6 +24,9 @@ Ext.define('PVE.dc.K8sCreateWindow', {
     // Minors this release can create. Kept in step with
     // PVE::K8s::Config::supported_versions by tests/unit/ui-k8s.t.
     supportedVersions: ['1.35', '1.36'],
+    // Upstream end of life per minor, kept in step with
+    // PVE::K8s::Config %VERSION_DATES by tests/unit/supported-versions.t.
+    versionEol: { '1.35': '2027-02-28', '1.36': '2027-06-28', '1.37': '2027-10-28' },
     // Backend defaults, only used for the summary line.
     defaultControlPlane: 3,
     defaultWorkers: 2,
@@ -245,7 +248,25 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     value: latest,
                     editable: false,
                     allowBlank: false,
-                    listeners: { change: function() { updateSummary(); } },
+                    listeners: {
+                        change: function(f, v) {
+                            let eol = me.versionEol[v];
+                            get('k8s-support').setValue(eol
+                                ? Ext.String.format(gettext('Upstream support until {0}'), eol)
+                                : '');
+                            updateSummary();
+                        },
+                    },
+                },
+                {
+                    xtype: 'displayfield',
+                    name: 'k8s-support',
+                    submitValue: false,
+                    fieldLabel: gettext('Support'),
+                    value: me.versionEol[latest]
+                        ? Ext.String.format(gettext('Upstream support until {0}'),
+                            me.versionEol[latest])
+                        : '',
                 },
                 {
                     xtype: 'combobox',
@@ -1679,6 +1700,25 @@ Ext.define('PVE.dc.K8sView', {
                     healthInfo.setValue('<i class="' + icon
                         + '"></i> ' + Ext.htmlEncode(
                             String(s.health || 'unknown')));
+                    // upstream support window of the running minor
+                    let vs = s['version-support'] || {};
+                    let ver = Ext.htmlEncode(String(s['k8s-version']
+                        || rec['k8s-version'] || ''));
+                    if (vs.status === 'eol') {
+                        versionInfo.setValue('<i class="fa fa-times critical"></i> '
+                            + ver + ' - ' + Ext.String.format(gettext(
+                                'end of life since {0}, no security patches: upgrade'),
+                                Ext.htmlEncode(vs.eol)));
+                    } else if (vs.status === 'maintenance') {
+                        versionInfo.setValue('<i class="fa fa-exclamation-triangle warning"></i> '
+                            + ver + ' - ' + Ext.String.format(gettext(
+                                'critical fixes only, end of life {0} ({1} days): plan the upgrade'),
+                                Ext.htmlEncode(vs.eol), vs.days));
+                    } else if (vs.status === 'supported') {
+                        versionInfo.setValue(ver + ' - ' + Ext.String.format(
+                            gettext('upstream support until {0}'),
+                            Ext.htmlEncode(vs.eol)));
+                    }
                     // Datacenter-Health idiom: every
                     // check carries its own status icon
                     let checkIcon = function(ok, warn) {
