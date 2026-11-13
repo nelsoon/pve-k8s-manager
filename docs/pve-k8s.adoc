@@ -392,57 +392,73 @@ replaces anything itself.
 
 == Add-ons
 
+pve-k8s manages its add-ons from one catalog
+(`PVE::K8s::Addons`): each has a tier, the version this
+release pins (per Kubernetes minor where needed), and
+where its running version is read in the cluster.
+
 |===
-| Add-on | Default | Notes
+| Add-on | Tier | Notes
 
-| Cilium (CNI, ingress, Gateway API)
-| installed with the cluster
-| not removable; provides the default ingress class
+| cilium (with gateway-api CRDs)
+| core
+| CNI, LoadBalancer IPs, ingress and Gateway; the
+  Gateway API CRDs update with it
 
-| Proxmox cloud-controller-manager
-| installed
-| labels nodes with zone/region from the fabric,
-  sets providerIDs
+| proxmox-ccm
+| core
+| labels nodes with zone/region, sets providerIDs
 
-| Proxmox CSI
-| installed
+| proxmox-csi
+| core
 | shared-block + local-block classes (above)
 
+| shared-file
+| storage
+| NFS or CephFS driver, when the cluster has a file tier
+
+| metrics-server
+| default
+| installed by provision, can be turned off; feeds the
+  pod CPU/memory section of the Metrics panel
+  (`--kubelet-insecure-tls` for the lab PKI)
+
 | cert-manager
-| deployed *unconfigured*
+| optional
 | enable with an issuer: the built-in CA (`ca`,
   default) or ACME (`acme`, with account email and
   directory URL)
 
 | external-dns
-| deployed *unconfigured*
+| optional
 | enable with the PowerDNS provider (`pdns`), API URL,
-  key and zone
-
-| metrics-server
-| opt-in
-| enable/disable in Add-ons; feeds the pod CPU/memory
-  section of the Metrics panel (0.9.1,
-  `--kubelet-insecure-tls` for the lab PKI)
+  key and zone; the key is kept only in the in-cluster
+  Secret
 |===
 
-Enable/disable over the API:
+The Add-ons panel shows each add-on's status, the
+version running in the cluster and the version pve-k8s
+pins. When they differ, *Update* re-applies that add-on
+at the pinned version with its stored settings, and
+*Update All* does so for every add-on that is behind,
+core add-ons first (a failing core add-on stops the
+run). A Kubernetes upgrade does the same for the target
+minor before it rolls any node, so an add-on the new
+minor needs (Cilium 1.21 for 1.37) is in place first; the
+upgrade check lists those updates.
 
 [source,sh]
 ----
+pvesh get /cluster/k8s/c1/addons
+pvesh create /cluster/k8s/c1/addons/cilium/update
+pvesh create /cluster/k8s/c1/addon-updates
 pvesh create /cluster/k8s/c1/addons/cert-manager/enable \
-    --issuer acme --acme-email ops@example.com
+    --issuer acme --email ops@example.com
 pvesh create /cluster/k8s/c1/addons/external-dns/enable \
     --provider pdns --pdns-url http://dns.example:8081 \
-    --pdns-key SECRET --zone example.com
-pvesh create /cluster/k8s/c1/addons/metrics-server/enable
+    --pdns-api-key SECRET --zone example.com
 pvesh create /cluster/k8s/c1/addons/metrics-server/disable
 ----
-
-"Unconfigured" is deliberate: the add-ons that need
-site-specific configuration are present and visible in
-the Add-ons panel with their state, but do nothing
-until the user supplies that configuration.
 
 == Metrics and observability
 
@@ -600,6 +616,8 @@ privilege).
 | GET | `.../addons` | add-on states
 | POST | `.../addons/{addon}/enable` | cert-manager, external-dns, metrics-server
 | POST | `.../addons/{addon}/disable` | metrics-server
+| POST | `.../addons/{addon}/update` | re-apply one add-on at its pinned version
+| POST | `.../addon-updates` | update every add-on that is behind
 | POST | `.../nodes/{node}/drain` | drain a node
 | POST | `.../nodes/{node}/replace` | replace a node
 | POST | `.../nodes/{node}/force-retire` | retire a dead node

@@ -2409,6 +2409,85 @@ sub install_file_tier {
         . "class shared-file, fs $fs)\n";
 }
 
+# Proxmox CCM: scoped token in, providerIDs out. Idempotent: provision
+# runs it on every converge, the add-on manager to update it.
+sub install_ccm {
+    my ($name, $scfg, $cp, $nodes, $total, %o) = @_;
+
+    $total //= scalar $nodes->@*;
+    my ($prefix) = ($scfg->{'node-subnet'} // '') =~ m|^(\d+\.\d+\.\d+)\.0/24$|;
+    my $gateway = $scfg->{gateway} // "$prefix.1";
+    my ($token_id, $token_secret) = ensure_ccm_credentials($name);
+    my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
+        pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
+        $token_id, $token_secret, pve_cluster_region());
+    # Nodes that predate the external kubelet flag never got the
+    # uninitialized taint that makes the CCM initialise them
+    # (providerID, addresses, taint removal); add it explicitly.
+    # An add-on update skips this: those nodes are initialised.
+    for my $node ($o{update} ? () : $nodes->@*) {
+        eval {
+            guest_exec($cp->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes '
+                . "$node->{host} node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule "
+                . '--overwrite');
+        };
+    }
+    guest_exec($cp->{vmid}, PVE::K8s::Addons::ccm_apply_cmd(
+        '/etc/kubernetes/admin.conf', $ccm_config));
+    my $identified = 0;
+    for my $try (1 .. 40) {
+        my $out = eval {
+            guest_exec($cp->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
+                . 'get nodes -o jsonpath=\'{range .items[*]}{.spec.providerID}{"\n"}{end}\'');
+        } // '';
+        my @ids = grep { /^proxmox:\/\// } split /\n/, $out;
+        $identified = scalar @ids;
+        last if $identified >= $total;
+        print "waiting for CCM providerIDs: "
+            . "$identified/$total\n" if $try % 4 == 1;
+        sleep 15;
+    }
+    die "CCM set providerID on only $identified/$total nodes\n"
+        if $identified < $total;
+    print "CCM initialised $identified/$total nodes\n";
+
+    return 1;
+}
+
+# Proxmox CSI: shared-block (default) + local-block classes. Idempotent.
+sub install_proxmox_csi {
+    my ($name, $scfg, $cp) = @_;
+
+    my ($prefix) = ($scfg->{'node-subnet'} // '') =~ m|^(\d+\.\d+\.\d+)\.0/24$|;
+    my $gateway = $scfg->{gateway} // "$prefix.1";
+    my $storage = $scfg->{storage} // 'local-zfs';
+    my ($csi_token_id, $csi_secret) = ensure_csi_credentials($name);
+    my $csi_values = PVE::K8s::Addons::csi_values_yaml(
+        pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
+        $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
+    guest_exec($cp->{vmid}, PVE::K8s::Addons::csi_install_cmd(
+        '/etc/kubernetes/admin.conf', $csi_values));
+    my $csi_ok = 0;
+    for (1 .. 20) {
+        $csi_ok = eval {
+            my $out = guest_exec($cp->{vmid},
+                'kubectl --kubeconfig /etc/kubernetes/admin.conf get csidriver '
+                . 'csi.proxmox.sinextra.dev -o name; '
+                . 'kubectl --kubeconfig /etc/kubernetes/admin.conf get sc '
+                . '-o name');
+            $out =~ /csidriver/ && $out =~ /shared-block/ && $out =~ /local-block/;
+        } // 0;
+        last if $csi_ok;
+        sleep 15;
+    }
+    die "Proxmox CSI did not come up (driver or storage classes missing)\n"
+        if !$csi_ok;
+    print "Proxmox CSI installed (shared-block default, local-block)\n";
+    return 1;
+}
+
 sub provision_cluster {
     my ($name) = @_;
 
@@ -2848,65 +2927,8 @@ sub provision_cluster {
         eval { ensure_vsock_proxy($node) };
     }
 
-    # --- Proxmox CCM: scoped token in, providerIDs out
-    my ($token_id, $token_secret) = ensure_ccm_credentials($name);
-    my $ccm_config = PVE::K8s::Addons::ccm_config_yaml(
-        pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
-        $token_id, $token_secret, pve_cluster_region());
-    # Nodes that predate the external kubelet flag never got the
-    # uninitialized taint that makes the CCM initialise them
-    # (providerID, addresses, taint removal); add it explicitly.
-    for my $node (@nodes) {
-        eval {
-            guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf taint nodes '
-                . "$node->{host} node.cloudprovider.kubernetes.io/uninitialized=true:NoSchedule "
-                . '--overwrite');
-        };
-    }
-    guest_exec($cp1->{vmid}, PVE::K8s::Addons::ccm_apply_cmd(
-        '/etc/kubernetes/admin.conf', $ccm_config));
-    my $identified = 0;
-    for my $try (1 .. 40) {
-        my $out = eval {
-            guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf '
-                . 'get nodes -o jsonpath=\'{range .items[*]}{.spec.providerID}{"\n"}{end}\'');
-        } // '';
-        my @ids = grep { /^proxmox:\/\// } split /\n/, $out;
-        $identified = scalar @ids;
-        last if $identified >= $total;
-        print "waiting for CCM providerIDs: "
-            . "$identified/$total\n" if $try % 4 == 1;
-        sleep 15;
-    }
-    die "CCM set providerID on only $identified/$total nodes\n"
-        if $identified < $total;
-    print "CCM initialised $identified/$total nodes\n";
-
-    # --- Proxmox CSI: shared-block (default) + local-block classes
-    my ($csi_token_id, $csi_secret) = ensure_csi_credentials($name);
-    my $csi_values = PVE::K8s::Addons::csi_values_yaml(
-        pve_api_url($gateway, $scfg->{'sdn-zone'} ? 1 : 0),
-        $csi_token_id, $csi_secret, pve_cluster_region(), $storage);
-    guest_exec($cp1->{vmid}, PVE::K8s::Addons::csi_install_cmd(
-        '/etc/kubernetes/admin.conf', $csi_values));
-    my $csi_ok = 0;
-    for (1 .. 20) {
-        $csi_ok = eval {
-            my $out = guest_exec($cp1->{vmid},
-                'kubectl --kubeconfig /etc/kubernetes/admin.conf get csidriver '
-                . 'csi.proxmox.sinextra.dev -o name; '
-                . 'kubectl --kubeconfig /etc/kubernetes/admin.conf get sc '
-                . '-o name');
-            $out =~ /csidriver/ && $out =~ /shared-block/ && $out =~ /local-block/;
-        } // 0;
-        last if $csi_ok;
-        sleep 15;
-    }
-    die "Proxmox CSI did not come up (driver or storage classes missing)\n"
-        if !$csi_ok;
-    print "Proxmox CSI installed (shared-block default, local-block)\n";
+    install_ccm($name, $scfg, $cp1, \@nodes, $total);
+    install_proxmox_csi($name, $scfg, $cp1);
 
     # Record whether the cluster storage is shared across
     # hosts: on node-local storage, shared-block volumes
@@ -3700,6 +3722,12 @@ sub kubectl_api_plan {
     return $get->('/api/v1/persistentvolumes') if $args eq 'get pv -o json';
     return $get->('/apis/storage.k8s.io/v1/volumeattachments')
         if $args eq 'get volumeattachments -o json';
+    return $get->('/apis/apps/v1/deployments') if $args eq 'get deployments -A -o json';
+    return $get->('/apis/apps/v1/daemonsets') if $args eq 'get daemonsets -A -o json';
+    return $get->("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/$1")
+        if $args =~ /^get crd ($DNS) -o json$/;
+    return $get->("/apis/apps/v1/namespaces/$1/daemonsets/$2")
+        if $args =~ /^-n ($DNS) get daemonset ($DNS) -o json$/;
     return { %{ $get->('/api/v1/events') }, sort => 'lastTimestamp' }
         if $args eq 'get events -A --sort-by=.lastTimestamp -o json';
     return $get->("/api/v1/persistentvolumes/$1")
@@ -7148,87 +7176,175 @@ sub addons_state {
     return $state // {};
 }
 
+# The Cilium version running in a cluster, from its DaemonSet.
+my sub cilium_running {
+    my ($cp) = @_;
+
+    return PVE::K8s::Addons::cilium_running_version(
+        kubectl_json($cp, '-n kube-system get daemonset cilium'));
+}
+
+# Running add-on versions, read from the cluster (one vsock call
+# each, guest exec fallback); undef when the cluster cannot be read.
+sub addons_live {
+    my ($name, $scfg, $nodes) = @_;
+
+    return eval {
+        my $cp = ops_cp($nodes);
+        my $crd = eval { kubectl_json($cp,
+            'get crd httproutes.gateway.networking.k8s.io') };
+        PVE::K8s::Addons::probe_versions({
+            deployment => kubectl_json($cp, 'get deployments -A'),
+            daemonset => kubectl_json($cp, 'get daemonsets -A'),
+            crd => { items => [$crd ? $crd : ()] },
+        }, $scfg->{'file-backend'});
+    };
+}
+
 sub list_addons {
     my ($name) = @_;
 
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
-    my $state = addons_state($scfg);
-
-    my @addons = ({
-        name => 'cilium-ingress',
-        status => ($scfg->{state} // '') eq 'ready'
-            ? 'installed' : 'pending',
-        mustdeploy => 0,
-        summary => 'Cilium ingress controller + Gateway API '
-            . '(part of the Cilium install)',
-    });
-    if (my $backend = $scfg->{'file-backend'}) {
+    my $live = ($scfg->{state} // '') eq 'ready'
+        ? addons_live($name, $scfg, load_nodes($name, $scfg)) : undef;
+    my $rows = PVE::K8s::Addons::addon_rows($scfg->{'k8s-version'},
+        addons_state($scfg), $live, $scfg->{'file-backend'});
+    for my $r ($rows->@*) {
+        next if $r->{name} ne 'shared-file';
         my $fstate = eval {
-            JSON::PP->new->decode($scfg->{'file-state'} // '')
-        } // {};
-        my $where = $backend eq 'nfs'
+            JSON::PP->new->decode($scfg->{'file-state'} // '') } // {};
+        my $where = ($scfg->{'file-backend'} // '') eq 'nfs'
             ? "$scfg->{'file-server'}:$scfg->{'file-share'}"
             : "CephFS " . ($scfg->{'file-share'} // '?');
-        my $cap = $fstate->{capacity}
-            ? sprintf('%.1f GiB total, %.1f GiB free',
-                $fstate->{capacity} / 1024**3,
-                ($fstate->{free} // 0) / 1024**3)
-            : 'capacity not probed';
-        push @addons, {
-            name => 'shared-file',
-            status => $fstate->{ok} ? 'installed' : 'unconfigured',
-            mustdeploy => 0,
-            summary => "RWX file storage (class shared-file) "
-                . "via $backend on $where; probe: $cap",
-            ($fstate->{ok} ? (config => $fstate) : ()),
-        };
+        $r->{detail} = $fstate->{capacity}
+            ? sprintf('%s: %.1f GiB total, %.1f GiB free', $where,
+                $fstate->{capacity} / 1024**3, ($fstate->{free} // 0) / 1024**3)
+            : $where;
     }
-    for my $addon (
-        ['cert-manager', 'TLS certificates (internal CA by '
-            . 'default, ACME optional)'],
-        ['external-dns', 'Publishes Ingress/Gateway hostnames '
-            . 'to a DNS provider (PowerDNS)'],
-    ) {
-        my ($addon_name, $summary) = @$addon;
-        my $conf = $state->{$addon_name};
-        push @addons, {
-            name => $addon_name,
-            status => $conf ? 'configured' : 'unconfigured',
-            mustdeploy => 1,
-            summary => $summary,
-            ($conf ? (config => $conf) : ()),
-        };
+    return $rows;
+}
+
+# Re-apply one add-on at the version pve-k8s pins for $o{minor}
+# (default: the cluster's minor), with its stored settings. Entries
+# installed together (gateway-api with cilium) update as one.
+sub update_addon {
+    my ($name, $addon, %o) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "cluster '$name' is not ready\n"
+        if ($scfg->{state} // '') ne 'ready' && !$o{during_upgrade};
+    my $e = PVE::K8s::Addons::catalog_entry($addon)
+        or die "unknown add-on '$addon'\n";
+    $addon = $e->{via} if $e->{via};
+    my $minor = $o{minor} // $scfg->{'k8s-version'};
+    my $nodes = $o{nodes} // load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    my $kc = '/etc/kubernetes/admin.conf';
+    my $rec = addons_state($scfg)->{$addon};
+    my $want = PVE::K8s::Addons::addon_version_for($addon, $minor,
+        $scfg->{'file-backend'});
+
+    if ($addon eq 'cilium') {
+        my $have = eval { cilium_running($cp) };
+        PVE::K8s::Addons::cilium_step($have, $want);
+        guest_exec($cp->{vmid}, PVE::K8s::Addons::cilium_install_cmd(
+            $kc, PVE::K8s::Config::vip_for($scfg), $minor));
+    } elsif ($addon eq 'proxmox-ccm') {
+        install_ccm($name, $scfg, $cp, $nodes, undef, update => 1);
+    } elsif ($addon eq 'proxmox-csi') {
+        install_proxmox_csi($name, $scfg, $cp);
+    } elsif ($addon eq 'shared-file') {
+        die "cluster '$name' has no shared-file storage\n"
+            if !$scfg->{'file-backend'};
+        install_file_tier($name, $scfg, $cp, $nodes);
+    } elsif ($addon eq 'metrics-server') {
+        die "metrics-server is turned off on '$name'\n"
+            if $rec && $rec->{disabled};
+        guest_exec($cp->{vmid},
+            PVE::K8s::Addons::metrics_server_install_cmd($kc));
+    } elsif ($addon eq 'cert-manager') {
+        die "cert-manager is not enabled on '$name'\n" if !$rec;
+        guest_exec($cp->{vmid}, PVE::K8s::Addons::certmanager_install_cmd(
+            $kc, PVE::K8s::Addons::certmanager_issuer_yaml($rec)));
+    } elsif ($addon eq 'external-dns') {
+        die "external-dns is not enabled on '$name'\n" if !$rec;
+        # the API key stays in the in-cluster Secret
+        guest_exec($cp->{vmid}, PVE::K8s::Addons::external_dns_install_cmd(
+            $kc, PVE::K8s::Addons::external_dns_values_yaml($name, $rec), undef));
+    } else {
+        die "add-on '$addon' has no update path\n";
     }
-    {
-        my $conf = $state->{'metrics-server'};
-        push @addons, {
-            name => 'metrics-server',
-            status => !$conf ? 'unconfigured'
-                : $conf->{disabled} ? 'disabled' : 'configured',
-            mustdeploy => 0,
-            summary => 'Pod/node CPU+memory metrics '
-                . '(kubectl top; feeds the Metrics panel)',
-            ($conf ? (config => $conf) : ()),
-        };
+    record_addon($name, $addon, { version => $want });
+    print "$addon is at $want on cluster '$name'\n";
+    return $want;
+}
+
+# Merge fields into an add-on's record (cluster config, under lock).
+sub record_addon {
+    my ($name, $addon, $fields) = @_;
+
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        my $state = addons_state($locked->{ids}->{$name});
+        $state->{$addon} = { %{ $state->{$addon} // {} }, %$fields };
+        $locked->{ids}->{$name}->{addons} =
+            JSON::PP->new->canonical->encode($state);
+        PVE::K8s::Config::store_config($locked);
+    });
+}
+
+# Pure: which add-ons to update, in catalog order: installed entries
+# whose running version differs from the pin for $minor (entries
+# that share one command once).
+sub addons_to_update {
+    my ($rows) = @_;
+
+    my (%seen, @out);
+    for my $r ($rows->@*) {
+        next if $r->{status} ne 'installed' || !$r->{update};
+        my $e = PVE::K8s::Addons::catalog_entry($r->{name});
+        my $key = $e->{via} // $r->{name};
+        next if $seen{$key}++;
+        push @out, { name => $key, from => $r->{installed}, to => $r->{pinned},
+            core => $e->{tier} eq 'core' ? 1 : 0 };
     }
-    for my $addon (
-        ['cilium-mesh', 'Cilium service mesh features (mTLS, '
-            . 'L7 policy, Hubble)'],
-        ['prometheus', 'Prometheus/Grafana monitoring stack'],
-        ['velero', 'Application-level backup to object '
-            . 'storage'],
-    ) {
-        my ($addon_name, $summary) = @$addon;
-        push @addons, {
-            name => $addon_name,
-            status => 'available',
-            mustdeploy => 0,
-            summary => $summary,
-        };
+    return \@out;
+}
+
+# Update every installed add-on that is behind its pin for $o{minor}.
+# A core add-on that fails stops (nothing else is touched after it);
+# the others warn and the rest continue.
+sub update_addons {
+    my ($name, %o) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $minor = $o{minor} // $scfg->{'k8s-version'};
+    my $live = addons_live($name, $scfg, $nodes)
+        or die "cannot read the add-ons running on '$name'\n";
+    my $todo = addons_to_update(PVE::K8s::Addons::addon_rows($minor,
+        addons_state($scfg), $live, $scfg->{'file-backend'}));
+    if (!$todo->@*) {
+        print "all add-ons on '$name' are at their pinned versions\n";
+        return [];
     }
-    return \@addons;
+    my @failed;
+    for my $t ($todo->@*) {
+        print "updating $t->{name} $t->{from} -> $t->{to}\n";
+        eval { update_addon($name, $t->{name}, minor => $minor,
+            nodes => $nodes, during_upgrade => $o{during_upgrade}) };
+        next if !$@;
+        die "core add-on $t->{name} failed to update: $@" if $t->{core};
+        print "warning: $t->{name} failed to update: $@";
+        push @failed, $t->{name};
+    }
+    return \@failed;
 }
 
 sub enable_addon {
@@ -7254,6 +7370,8 @@ sub enable_addon {
         %record = (
             issuer => $opts->{issuer} // 'ca',
             ($opts->{email} ? (email => $opts->{email}) : ()),
+            ($opts->{'acme-server'}
+                ? ('acme-server' => $opts->{'acme-server'}) : ()),
         );
         print "cert-manager enabled on cluster '$name' "
             . "with issuer '$record{issuer}'\n";
@@ -7289,7 +7407,9 @@ sub enable_addon {
     PVE::K8s::Config::lock_config(sub {
         my $locked = PVE::K8s::Config->config();
         my $state = addons_state($locked->{ids}->{$name});
-        $state->{$addon} = \%record;
+        $state->{$addon} = { %record, version =>
+            PVE::K8s::Addons::addon_version_for($addon,
+                $locked->{ids}->{$name}->{'k8s-version'}) };
         $locked->{ids}->{$name}->{addons} =
             JSON::PP->new->canonical->encode($state);
         PVE::K8s::Config::store_config($locked);
@@ -8439,14 +8559,6 @@ sub build_template {
     return $found;
 }
 
-# The Cilium version running in a cluster, from its DaemonSet.
-my sub cilium_running {
-    my ($cp) = @_;
-
-    return PVE::K8s::Addons::cilium_running_version(
-        kubectl_json($cp, '-n kube-system get daemonset cilium'));
-}
-
 sub upgrade_cluster {
     my ($name, $target, %opts) = @_;
 
@@ -8466,17 +8578,11 @@ sub upgrade_cluster {
     die "no template k8s-node-$to-r* found on any host; "
         . "build one first (images/)\n"
         if !defined $upgrade_tpl;
-    # Cilium first: the target minor may need a newer one (1.37
-    # needs 1.21), which still runs on the current minor.
-    my $nodes = load_nodes($name, $scfg);
-    my $cp = ops_cp($nodes);
-    my $have = cilium_running($cp);
-    my $want = PVE::K8s::Addons::cilium_version_for($to);
-    if (PVE::K8s::Addons::cilium_step($have, $want) eq 'upgrade') {
-        print "upgrading Cilium $have -> $want before Kubernetes $to\n";
-        guest_exec($cp->{vmid}, PVE::K8s::Addons::cilium_install_cmd(
-            '/etc/kubernetes/admin.conf', PVE::K8s::Config::vip_for($scfg), $to));
-    }
+    # Add-ons first, at their pins for the target minor: the target
+    # may need newer ones (1.37 needs Cilium 1.21), which still run
+    # on the current minor. A core add-on failure stops here, before
+    # any node is rolled.
+    update_addons($name, minor => $to);
     return roll_cluster($name, target_version => $to, force => $opts{force});
 }
 
@@ -8868,19 +8974,24 @@ sub upgrade_check {
                 . 'disruptions left can stall node drains: '
                 . join(', ', @blocked))
             : $add->('pdb', 'ok', 'no PodDisruptionBudget blocks eviction');
-        my $have = cilium_running($cp);
-        my $want = PVE::K8s::Addons::cilium_version_for($to);
-        my $step = eval { PVE::K8s::Addons::cilium_step($have, $want) };
-        if (my $e = $@) {
-            $e =~ s/\s+$//;
-            $add->('cilium', 'block', $e);
-        } elsif ($step eq 'upgrade') {
-            $add->('cilium', 'ok', "Cilium $have -> $want is upgraded "
-                . "first (Kubernetes $to needs it)");
+        # add-ons are updated to their pins for $to before the roll
+        my $alive = addons_live($name, $scfg, $nodes);
+        if (!$alive) {
+            $add->('addons', 'warn', 'could not read the running add-ons');
         } else {
-            $add->('cilium', defined $have ? 'ok' : 'warn', defined $have
-                ? "Cilium $have already fits Kubernetes $to"
-                : 'could not read the running Cilium version');
+            my $todo = addons_to_update(PVE::K8s::Addons::addon_rows($to,
+                addons_state($scfg), $alive, $scfg->{'file-backend'}));
+            my ($cil) = grep { $_->{name} eq 'cilium' } $todo->@*;
+            if ($cil && !eval { PVE::K8s::Addons::cilium_step(
+                    $cil->{from}, $cil->{to}); 1 }) {
+                (my $e = $@) =~ s/\s+$//;
+                $add->('addons', 'block', $e);
+            } else {
+                $add->('addons', 'ok', $todo->@*
+                    ? 'updated first: ' . join(', ', map {
+                        "$_->{name} $_->{from} -> $_->{to}" } $todo->@*)
+                    : "all add-ons are at their pins for Kubernetes $to");
+            }
         }
         my $m = guest_exec($cp->{vmid},
             'kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw '

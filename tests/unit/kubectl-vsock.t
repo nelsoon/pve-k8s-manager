@@ -26,6 +26,13 @@ is($path->('get pvc -n web data-0 -o json'),
 is($path->('get pods -n web -o json'), '/api/v1/namespaces/web/pods', 'pods of a namespace');
 is($path->('get volumeattachments -o json'), '/apis/storage.k8s.io/v1/volumeattachments',
     'volume attachments');
+is($path->('get deployments -A -o json'), '/apis/apps/v1/deployments', 'all Deployments');
+is($path->('get daemonsets -A -o json'), '/apis/apps/v1/daemonsets', 'all DaemonSets');
+is($path->('get crd httproutes.gateway.networking.k8s.io -o json'),
+    '/apis/apiextensions.k8s.io/v1/customresourcedefinitions/httproutes.gateway.networking.k8s.io',
+    'one CRD');
+is($path->('-n kube-system get daemonset cilium -o json'),
+    '/apis/apps/v1/namespaces/kube-system/daemonsets/cilium', 'one DaemonSet');
 my $ev = $plan->('get events -A --sort-by=.lastTimestamp -o json');
 is($ev->{reqs}[0]{path}, '/api/v1/events', 'events');
 is($ev->{sort}, 'lastTimestamp', 'sorted like --sort-by');

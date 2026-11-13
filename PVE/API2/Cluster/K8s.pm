@@ -5,6 +5,7 @@ package PVE::API2::Cluster::K8s;
 use strict;
 use warnings;
 
+use PVE::K8s::Addons;
 use PVE::K8s::Config;
 use PVE::K8s::Provision;
 use PVE::RPCEnvironment;
@@ -1353,10 +1354,10 @@ __PACKAGE__->register_method({
     name => 'addons',
     path => '{name}/addons',
     method => 'GET',
-    description => "List add-ons for a cluster: Cilium "
-        . "ingress/Gateway (installed), cert-manager and "
-        . "external-dns (unconfigured until enabled), and "
-        . "catalog entries available for later.",
+    description => "List the add-ons pve-k8s manages on a cluster: "
+        . "tier (core, default, optional, storage), status, the running "
+        . "version (read from the cluster), the version pve-k8s pins, "
+        . "and whether an update is available.",
     permissions => {
         check => ['perm', '/cluster', ['Sys.Audit']],
     },
@@ -1459,6 +1460,65 @@ __PACKAGE__->register_method({
             $param->{name}, "addon-enable:$addon", sub {
                 PVE::K8s::Provision::enable_addon(
                     $param->{name}, $addon, \%opts);
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'addon_update',
+    path => '{name}/addons/{addon}/update',
+    method => 'POST',
+    protected => 1,
+    description => "Update one add-on to the version pve-k8s pins, with "
+        . "its stored settings (gateway-api updates with cilium).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => $cluster_name,
+            addon => {
+                type => 'string',
+                pattern => '^[a-z][a-z0-9-]{1,40}$',
+                description => "The add-on to update (see the add-on list).",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+        die "unknown add-on '$param->{addon}'\n"
+            if !PVE::K8s::Addons::catalog_entry($param->{addon});
+        return fork_cluster_worker('k8saddonupdate',
+            $param->{name}, "addon-update:$param->{addon}", sub {
+                PVE::K8s::Provision::update_addon(
+                    $param->{name}, $param->{addon});
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'addons_update',
+    path => '{name}/addon-updates',
+    method => 'POST',
+    protected => 1,
+    description => "Update every installed add-on that is behind the "
+        . "version pve-k8s pins (core add-ons first; a failing core "
+        . "add-on stops the run).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { name => $cluster_name },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+        return fork_cluster_worker('k8saddonsupdate',
+            $param->{name}, 'addon-update:all', sub {
+                my $failed = PVE::K8s::Provision::update_addons($param->{name});
+                die "add-ons not updated: " . join(', ', $failed->@*) . "\n"
+                    if $failed->@*;
             });
     }});
 

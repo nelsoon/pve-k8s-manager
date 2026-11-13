@@ -536,17 +536,21 @@ EOF
 sub external_dns_install_cmd {
     my ($kubeconfig, $values_yaml, $api_key) = @_;
 
-    $api_key =~ /\A[A-Za-z0-9._~+\/=-]+\z/
-        or die "invalid PowerDNS api key characters\n";
-    my @args = (helm_ensure_cmd(), $kubeconfig, $api_key,
+    # no key: an update, the Secret made at enable time stays
+    my $secret = '';
+    if (defined $api_key) {
+        $api_key =~ /\A[A-Za-z0-9._~+\/=-]+\z/
+            or die "invalid PowerDNS api key characters\n";
+        $secret = "kubectl -n external-dns create secret generic external-dns-pdns \\\n"
+            . "    --from-literal=api-key=$api_key --dry-run=client -o yaml | kubectl apply -f -\n";
+    }
+    my @args = (helm_ensure_cmd(), $kubeconfig, $secret,
         $values_yaml, $EXTDNS_CHART_VERSION);
     return sprintf(<<'EOF', @args);
 %s
 export KUBECONFIG=%s
 kubectl create namespace external-dns --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n external-dns create secret generic external-dns-pdns \
-    --from-literal=api-key=%s --dry-run=client -o yaml | kubectl apply -f -
-cat > /root/external-dns-values.yaml <<'VALUES'
+%scat > /root/external-dns-values.yaml <<'VALUES'
 %sVALUES
 helm repo add external-dns https://kubernetes-sigs.github.io/external-dns/ >/dev/null 2>&1 || true
 helm repo update external-dns >/dev/null
@@ -584,6 +588,190 @@ curl -fsSL $MS > /root/ms.yaml
 sed -i 's|--kubelet-use-node-status-port|&\n        - --kubelet-insecure-tls|' /root/ms.yaml
 kubectl delete -f /root/ms.yaml --ignore-not-found
 EOF
+}
+
+# --- Add-on manager catalog ----------------------------------
+# One entry per add-on pve-k8s manages. The manager (list,
+# update, upgrade step) is driven by this table only:
+#   tier     core (every cluster, no disable) | default (installed
+#            by provision unless turned off) | optional (enabled
+#            on request) | storage (follows the cluster's file tier)
+#   version  the pinned version, or a code ref ($minor) for pins
+#            that depend on the Kubernetes minor
+#   probe    where the running version is read: a workload image
+#            tag, or a CRD annotation
+#   via      updated together with another entry (one command)
+#   options  settings an enable/configure call takes; 'secret'
+#            ones are never stored on pmxcfs. Generic for now: a
+#            dedicated configuration panel can be added per add-on
+#            later without changing the manager.
+our @CATALOG = (
+    { name => 'cilium', tier => 'core',
+      title => 'Cilium (network, load balancer IPs, ingress, Gateway)',
+      version => sub { cilium_version_for($_[0]) },
+      probe => { kind => 'daemonset', ns => 'kube-system',
+          name => 'cilium', image => 'cilium' } },
+    { name => 'gateway-api', tier => 'core', via => 'cilium',
+      title => 'Gateway API CRDs (experimental channel)',
+      version => sub { $GATEWAY_API_VERSION },
+      probe => { kind => 'crd', name => 'httproutes.gateway.networking.k8s.io',
+          annotation => 'gateway.networking.k8s.io/bundle-version' } },
+    { name => 'proxmox-ccm', tier => 'core',
+      title => 'Proxmox cloud controller (node identity and topology)',
+      version => sub { $CCM_VERSION },
+      probe => { kind => 'deployment', ns => 'kube-system',
+          name => 'proxmox-cloud-controller-manager' } },
+    { name => 'proxmox-csi', tier => 'core',
+      title => 'Proxmox CSI (shared-block and local-block volumes)',
+      version => sub { $CSI_VERSION },
+      probe => { kind => 'deployment', ns => 'csi-proxmox',
+          name => 'proxmox-csi-plugin-controller', image => 'proxmox-csi-controller' } },
+    { name => 'shared-file', tier => 'storage',
+      title => 'Shared file volumes (class shared-file, NFS or CephFS)',
+      version => sub { $_[1] && $_[1] eq 'cephfs' ? $CEPH_CSI_VERSION : $NFS_CSI_VERSION },
+      probe => sub {
+          $_[0] && $_[0] eq 'cephfs'
+              ? { kind => 'deployment', ns => 'kube-system',
+                  name => 'ceph-csi-cephfs-provisioner', image => 'cephcsi' }
+              : { kind => 'deployment', ns => 'kube-system',
+                  name => 'csi-nfs-controller', image => 'nfsplugin' } } },
+    { name => 'metrics-server', tier => 'default',
+      title => 'Pod and node CPU/memory metrics (kubectl top, Metrics tab)',
+      version => sub { $METRICS_SERVER_VERSION },
+      probe => { kind => 'deployment', ns => 'kube-system',
+          name => 'metrics-server' } },
+    { name => 'cert-manager', tier => 'optional',
+      title => 'TLS certificates (internal CA by default, ACME optional)',
+      version => sub { $CERTMANAGER_VERSION },
+      probe => { kind => 'deployment', ns => 'cert-manager',
+          name => 'cert-manager', image => 'cert-manager-controller' },
+      options => [
+          { name => 'issuer', type => 'enum', values => ['ca', 'acme'], default => 'ca' },
+          { name => 'email', type => 'string' },
+          { name => 'acme-server', type => 'string' },
+      ] },
+    { name => 'external-dns', tier => 'optional',
+      title => 'Publishes Ingress/Gateway hostnames to DNS (PowerDNS)',
+      version => sub { $EXTDNS_VERSION },
+      probe => { kind => 'deployment', ns => 'external-dns',
+          name => 'external-dns' },
+      options => [
+          { name => 'provider', type => 'enum', values => ['pdns'], default => 'pdns' },
+          { name => 'pdns-url', type => 'string', required => 1 },
+          { name => 'pdns-api-key', type => 'string', required => 1, secret => 1 },
+          { name => 'zone', type => 'string', required => 1 },
+      ] },
+);
+
+# Update order: what others depend on first.
+sub catalog { return @CATALOG }
+
+sub catalog_entry {
+    my ($name) = @_;
+
+    my ($e) = grep { $_->{name} eq ($name // '') } @CATALOG;
+    return $e;
+}
+
+# The version pve-k8s pins for an add-on on Kubernetes $minor
+# ($backend: the cluster's file backend, for shared-file).
+sub addon_version_for {
+    my ($name, $minor, $backend) = @_;
+
+    my $e = catalog_entry($name) or return undef;
+    return $e->{version}->($minor, $backend);
+}
+
+# Pure: "1.20.4" from an image reference
+# (registry/path/name:v1.20.4@sha256:...), optionally only when the
+# image name matches.
+sub image_version {
+    my ($image, $want) = @_;
+
+    my ($path, $tag) = ($image // '') =~ m{^([^@]+?):([^:/@]+)(?:@.*)?$}
+        or return undef;
+    if (defined $want) {
+        my ($base) = $path =~ m{([^/]+)$};
+        return undef if ($base // '') ne $want && ($base // '') ne "$want-ci";
+    }
+    my ($v) = $tag =~ /^v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/;
+    return $v;
+}
+
+# Pure: running versions of every catalog entry, from the cluster's
+# Deployments, DaemonSets and CRDs (lists as the API returns them).
+# Missing workloads are absent from the result (not installed).
+sub probe_versions {
+    my ($lists, $backend) = @_;
+
+    my %idx;
+    for my $kind (qw(deployment daemonset crd)) {
+        for my $o ((($lists->{$kind} // {})->{items} // [])->@*) {
+            my $m = $o->{metadata} // {};
+            $idx{$kind}{($m->{namespace} // '') . '/' . ($m->{name} // '')} = $o;
+        }
+    }
+    my %v;
+    for my $e (@CATALOG) {
+        my $p = ref $e->{probe} eq 'CODE' ? $e->{probe}->($backend) : $e->{probe};
+        my $o = $idx{$p->{kind}}{($p->{ns} // '') . '/' . $p->{name}} or next;
+        my $ver;
+        if ($p->{kind} eq 'crd') {
+            ($ver) = ((($o->{metadata} // {})->{annotations} // {})
+                ->{$p->{annotation}} // '') =~ /^v?(\d+\.\d+\.\d+)/;
+        } else {
+            my $want = $p->{image} // $p->{name};
+            for my $c (((((($o->{spec} // {})->{template} // {})->{spec} // {})
+                    ->{containers}) // [])->@*) {
+                $ver = image_version($c->{image}, $want) and last;
+            }
+        }
+        $v{$e->{name}} = $ver // 'unknown';
+    }
+    return \%v;
+}
+
+# Pure: the manager's rows. $state: the cluster's add-on records;
+# $live: probe_versions() or undef when the cluster could not be
+# read; $file_backend: the cluster's shared-file backend, if any.
+sub addon_rows {
+    my ($minor, $state, $live, $file_backend) = @_;
+
+    my @rows;
+    for my $e (@CATALOG) {
+        my $n = $e->{name};
+        next if $e->{tier} eq 'storage' && !$file_backend;
+        my $rec = ($state // {})->{$n};
+        my $pinned = $e->{version}->($minor, $file_backend);
+        my $installed = $live ? $live->{$n} : undef;
+        my $status;
+        if (!$live) {
+            $status = 'unknown';
+        } elsif (defined $installed) {
+            $status = 'installed';
+        } elsif ($rec && $rec->{disabled}) {
+            $status = 'disabled';
+        } elsif ($e->{tier} eq 'optional') {
+            $status = 'available';
+        } else {
+            $status = 'missing';
+        }
+        my $update = $status eq 'installed' && $installed ne 'unknown'
+            && $installed ne $pinned ? 1 : 0;
+        push @rows, {
+            name => $n,
+            title => $e->{title},
+            tier => $e->{tier},
+            status => $status,
+            ($e->{via} ? (via => $e->{via}) : ()),
+            pinned => $pinned,
+            (defined $installed ? (installed => $installed) : ()),
+            update => $update,
+            configurable => $e->{options} ? 1 : 0,
+            ($rec && !$rec->{disabled} ? (config => $rec) : ()),
+        };
+    }
+    return \@rows;
 }
 
 1;

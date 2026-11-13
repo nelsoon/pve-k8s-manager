@@ -2465,18 +2465,20 @@ Ext.define('PVE.dc.K8sView', {
         };
 
         let addonsPanel = function(name) {
+            // Add-on manager: every add-on pve-k8s manages, with the
+            // running version (read from the cluster) next to the
+            // version this pve-k8s release pins.
             let store = Ext.create('Ext.data.Store', {
-                fields: ['name', 'status', 'mustdeploy', 'summary'],
+                fields: ['name', 'title', 'tier', 'status', 'installed',
+                    'pinned', 'update', 'via', 'configurable', 'detail'],
                 proxy: {
                     type: 'proxmox',
                     url: '/api2/json/cluster/k8s/' + name + '/addons',
                 },
                 autoLoad: true,
             });
-            // add-ons that need answers first get a stock Edit window;
-            // the others are enabled directly
-            let configurable = { 'cert-manager': 1, 'external-dns': 1 };
-            let enableable = Ext.apply({ 'metrics-server': 1 }, configurable);
+            let reload = function() { store.load(); };
+            let done = function(r) { task(r.result.data); reload(); };
             let asm = Ext.create('Ext.selection.RowModel', {});
             let enableBtn = {
                 xtype: 'proxmoxButton',
@@ -2484,16 +2486,23 @@ Ext.define('PVE.dc.K8sView', {
                 iconCls: 'fa fa-fw fa-play',
                 disabled: true,
                 selModel: asm,
-                enableFn: function(rec) { return !!enableable[rec.data.name]; },
+                enableFn: function(rec) {
+                    let d = rec.data;
+                    return (d.tier === 'optional' && d.status === 'available')
+                        || (d.tier === 'default'
+                            && (d.status === 'disabled' || d.status === 'missing'));
+                },
                 handler: function(btn, event, rec) {
                     let addon = rec.data.name;
-                    if (configurable[addon]) {
+                    // add-ons that need answers get their own window
+                    // (a dedicated configuration panel can replace it)
+                    if (rec.data.configurable) {
                         Ext.create('PVE.dc.K8sAddonWindow', {
                             autoShow: true,
                             clusterName: name,
                             addon: addon,
                             apiCallDone: function(ok) {
-                                if (ok) { store.load(); }
+                                if (ok) { reload(); }
                             },
                         });
                         return;
@@ -2501,9 +2510,7 @@ Ext.define('PVE.dc.K8sView', {
                     api({
                         url: '/cluster/k8s/' + name + '/addons/' + addon + '/enable',
                         method: 'POST',
-                        success: function(r) {
-                            task(r.result.data); store.load();
-                        },
+                        success: done,
                     });
                 },
             };
@@ -2515,7 +2522,7 @@ Ext.define('PVE.dc.K8sView', {
                 selModel: asm,
                 enableFn: function(rec) {
                     return rec.data.name === 'metrics-server'
-                        && rec.data.status === 'configured';
+                        && rec.data.status === 'installed';
                 },
                 confirmMsg: function(rec) {
                     return Ext.String.format(gettext('Disable {0}?'),
@@ -2526,29 +2533,99 @@ Ext.define('PVE.dc.K8sView', {
                         url: '/cluster/k8s/' + name + '/addons/'
                             + rec.data.name + '/disable',
                         method: 'POST',
-                        success: function(r) {
-                            task(r.result.data); store.load();
-                        },
+                        success: done,
                     });
                 },
+            };
+            let updateBtn = {
+                xtype: 'proxmoxButton',
+                text: gettext('Update'),
+                iconCls: 'fa fa-fw fa-arrow-circle-up',
+                disabled: true,
+                selModel: asm,
+                enableFn: function(rec) { return !!rec.data.update; },
+                confirmMsg: function(rec) {
+                    return Ext.String.format(gettext('Update {0} from {1} to {2}?'),
+                        Ext.htmlEncode(rec.data.via || rec.data.name),
+                        Ext.htmlEncode(rec.data.installed),
+                        Ext.htmlEncode(rec.data.pinned));
+                },
+                handler: function(btn, event, rec) {
+                    api({
+                        url: '/cluster/k8s/' + name + '/addons/'
+                            + rec.data.name + '/update',
+                        method: 'POST',
+                        success: done,
+                    });
+                },
+            };
+            let updateAllBtn = Ext.create('Ext.button.Button', {
+                text: gettext('Update All'),
+                iconCls: 'fa fa-fw fa-arrow-circle-o-up',
+                disabled: true,
+                handler: function() {
+                    Ext.Msg.confirm(gettext('Update All'),
+                        gettext('Update every add-on that is behind its '
+                            + 'pinned version (core add-ons first)?'),
+                        function(answer) {
+                            if (answer !== 'yes') { return; }
+                            api({
+                                url: '/cluster/k8s/' + name + '/addon-updates',
+                                method: 'POST',
+                                success: done,
+                            });
+                        });
+                },
+            });
+            store.on('load', function() {
+                updateAllBtn.setDisabled(!store.findRecord('update', 1));
+            });
+            let tierText = {
+                core: gettext('Core'),
+                'default': gettext('Default'),
+                optional: gettext('Optional'),
+                storage: gettext('Storage'),
             };
             let g = Ext.create('Ext.grid.Panel', {
                 header: false,
                 border: false,
                 store: store,
                 selModel: asm,
-                tbar: [enableBtn, disableBtn],
+                tbar: [enableBtn, disableBtn, '-', updateBtn, updateAllBtn,
+                    '->', {
+                        text: gettext('Reload'),
+                        iconCls: 'fa fa-fw fa-refresh',
+                        k8sReadOnly: true,
+                        handler: reload,
+                    }],
                 columns: [
-                    { text: gettext('Add-on'), dataIndex: 'name', width: 160 },
-                    { text: gettext('Status'), dataIndex: 'status', width: 130 },
+                    { text: gettext('Add-on'), dataIndex: 'name', width: 150 },
                     {
-                        text: gettext('Recommended'),
-                        dataIndex: 'mustdeploy', width: 120,
-                        renderer: function(v) {
-                            return v ? gettext('Yes') : '';
+                        text: gettext('Tier'), dataIndex: 'tier', width: 90,
+                        renderer: function(v) { return tierText[v] || Ext.htmlEncode(v); },
+                    },
+                    { text: gettext('Status'), dataIndex: 'status', width: 100 },
+                    {
+                        text: gettext('Installed'), dataIndex: 'installed', width: 130,
+                        renderer: function(v, meta, rec) {
+                            if (!v) { return ''; }
+                            return rec.data.update
+                                ? '<i class="fa fa-arrow-circle-up warning"></i> '
+                                    + Ext.htmlEncode(v)
+                                : Ext.htmlEncode(v);
                         },
                     },
-                    { text: gettext('Description'), dataIndex: 'summary', flex: 1 },
+                    { text: gettext('Pinned'), dataIndex: 'pinned', width: 130 },
+                    {
+                        text: gettext('Description'), dataIndex: 'title', flex: 1,
+                        renderer: function(v, meta, rec) {
+                            let t = Ext.htmlEncode(v || '');
+                            if (rec.data.detail) {
+                                t += ' (' + Ext.htmlEncode(rec.data.detail) + ')';
+                            }
+                            return t;
+                        },
+                    },
                 ],
             });
             return g;

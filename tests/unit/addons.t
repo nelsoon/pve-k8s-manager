@@ -7,6 +7,7 @@ use warnings;
 use Test::More;
 
 use PVE::K8s::Addons;
+require PVE::K8s::Provision;
 
 # --- cert-manager issuers
 my $ca = PVE::K8s::Addons::certmanager_issuer_yaml({});
@@ -207,5 +208,92 @@ like($api, qr/assert_network_config/,
     like($cmd, qr{gateway-api/releases/download/v1\.6\.3/experimental-install\.yaml},
         'Gateway API v1.6.3 (what Cilium documents)');
 }
+
+# Add-on manager: catalog, running versions, rows, update plan.
+{
+    my $A = 'PVE::K8s::Addons';
+    my $iv = $A->can('image_version');
+    is($iv->('quay.io/cilium/cilium:v1.20.4@sha256:abc', 'cilium'), '1.20.4', 'tag with digest');
+    is($iv->('registry.k8s.io/metrics-server/metrics-server:v0.9.1'), '0.9.1', 'plain tag');
+    is($iv->('quay.io/cilium/cilium-ci:v1.21.0-pre.4', 'cilium'), '1.21.0-pre.4', '-ci image, pre-release');
+    is($iv->('quay.io/cilium/operator-generic:v1.20.4', 'cilium'), undef, 'another image name');
+    is($iv->('registry:5000/x/y:latest'), undef, 'no version tag');
+    is($iv->('busybox'), undef, 'no tag at all');
+
+    my $dep = sub { my ($ns, $n, @img) = @_;
+        { metadata => { namespace => $ns, name => $n },
+          spec => { template => { spec => { containers => [map { { image => $_ } } @img] } } } } };
+    my $lists = {
+        daemonset => { items => [$dep->('kube-system', 'cilium', 'quay.io/cilium/cilium:v1.20.3@sha256:1')] },
+        deployment => { items => [
+            $dep->('kube-system', 'proxmox-cloud-controller-manager',
+                'ghcr.io/sergelogvinov/proxmox-cloud-controller-manager:v0.16.1'),
+            $dep->('csi-proxmox', 'proxmox-csi-plugin-controller',
+                'registry.k8s.io/sig-storage/csi-attacher:v4.8.0',
+                'ghcr.io/sergelogvinov/proxmox-csi-controller:v0.20.0'),
+            $dep->('kube-system', 'metrics-server', 'registry.k8s.io/metrics-server/metrics-server:v0.9.1'),
+            $dep->('kube-system', 'csi-nfs-controller', 'registry.k8s.io/sig-storage/nfsplugin:v4.13.6'),
+            $dep->('cert-manager', 'cert-manager', 'quay.io/jetstack/cert-manager-controller:weird'),
+        ] },
+        crd => { items => [{ metadata => { namespace => undef,
+            name => 'httproutes.gateway.networking.k8s.io',
+            annotations => { 'gateway.networking.k8s.io/bundle-version' => 'v1.5.1' } } }] },
+    };
+    my $live = $A->can('probe_versions')->($lists, 'nfs');
+    is($live->{cilium}, '1.20.3', 'cilium from its DaemonSet');
+    is($live->{'gateway-api'}, '1.5.1', 'Gateway API from the CRD bundle annotation');
+    is($live->{'proxmox-csi'}, '0.20.0', 'the matching container, not a sidecar');
+    is($live->{'shared-file'}, '4.13.6', 'NFS driver for an nfs file tier');
+    is($live->{'cert-manager'}, 'unknown', 'present but unreadable tag: unknown');
+    ok(!exists $live->{'external-dns'}, 'absent: not installed');
+    is($A->can('probe_versions')->($lists, 'cephfs')->{'shared-file'}, undef,
+        'CephFS tier looks for the CephFS driver');
+
+    my $rows = $A->can('addon_rows')->('1.36',
+        { 'cert-manager' => { issuer => 'ca' } }, $live, 'nfs');
+    my %r = map { $_->{name} => $_ } $rows->@*;
+    is($r{cilium}{update}, 1, 'cilium behind its pin: update');
+    is($r{'metrics-server'}{update}, 0, 'at its pin: no update');
+    is($r{'cert-manager'}{update}, 0, 'unknown running version: no blind update');
+    is($r{'external-dns'}{status}, 'available', 'optional, not installed: available');
+    is($r{'proxmox-ccm'}{status}, 'installed', 'core installed');
+    ok($r{'external-dns'}{configurable}, 'add-ons with settings are configurable');
+    is($r{'cert-manager'}{config}{issuer}, 'ca', 'stored settings shown');
+    is($A->can('addon_rows')->('1.36', {}, $live, undef)->[4]{name}, 'metrics-server',
+        'no file tier: no shared-file row');
+    is($A->can('addon_rows')->('1.37', {}, $live, 'nfs')->[0]{pinned}, '1.21.0-pre.4',
+        'pins follow the Kubernetes minor');
+    is($A->can('addon_rows')->('1.36', { 'metrics-server' => { disabled => 1 } },
+        { cilium => '1.20.4' }, undef)->[4]{status}, 'disabled', 'turned off stays off');
+    is($A->can('addon_rows')->('1.36', {}, undef, undef)->[0]{status}, 'unknown',
+        'cluster not readable: unknown, no update offered');
+
+    my $todo = PVE::K8s::Provision::addons_to_update(
+        $A->can('addon_rows')->('1.36', {}, $live, 'nfs'));
+    is_deeply([map { $_->{name} } $todo->@*], ['cilium', 'proxmox-csi'],
+        'update plan: behind entries, catalog order (cilium first)');
+    ok($todo->[0]{core}, 'cilium is core');
+    my $todo37 = PVE::K8s::Provision::addons_to_update(
+        $A->can('addon_rows')->('1.36', {}, { %$live, cilium => '1.20.4' }, 'nfs'));
+    is_deeply([map { $_->{name} } $todo37->@*], ['cilium', 'proxmox-csi'],
+        'gateway-api behind is updated through cilium, once');
+
+    my @names = map { $_->{name} } $A->can('catalog')->();
+    is($names[0], 'cilium', 'cilium updates first');
+    for my $e ($A->can('catalog')->()) {
+        ok(defined $e->{version}->('1.36', 'nfs'), "$e->{name} has a pin");
+        ok($e->{probe}, "$e->{name} has a probe");
+    }
+}
+
+$prov = do { local $/; open my $fh, "<", "PVE/K8s/Provision.pm" or die; <$fh> };
+like($prov, qr/update_addons\(\$name, minor => \$to\);\n\s+return roll_cluster\(/,
+    'an upgrade updates add-ons before the roll');
+like($prov, qr/for my \$node \(\$o\{update\} \? \(\) : \$nodes->\@\*\)/,
+    'an add-on update does not re-taint initialised nodes');
+like($api, qr/path => '\{name\}\/addons\/\{addon\}\/update',[\s\S]*?Sys\.Modify/,
+    'per add-on update needs Sys.Modify');
+like($api, qr/path => '\{name\}\/addon-updates',[\s\S]*?Sys\.Modify/,
+    'update all needs Sys.Modify');
 
 done_testing();
