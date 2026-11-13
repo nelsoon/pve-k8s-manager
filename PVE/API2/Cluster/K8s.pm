@@ -8,6 +8,7 @@ use warnings;
 use PVE::K8s::Config;
 use PVE::K8s::Provision;
 use PVE::RPCEnvironment;
+use PVE::Tools;
 
 use base qw(PVE::RESTHandler);
 
@@ -724,6 +725,96 @@ __PACKAGE__->register_method({
         my $admin = $rpcenv->check($user, '/cluster', ['Sys.Modify'], 1);
         return PVE::K8s::Provision::user_kubeconfig($param->{name},
             $user, $admin ? 1 : 0, $param->{hours});
+    }});
+
+my $cluster_name = {
+    type => 'string',
+    format => 'pve-configid',
+    description => "The name of the Kubernetes cluster.",
+};
+
+__PACKAGE__->register_method({
+    name => 'auto_kubeconfig',
+    path => '{name}/kubeconfig',
+    method => 'POST',
+    protected => 1,
+    description => "Create an auto-refresh kubeconfig for the calling "
+        . "user: it holds the user's API token k8s-<cluster> (created, or "
+        . "given a new secret, which stops the previous such kubeconfig), "
+        . "and kubectl trades it for 1h Kubernetes tokens through "
+        . "pve-k8s-auth.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => $cluster_name,
+            url => {
+                type => 'string',
+                maxLength => 256,
+                description => "The Proxmox VE address pve-k8s-auth "
+                    . "calls, e.g. https://pve.example.com:8006.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $user = $rpcenv->get_user();
+        my $admin = $rpcenv->check($user, '/cluster', ['Sys.Modify'], 1);
+        return PVE::K8s::Provision::auto_kubeconfig($param->{name},
+            $user, $admin ? 1 : 0, $param->{url});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'credential',
+    path => '{name}/credential',
+    method => 'GET',
+    protected => 1,
+    description => "A 1h Kubernetes token for the calling user or API "
+        . "token (what pve-k8s-auth asks for): cluster-admin with "
+        . "Sys.Modify, read-only (view) with Sys.Audit.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { name => $cluster_name },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $user = $rpcenv->get_user();
+        my $admin = $rpcenv->check($user, '/cluster', ['Sys.Modify'], 1);
+        return PVE::K8s::Provision::user_credential($param->{name},
+            $user, $admin ? 1 : 0);
+    }});
+
+__PACKAGE__->register_method({
+    name => 'auth_helper',
+    path => '{name}/auth-helper',
+    method => 'GET',
+    description => "The pve-k8s-auth program (Python 3) that "
+        . "auto-refresh kubeconfigs run, for download.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { name => $cluster_name },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        return {
+            filename => 'pve-k8s-auth',
+            content => PVE::Tools::file_get_contents(
+                '/usr/sbin/pve-k8s-auth'),
+        };
     }});
 
 __PACKAGE__->register_method({

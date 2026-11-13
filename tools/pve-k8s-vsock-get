@@ -6,27 +6,43 @@
 # needed - vsock is a hypervisor channel.
 #
 # Usage: pve-k8s-vsock-get --cid <vmid> --path /api/v1/nodes
+#        pve-k8s-vsock-get --cid <vmid> --requests <base64 JSON>
 # Env:   PVE_K8S_TOKEN_FILE  bearer token file
 #        PVE_K8S_CA_FILE     cluster CA PEM file
-# Prints the response body on stdout; dies on any
+# --path: GETs; prints the response body, dies on any
 # transport or non-200 failure.
+# --requests: a JSON array of {method, path, body, type},
+# sent in order; prints a JSON array of {code, body} (body
+# decoded when it is JSON). HTTP errors are results, not
+# failures: only the transport dies.
 use strict;
 use warnings;
 
+use JSON::PP ();
+use MIME::Base64 ();
 use Net::SSLeay ();
 use Socket qw(SOCK_STREAM);
 
-my ($cid, @paths);
+my ($cid, @paths, $requests);
 while (@ARGV) {
     my $arg = shift @ARGV;
     if ($arg eq '--cid') { $cid = shift @ARGV }
     elsif ($arg eq '--path') { push @paths, shift @ARGV }
+    elsif ($arg eq '--requests') {
+        $requests = JSON::PP->new->utf8->decode(
+            MIME::Base64::decode_base64(shift(@ARGV) // ''));
+    }
     else { die "unknown argument $arg\n" }
 }
-# Several --path: one process (and one ssh hop for the caller), one
-# connection per path; the output is then a JSON array of the bodies.
+my @reqs = $requests ? $requests->@*
+    : map { { method => 'GET', path => $_ } } @paths;
+# Several requests: one process (and one ssh hop for the caller), one
+# connection each; the output is then a JSON array.
 die "usage: pve-k8s-vsock-get --cid <id> --path </api/...> [--path ...]\n"
-    if !$cid || $cid !~ /^\d+$/ || !@paths || grep { !m|^/api| } @paths;
+    . "       pve-k8s-vsock-get --cid <id> --requests <base64 JSON>\n"
+    if !$cid || $cid !~ /^\d+$/ || !@reqs
+        || grep { ($_->{path} // '') !~ m|^/api|
+            || ($_->{method} // '') !~ /^(GET|POST|PUT|PATCH|DELETE)$/ } @reqs;
 my $token_file = $ENV{PVE_K8S_TOKEN_FILE}
     or die "PVE_K8S_TOKEN_FILE not set\n";
 my $ca_file = $ENV{PVE_K8S_CA_FILE}
@@ -42,8 +58,8 @@ die "empty token\n" if !$token;
 
 # sockaddr_vm: family(2) reserved(2) port(4) cid(4)
 # flags(1) zero(3); AF_VSOCK is family 40 on Linux.
-sub fetch {
-    my ($path) = @_;
+sub request {
+    my ($method, $path, $body, $type) = @_;
 
     socket(my $sock, 40, SOCK_STREAM, 0)
         or die "vsock socket: $!\n";
@@ -70,10 +86,15 @@ sub fetch {
     die "peer certificate not verified\n"
         if Net::SSLeay::get_verify_result($ssl) != 0;
 
-    my $req = "GET $path HTTP/1.1\r\nHost: kubernetes\r\n"
+    my $req = "$method $path HTTP/1.1\r\nHost: kubernetes\r\n"
         . "Authorization: Bearer $token\r\n"
-        . "Accept: application/json\r\nConnection: close\r\n\r\n";
-    Net::SSLeay::write($ssl, $req)
+        . "Accept: application/json\r\nConnection: close\r\n";
+    if (defined $body) {
+        $req .= "Content-Type: " . ($type // 'application/json') . "\r\n"
+            . "Content-Length: " . length($body) . "\r\n";
+    }
+    $req .= "\r\n" . ($body // '');
+    Net::SSLeay::ssl_write_all($ssl, $req)
         or die "tls write failed\n";
     my $raw = '';
     while (my $buf = Net::SSLeay::read($ssl)) {
@@ -83,26 +104,45 @@ sub fetch {
     Net::SSLeay::CTX_free($ctx);
     close $sock;
 
-    my ($head, $body) = split /\r\n\r\n/, $raw, 2;
+    my ($head, $resp) = split /\r\n\r\n/, $raw, 2;
     die "bad response\n" if !$head || $head !~ m|^HTTP/1\.\d (\d+)|;
     my $code = $1;
     if ($head =~ /Transfer-Encoding: chunked/i) {
         my $decoded = '';
-        while ($body =~ /^([0-9a-fA-F]+)\r\n/) {
+        while ($resp =~ /^([0-9a-fA-F]+)\r\n/) {
             my $len = hex $1;
             last if !$len;
-            $decoded .= substr($body, length($1) + 2, $len);
-            $body = substr($body, length($1) + 2 + $len + 2);
+            $decoded .= substr($resp, length($1) + 2, $len);
+            $resp = substr($resp, length($1) + 2 + $len + 2);
         }
-        $body = $decoded;
+        $resp = $decoded;
     }
+    return ($code, $resp);
+}
+
+sub fetch {
+    my ($path) = @_;
+
+    my ($code, $body) = request('GET', $path);
     die "GET $path returned $code: $body\n" if $code != 200;
     return $body;
 }
 
 Net::SSLeay::load_error_strings();
 Net::SSLeay::SSLeay_add_ssl_algorithms();
-if (@paths == 1) {
+if ($requests) {
+    my $json = JSON::PP->new->canonical->utf8;
+    my @out;
+    for my $r (@reqs) {
+        my $body = $r->{body};
+        $body = $json->encode($body) if ref $body;
+        my ($code, $resp) = request($r->{method}, $r->{path}, $body,
+            $r->{type});
+        my $data = eval { $json->decode($resp) } // $resp;
+        push @out, { code => $code + 0, body => $data };
+    }
+    print $json->encode(\@out);
+} elsif (@paths == 1) {
     print fetch($paths[0]);
 } else {
     print '[', join(',', map { fetch($_) } @paths), ']';

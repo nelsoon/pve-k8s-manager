@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""pve-k8s-auth: kubectl credential plugin for pve-k8s clusters.
+
+An auto-refresh kubeconfig runs this program instead of carrying a
+Kubernetes token. It trades a Proxmox VE API token (environment
+variable PVE_K8S_API_TOKEN, "user@realm!tokenid=secret") for a 1h
+Kubernetes token from the Proxmox VE API, caches it until shortly
+before it expires, and prints it as a client.authentication.k8s.io/v1
+ExecCredential. Python 3 standard library only.
+
+    pve-k8s-auth --url https://pve.example.com:8006 --cluster NAME \
+        [--ca-data BASE64-PEM]
+
+--ca-data is the Proxmox VE cluster CA; the server certificate must
+chain to it or to a CA the system trusts.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import ssl
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+RENEW_BEFORE = 300  # seconds of validity left that trigger a new token
+
+
+def fail(msg):
+    sys.stderr.write("pve-k8s-auth: %s\n" % msg)
+    sys.exit(1)
+
+
+def cache_path(url, cluster, tokenid):
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    key = hashlib.sha256(
+        ("%s\n%s\n%s" % (url, cluster, tokenid)).encode()).hexdigest()[:16]
+    return os.path.join(base, "pve-k8s", key + ".json")
+
+
+def read_cache(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache(path, data):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def fetch(url, cluster, token, ca_data):
+    ctx = ssl.create_default_context()
+    if ca_data:
+        try:
+            ctx.load_verify_locations(
+                cadata=base64.b64decode(ca_data).decode())
+        except (ValueError, ssl.SSLError) as e:
+            fail("bad --ca-data: %s" % e)
+    req = urllib.request.Request(
+        "%s/api2/json/cluster/k8s/%s/credential"
+        % (url.rstrip("/"), urllib.parse.quote(cluster, safe="")),
+        headers={"Authorization": "PVEAPIToken=" + token})
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+            body = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            fail("Proxmox VE rejected the API token (deleted, revoked or "
+                 "expired): download a new kubeconfig")
+        fail("Proxmox VE answered %d: %s" % (e.code, e.reason))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        fail("cannot reach %s: %s" % (url, e))
+    data = (body or {}).get("data") or {}
+    if not data.get("token") or not data.get("expires-at"):
+        fail("Proxmox VE returned no token")
+    return {"token": data["token"], "expires": int(data["expires-at"])}
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pve-k8s-auth",
+                                 description=__doc__.split("\n")[0])
+    ap.add_argument("--url", required=True,
+                    help="Proxmox VE address, https://host:8006")
+    ap.add_argument("--cluster", required=True,
+                    help="Kubernetes cluster name in Proxmox VE")
+    ap.add_argument("--ca-data", default="",
+                    help="Proxmox VE cluster CA, base64 PEM")
+    args = ap.parse_args()
+
+    token = os.environ.get("PVE_K8S_API_TOKEN", "")
+    if "!" not in token or "=" not in token:
+        fail("PVE_K8S_API_TOKEN must be user@realm!tokenid=secret")
+    tokenid = token.split("=", 1)[0]
+
+    path = cache_path(args.url, args.cluster, tokenid)
+    cached = read_cache(path)
+    now = int(time.time())
+    # kubectl runs the plugin once per process; a second call from the
+    # same kubectl means the API server rejected the cached token
+    parent = os.getppid()
+    fresh = (cached and cached.get("expires", 0) - now > RENEW_BEFORE
+             and cached.get("parent") != parent)
+    cred = cached if fresh else fetch(args.url, args.cluster, token,
+                                      args.ca_data)
+    cred["parent"] = parent
+    write_cache(path, cred)
+
+    print(json.dumps({
+        "apiVersion": "client.authentication.k8s.io/v1",
+        "kind": "ExecCredential",
+        "status": {
+            "token": cred["token"],
+            "expirationTimestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(cred["expires"])),
+        },
+    }))
+
+
+if __name__ == "__main__":
+    main()

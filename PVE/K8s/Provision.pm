@@ -3712,37 +3712,127 @@ my sub kubectl_json {
 # guest proxies vsock:10244 to the apiserver. HTTPS over
 # that channel is ~70x faster than a guest-agent exec
 # and needs no IP route into the SDN zone. Credentials
-# are the pve-k8s-admin SA token + cluster CA, cached
-# on pmxcfs for 50 minutes (the token lives 1h); the
-# mint itself goes through kubeconfig_cluster, i.e.
-# guest exec, once per cache period. Every caller
-# falls back to kubectl_json_batch when vsock is not
-# available (old nodes, proxy unit missing).
+# are the pve-k8s-manager SA token + cluster CA, cached
+# on pmxcfs for 50 minutes (the token lives 1h). The
+# first token is minted by guest exec (kubeconfig_cluster);
+# after that the still-valid token renews itself through
+# a TokenRequest over vsock. Every caller falls back to
+# guest exec when vsock is not available (old nodes,
+# proxy unit missing).
 my $VSOCK_PORT = 10244;
 
+# Kubernetes identities (see below)
+our $USER_NS = 'pve-k8s-users';
+our $MANAGER_SA = 'pve-k8s-manager';
+our $USER_LABEL = 'pve-k8s.proxmox.com/user-sa';
+our $USER_ANNOTATION = 'pve-k8s.proxmox.com/user';
+our $DEFAULT_KUBECONFIG_MAX_HOURS = 24;
+my $API_TOKEN_REFRESH = 3000;   # renew after 50 min
+my $API_TOKEN_LIFE = 3600;
+
+my sub write_private {
+    my ($path, $data) = @_;
+
+    sysopen my $fh, "$path.tmp",
+        Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(),
+        0600 or die "credential cache: $!\n";
+    print $fh $data;
+    close $fh;
+    rename "$path.tmp", $path or die "credential cache rename: $!\n";
+}
+
+# One helper process on the host that has the VM's vsock (an ssh hop
+# when that is another host); returns its stdout.
+my sub vsock_run {
+    my ($cp, $tf, $cf, @args) = @_;
+
+    my $cid = $cp->{vmid};
+    if (!$cp->{pvehost} || $cp->{pvehost} eq local_node_name()) {
+        return run(['env', "PVE_K8S_TOKEN_FILE=$tf",
+            "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
+            '--cid', $cid, @args], timeout => 60);
+    }
+    return run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
+        "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
+        . "pve-k8s-vsock-get --cid $cid "
+        . join(' ', map { shq($_) } @args)], timeout => 60);
+}
+
+my sub vsock_requests {
+    my ($cp, $tf, $cf, @reqs) = @_;
+
+    my $plain = [ map { my %r = $_->%*; delete $r{ok}; \%r } @reqs ];
+    my $b64 = MIME::Base64::encode_base64(
+        JSON::PP->new->canonical->utf8->encode($plain), '');
+    my $out = vsock_run($cp, $tf, $cf, '--requests', $b64);
+    my $res = JSON::PP->new->utf8->decode($out);
+    die "vsock: expected " . scalar(@reqs) . " results\n"
+        if ref $res ne 'ARRAY' || @$res != @reqs;
+    return $res;
+}
+
+# Pure: a TokenRequest for one service account.
+sub token_request {
+    my ($ns, $sa, $seconds) = @_;
+
+    return {
+        method => 'POST', ok => [201],
+        path => "/api/v1/namespaces/$ns/serviceaccounts/$sa/token",
+        body => { apiVersion => 'authentication.k8s.io/v1',
+            kind => 'TokenRequest',
+            spec => { expirationSeconds => $seconds + 0 } },
+    };
+}
+
+# Pure: the first request whose answer is not one it accepts, as an
+# error message; undef when all went through.
+sub api_failure {
+    my ($reqs, $res) = @_;
+
+    for my $i (0 .. $#$reqs) {
+        my $r = $reqs->[$i];
+        my $code = ($res->[$i] // {})->{code} // 0;
+        next if grep { $_ == $code } ($r->{ok} // [200])->@*;
+        my $body = ($res->[$i] // {})->{body};
+        my $msg = ref $body eq 'HASH' ? ($body->{message} // '') : ($body // '');
+        return "$r->{method} $r->{path} returned $code"
+            . ($msg ne '' ? ": $msg" : '') . "\n";
+    }
+    return undef;
+}
+
+my sub renew_manager_token {
+    my ($name, $cp, $tf, $cf) = @_;
+
+    my $req = token_request('kube-system', $MANAGER_SA, $API_TOKEN_LIFE);
+    my $res = vsock_requests($cp, $tf, $cf, $req);
+    my $err = api_failure([$req], $res);
+    die $err if $err;
+    my $token = $res->[0]{body}{status}{token}
+        or die "token renewal returned no token\n";
+    write_private($tf, $token);
+}
+
 sub api_credentials {
-    my ($name) = @_;
+    my ($name, $cp) = @_;
 
     my $tf = "/etc/pve/k8s/api-$name.token";
     my $cf = "/etc/pve/k8s/api-$name.ca";
     my @st = stat $tf;
+    my $age = @st ? time() - $st[9] : undef;
     return ($tf, $cf)
-        if @st && time() - $st[9] < 3000 && -s $cf;
+        if defined $age && $age < $API_TOKEN_REFRESH && -s $cf;
+    if ($cp && defined $age && $age < $API_TOKEN_LIFE - 60 && -s $cf) {
+        return ($tf, $cf)
+            if eval { renew_manager_token($name, $cp, $tf, $cf); 1 };
+    }
     my $kc = kubeconfig_cluster($name)->{kubeconfig};
     my ($token) = $kc =~ /token: (\S+)/;
     my ($ca_b64) = $kc =~ /certificate-authority-data: (\S+)/;
     die "could not parse issued kubeconfig for '$name'\n"
         if !$token || !$ca_b64;
-    my $ca = MIME::Base64::decode_base64($ca_b64);
-    for my $pair ([$tf, $token], [$cf, $ca]) {
-        sysopen my $fh, "$pair->[0].tmp",
-            Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_TRUNC(),
-            0600 or die "credential cache: $!\n";
-        print $fh $pair->[1];
-        close $fh;
-        rename "$pair->[0].tmp", $pair->[0]
-            or die "credential cache rename: $!\n";
-    }
+    write_private($cf, MIME::Base64::decode_base64($ca_b64));
+    write_private($tf, $token);
     return ($tf, $cf);
 }
 
@@ -3751,20 +3841,8 @@ sub api_credentials {
 sub k8s_api_get_many {
     my ($name, $cp, @paths) = @_;
 
-    my ($tf, $cf) = api_credentials($name);
-    my $cid = $cp->{vmid};
-    my @args = map { ('--path', $_) } @paths;
-    my $out;
-    if (!$cp->{pvehost} || $cp->{pvehost} eq local_node_name()) {
-        $out = run(['env', "PVE_K8S_TOKEN_FILE=$tf",
-            "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
-            '--cid', $cid, @args], timeout => 60);
-    } else {
-        $out = run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
-            "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
-            . "pve-k8s-vsock-get --cid $cid "
-            . join(' ', map { shq($_) } @args)], timeout => 60);
-    }
+    my ($tf, $cf) = api_credentials($name, $cp);
+    my $out = vsock_run($cp, $tf, $cf, map { ('--path', $_) } @paths);
     my $data = JSON::PP->new->decode($out);
     return @paths == 1 ? [$data] : $data;
 }
@@ -3780,6 +3858,32 @@ my sub k8s_api_get_many_retry {
     die $err if $err !~ /returned 401/;
     unlink "/etc/pve/k8s/api-$name.token";
     return k8s_api_get_many($name, $cp, @paths);
+}
+
+# Requests (reads or writes) over vsock, control planes on this host
+# first: one {code, body} per request, or undef when no control plane
+# answers that way (the caller then uses guest exec). Requests must be
+# safe to repeat (server-side apply, deletes, token requests): a
+# transport failure halfway moves on to the next control plane. A
+# rejected manager token (every answer 401, so nothing was applied)
+# is dropped and minted again once.
+sub k8s_api_fast {
+    my ($name, $nodes, @reqs) = @_;
+
+    for my $cp (cp_read_order($nodes, local_node_name())->@*) {
+        my $res = eval {
+            my ($tf, $cf) = api_credentials($name, $cp);
+            my $r = vsock_requests($cp, $tf, $cf, @reqs);
+            if (!grep { $_->{code} != 401 } @$r) {
+                unlink $tf;
+                ($tf, $cf) = api_credentials($name, $cp);
+                $r = vsock_requests($cp, $tf, $cf, @reqs);
+            }
+            $r;
+        };
+        return $res if $res;
+    }
+    return undef;
 }
 
 # Read several API paths the fast way: vsock, control planes on this
@@ -5216,11 +5320,7 @@ my sub find_node {
 # access can be revoked (deleting the account invalidates
 # every token issued to it) without touching anyone else's or
 # pve-k8s's own.
-our $USER_NS = 'pve-k8s-users';
-our $MANAGER_SA = 'pve-k8s-manager';
-our $USER_LABEL = 'pve-k8s.proxmox.com/user-sa';
-our $USER_ANNOTATION = 'pve-k8s.proxmox.com/user';
-our $DEFAULT_KUBECONFIG_MAX_HOURS = 24;
+# (names: see the vsock transport section)
 
 # Pure: a stable, valid service-account name for a PVE userid
 # (user@realm or user@realm!token). The hash keeps two ids that
@@ -5307,6 +5407,82 @@ sub token_script {
     return join("\n", @cmd) . "\n";
 }
 
+# Pure: token_script as Kubernetes API requests, for the vsock path:
+# server-side apply (creates or updates, safe to repeat), deletes that
+# accept 404, then the TokenRequest last.
+sub identity_requests {
+    my (%o) = @_;
+
+    my ($ns, $sa) = ($o{namespace}, $o{sa});
+    my $q = '?fieldManager=pve-k8s&force=true';
+    my $rbac = '/apis/rbac.authorization.k8s.io/v1';
+    my $apply = sub {
+        my ($path, $obj) = @_;
+        return { method => 'PATCH', path => "$path$q", ok => [200, 201],
+            type => 'application/apply-patch+yaml', body => $obj };
+    };
+    my @r;
+    push @r, $apply->("/api/v1/namespaces/$ns", { apiVersion => 'v1',
+        kind => 'Namespace', metadata => { name => $ns } })
+        if $ns ne 'kube-system';
+    my $meta = { name => $sa, namespace => $ns };
+    $meta->{annotations} = { $USER_ANNOTATION => $o{userid} }
+        if defined $o{userid};
+    push @r, $apply->("/api/v1/namespaces/$ns/serviceaccounts/$sa",
+        { apiVersion => 'v1', kind => 'ServiceAccount', metadata => $meta });
+    my $bind = sub {
+        my ($bname, $role) = @_;
+        return $apply->("$rbac/clusterrolebindings/$bname", {
+            apiVersion => 'rbac.authorization.k8s.io/v1',
+            kind => 'ClusterRoleBinding',
+            metadata => { name => $bname, labels => { $USER_LABEL => $sa } },
+            roleRef => { apiGroup => 'rbac.authorization.k8s.io',
+                kind => 'ClusterRole', name => $role },
+            subjects => [{ kind => 'ServiceAccount', name => $sa,
+                namespace => $ns }],
+        });
+    };
+    my $drop = sub {
+        return map { { method => 'DELETE', ok => [200, 202, 404],
+            path => "$rbac/clusterrolebindings/$_" } } @_;
+    };
+    if ($o{role} eq 'admin') {
+        push @r, $bind->("$sa-admin", 'cluster-admin'),
+            $drop->("$sa-view", "$sa-view-cluster");
+    } else {
+        my $read = [qw(get list watch)];
+        push @r, $apply->("$rbac/clusterroles/pve-k8s-cluster-view", {
+            apiVersion => 'rbac.authorization.k8s.io/v1',
+            kind => 'ClusterRole',
+            metadata => { name => 'pve-k8s-cluster-view' },
+            rules => [
+                { apiGroups => [''], verbs => $read,
+                    resources => [qw(nodes namespaces persistentvolumes)] },
+                { apiGroups => ['storage.k8s.io'], verbs => $read,
+                    resources => ['storageclasses'] },
+            ],
+        });
+        push @r, $bind->("$sa-view", 'view'),
+            $bind->("$sa-view-cluster", 'pve-k8s-cluster-view'),
+            $drop->("$sa-admin");
+    }
+    push @r, token_request($ns, $sa, $o{seconds});
+    return @r;
+}
+
+# Pure: requests that remove one identity (revoke).
+sub revoke_requests {
+    my ($sa) = @_;
+
+    return (
+        { method => 'DELETE', ok => [200, 202, 404],
+            path => "/api/v1/namespaces/$USER_NS/serviceaccounts/$sa" },
+        { method => 'DELETE', ok => [200],
+            path => '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings'
+                . "?labelSelector=$USER_LABEL%3D$sa" },
+    );
+}
+
 # Pure: token and CA out of token_script's output.
 sub parse_token_output {
     my ($out) = @_;
@@ -5366,9 +5542,21 @@ my sub issue_kubeconfig {
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
     my $vip = PVE::K8s::Config::vip_for($scfg);
     my $nodes = load_nodes($name, $scfg);
-    my $cp = ops_cp($nodes);
-    my ($token, $ca) = parse_token_output(
-        guest_exec($cp->{vmid}, token_script(%o)));
+    my ($token, $ca);
+    # pve-k8s's own account bootstraps the vsock path: guest exec only
+    my @reqs = $o{exec_only} ? () : identity_requests(%o);
+    my $res = @reqs ? k8s_api_fast($name, $nodes, @reqs) : undef;
+    if ($res) {
+        my $err = api_failure(\@reqs, $res);
+        die $err if $err;
+        $token = $res->[-1]{body}{status}{token}
+            or die "could not issue a token\n";
+        $ca = MIME::Base64::encode_base64(
+            PVE::Tools::file_get_contents("/etc/pve/k8s/api-$name.ca"), '');
+    } else {
+        ($token, $ca) = parse_token_output(
+            guest_exec(ops_cp($nodes)->{vmid}, token_script(%o)));
+    }
     my $server = "https://$vip:6443";
     return {
         kubeconfig => kubeconfig_text($name, $server, $ca,
@@ -5376,6 +5564,7 @@ my sub issue_kubeconfig {
         server => $server,
         'expires-at' => token_expiry($token) // time() + $o{seconds},
         'service-account' => "$o{namespace}/$o{sa}",
+        token => $token,
     };
 }
 
@@ -5388,7 +5577,7 @@ sub kubeconfig_cluster {
     my $k = 'kubectl --kubeconfig /etc/kubernetes/admin.conf';
     return issue_kubeconfig($name,
         namespace => 'kube-system', sa => $MANAGER_SA,
-        role => 'admin', seconds => 3600,
+        role => 'admin', seconds => 3600, exec_only => 1,
         extra => [
             "$k -n kube-system delete serviceaccount pve-k8s-admin "
                 . "--ignore-not-found >/dev/null",
@@ -5412,10 +5601,187 @@ sub user_kubeconfig {
         namespace => $USER_NS, sa => user_sa_name($userid),
         role => $role, seconds => $hours * 3600,
         userid => $userid, user_entry => $userid);
+    delete $res->{token};
     $res->{role} = $role;
     $res->{user} = $userid;
     $res->{hours} = $hours;
     return $res;
+}
+
+# --- auto-refresh kubeconfigs ------------------------------
+# The kubeconfig holds a PVE API token (k8s-<cluster>, full
+# privileges of its user) instead of a Kubernetes token;
+# kubectl runs pve-k8s-auth, which trades it for a 1h
+# Kubernetes token through the credential call below and
+# caches that. One such token per user and cluster: issuing
+# a new kubeconfig replaces the secret (and the identity,
+# so tokens the old one fetched stop too). Revoke deletes it.
+our $CREDENTIAL_SECONDS = 3600;
+
+sub refresh_token_id {
+    my ($name) = @_;
+
+    return "k8s-$name";
+}
+
+# The 1h token pve-k8s-auth asks for, for the calling user or token.
+sub user_credential {
+    my ($name, $userid, $can_modify) = @_;
+
+    my $role = user_k8s_role($can_modify);
+    my $res = issue_kubeconfig($name,
+        namespace => $USER_NS, sa => user_sa_name($userid),
+        role => $role, seconds => $CREDENTIAL_SECONDS,
+        userid => $userid, user_entry => $userid);
+    return { token => $res->{token}, 'expires-at' => $res->{'expires-at'},
+        role => $role, user => $userid };
+}
+
+# Pure: an https base URL of the PVE API, without a trailing slash.
+sub pve_url {
+    my ($url) = @_;
+
+    $url //= '';
+    $url =~ s|/+$||;
+    die "the Proxmox VE address must look like https://host:8006\n"
+        if $url !~ m{^https://[A-Za-z0-9.\-]+(?::\d{1,5})?\z}
+            && $url !~ m{^https://\[[0-9a-fA-F:]+\](?::\d{1,5})?\z};
+    return $url;
+}
+
+# Pure: a YAML double-quoted scalar.
+sub yq {
+    my ($v) = @_;
+
+    $v =~ s/(["\\])/\\$1/g;
+    return "\"$v\"";
+}
+
+sub kubeconfig_exec_text {
+    my (%o) = @_;
+
+    my $hint = 'pve-k8s-auth is needed: download it from the Kubeconfig '
+        . 'window (Datacenter, Kubernetes) and put it on your PATH';
+    my $user = yq($o{user});
+    return join "\n",
+        'apiVersion: v1',
+        'kind: Config',
+        'clusters:',
+        "- name: $o{name}",
+        '  cluster:',
+        "    server: $o{server}",
+        "    certificate-authority-data: $o{ca}",
+        'contexts:',
+        "- name: $o{name}",
+        '  context:',
+        "    cluster: $o{name}",
+        "    user: $user",
+        "current-context: $o{name}",
+        'users:',
+        "- name: $user",
+        '  user:',
+        '    exec:',
+        '      apiVersion: client.authentication.k8s.io/v1',
+        '      command: pve-k8s-auth',
+        '      args:',
+        '      - --url',
+        '      - ' . yq($o{url}),
+        '      - --cluster',
+        "      - $o{name}",
+        '      - --ca-data',
+        "      - $o{pveca}",
+        '      env:',
+        '      - name: PVE_K8S_API_TOKEN',
+        '        value: ' . yq($o{secret}),
+        '      interactiveMode: Never',
+        '      installHint: ' . yq($hint),
+        '';
+}
+
+# Create the user's k8s-<cluster> API token, or give it a new secret.
+# privsep off: the token acts with its user's privileges, so the
+# Kubernetes role keeps following them.
+my sub refresh_api_token {
+    my ($userid, $tokenid, $comment) = @_;
+
+    require PVE::AccessControl;
+    require PVE::API2::User;
+    require PVE::Cluster;
+    my $usercfg = PVE::Cluster::cfs_read_file('user.cfg');
+    my $have = PVE::AccessControl::check_token_exist($usercfg, $userid,
+        $tokenid, 1);
+    my %p = (userid => $userid, tokenid => $tokenid, privsep => 0,
+        comment => $comment);
+    my $res = $have
+        ? PVE::API2::User->update_token_info({ %p, regenerate => 1 })
+        : PVE::API2::User->generate_token({ %p });
+    return ($res->{'full-tokenid'}, $res->{value});
+}
+
+my sub remove_api_token {
+    my ($userid, $tokenid) = @_;
+
+    require PVE::AccessControl;
+    require PVE::API2::User;
+    require PVE::Cluster;
+    my $usercfg = PVE::Cluster::cfs_read_file('user.cfg');
+    return 0 if !PVE::AccessControl::check_token_exist($usercfg, $userid,
+        $tokenid, 1);
+    PVE::API2::User->remove_token({ userid => $userid, tokenid => $tokenid });
+    return 1;
+}
+
+my sub remove_identities {
+    my ($name, $nodes, @sas) = @_;
+
+    my @reqs = map { revoke_requests($_) } @sas;
+    my $res = k8s_api_fast($name, $nodes, @reqs);
+    if ($res) {
+        my $err = api_failure(\@reqs, $res);
+        die $err if $err;
+        return;
+    }
+    my $k = 'kubectl --kubeconfig /etc/kubernetes/admin.conf';
+    guest_exec(ops_cp($nodes)->{vmid}, join("\n", map {
+        ("$k -n $USER_NS delete serviceaccount $_ --ignore-not-found",
+            "$k delete clusterrolebinding -l $USER_LABEL=$_ --ignore-not-found")
+    } @sas) . "\n");
+}
+
+sub auto_kubeconfig {
+    my ($name, $userid, $can_modify, $url) = @_;
+
+    die "an auto-refresh kubeconfig is made for a user login, not for an "
+        . "API token: give the token to pve-k8s-auth directly\n"
+        if $userid =~ /!/;
+    $url = pve_url($url);
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $tokenid = refresh_token_id($name);
+    my ($full, $secret) = refresh_api_token($userid, $tokenid,
+        "kubectl access to Kubernetes cluster $name (pve-k8s-auth)");
+    die "could not create the API token\n" if !$full || !$secret;
+    # a fresh identity: tokens fetched with the replaced secret stop now
+    remove_identities($name, $nodes, user_sa_name($full));
+    my $role = user_k8s_role($can_modify);
+    my $res = issue_kubeconfig($name,
+        namespace => $USER_NS, sa => user_sa_name($full),
+        role => $role, seconds => 600, userid => $full);
+    my ($ca) = $res->{kubeconfig} =~ /certificate-authority-data: (\S+)/;
+    my $pveca = MIME::Base64::encode_base64(
+        PVE::Tools::file_get_contents('/etc/pve/pve-root-ca.pem'), '');
+    return {
+        kubeconfig => kubeconfig_exec_text(name => $name,
+            server => $res->{server}, ca => $ca, user => $userid,
+            url => $url, pveca => $pveca, secret => "$full=$secret"),
+        server => $res->{server},
+        'api-token' => $full,
+        'service-account' => $res->{'service-account'},
+        role => $role,
+        user => $userid,
+    };
 }
 
 # Pure: who holds kubeconfig access, from the service accounts in
@@ -5472,7 +5838,9 @@ sub access_list {
 }
 
 # Revoke one user's kubeconfigs: deleting the service account makes
-# the API server reject every token issued to it, at once.
+# the API server reject every token issued to it, at once. A user's
+# auto-refresh API token goes too (it could fetch new ones), and
+# revoking that token's row deletes the token.
 sub revoke_access {
     my ($name, $userid) = @_;
 
@@ -5480,12 +5848,18 @@ sub revoke_access {
     my $scfg = $cfg->{ids}->{$name}
         or die "cluster '$name' does not exist\n";
     my $nodes = load_nodes($name, $scfg);
-    my $sa = user_sa_name($userid);
-    my $k = 'kubectl --kubeconfig /etc/kubernetes/admin.conf';
-    guest_exec(ops_cp($nodes)->{vmid}, join("\n",
-        "$k -n $USER_NS delete serviceaccount $sa --ignore-not-found",
-        "$k delete clusterrolebinding -l $USER_LABEL=$sa --ignore-not-found",
-    ) . "\n");
+    my $tokenid = refresh_token_id($name);
+    my ($user, $tok) = split /!/, $userid, 2;
+    my @sas = (user_sa_name($userid));
+    my $pve_token;
+    if (!defined $tok) {
+        push @sas, user_sa_name("$userid!$tokenid");
+        $pve_token = $userid;
+    } elsif ($tok eq $tokenid) {
+        $pve_token = $user;
+    }
+    remove_identities($name, $nodes, @sas);
+    remove_api_token($pve_token, $tokenid) if defined $pve_token;
     return undef;
 }
 
@@ -7572,6 +7946,28 @@ sub cert_expiry_cached {
     return $rows;
 }
 
+# Renew pve-k8s's own token ahead of time: over vsock while the old
+# one is still valid, by guest exec otherwise.
+sub renew_api_credentials {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $tf = "/etc/pve/k8s/api-$name.token";
+    my $cf = "/etc/pve/k8s/api-$name.ca";
+    my @st = stat $tf;
+    if (@st && time() - $st[9] < $API_TOKEN_LIFE - 60 && -s $cf) {
+        my $nodes = load_nodes($name, $scfg);
+        for my $cp (cp_read_order($nodes, local_node_name())->@*) {
+            return 1 if eval { renew_manager_token($name, $cp, $tf, $cf); 1 };
+        }
+    }
+    unlink $tf;
+    api_credentials($name);
+    return 1;
+}
+
 # Keep the slow-to-make read inputs fresh from the timer, so a page
 # view never pays for them: the API token is re-issued before readers
 # would (40 of its 50 cached minutes), certificates before their 6h
@@ -7583,8 +7979,7 @@ sub warm_read_caches {
     my $tf = "/etc/pve/k8s/api-$name.token";
     my @st = stat $tf;
     if (!@st || $now - $st[9] > 2400) {
-        unlink $tf;
-        eval { api_credentials($name) };
+        eval { renew_api_credentials($name) };
     }
     my $cp = cert_cache_path($name);
     my @cs = stat $cp;

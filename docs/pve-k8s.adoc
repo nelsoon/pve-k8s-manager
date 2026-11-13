@@ -175,6 +175,45 @@ for the calling PVE user or API token:
   (`Sys.Modify`) deletes that account, so every token
   issued to it stops working at once.
 
+==== Auto-refresh
+
+For daily use, choose *Auto-refresh* as the validity
+(`pvesh create /cluster/k8s/c1/kubeconfig --url
+https://pve.example.com:8006`). Instead of a Kubernetes
+token, the kubeconfig carries a PVE API token,
+`<user>!k8s-<cluster>`, which pve-k8s creates under the
+calling user. Its privilege separation is off, so it
+acts with the user's privileges and the role keeps
+following them. kubectl runs `pve-k8s-auth` (an exec
+credential plugin, like `aws eks get-token`), which
+trades the API token for a 1-hour Kubernetes token
+(`GET .../credential`) and caches it until 5 minutes
+before it expires.
+
+* `pve-k8s-auth` is one Python 3 file with no
+  dependencies. Download it from the Kubeconfig window
+  (it is also installed as `/usr/sbin/pve-k8s-auth` on
+  every PVE host) and put it on your `PATH`.
+* The PVE certificate is checked against the PVE
+  cluster CA, which the kubeconfig carries, or against a
+  CA the system trusts.
+* There is one such token per user and cluster. Issuing
+  a new auto-refresh kubeconfig gives it a new secret and
+  a new identity, so the previous kubeconfig stops at
+  once.
+* Revoking a user also deletes its `k8s-<cluster>` API
+  token. So does deleting the token under Permissions ->
+  API Tokens; either way kubectl gets no new token after
+  that. Revoke stops the current token at once as well.
+* A login that is itself an API token cannot create
+  one; give that token to `pve-k8s-auth` directly
+  (environment variable `PVE_K8S_API_TOKEN`).
+
+Tokens are issued over the control plane's vsock
+channel, typically in well under a second; guest exec
+is the fallback. pve-k8s's own token renews itself the
+same way before it expires.
+
 The cluster's own admin certificate stays on the
 control-plane VMs and is never handed out.
 
@@ -500,6 +539,9 @@ privilege).
 | POST | `.../scale` | one scaler pass
 | POST | `.../power` | start (CP first) / stop (workers first) all VMs
 | GET | `.../kubeconfig` | kubeconfig for the caller (`--hours`)
+| POST | `.../kubeconfig` | auto-refresh kubeconfig for the caller (`--url`)
+| GET | `.../credential` | 1-hour Kubernetes token for the caller (pve-k8s-auth)
+| GET | `.../auth-helper` | the pve-k8s-auth program, for download
 | GET | `.../access` | who was issued a kubeconfig, and the role
 | DELETE | `.../access/{userid}` | revoke a user's kubeconfigs
 | GET | `.../certificates` | PKI expiry report

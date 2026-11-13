@@ -105,6 +105,109 @@ like($api, qr/path => '\{name\}\/access\/\{userid\}',\s+method => 'DELETE',[\s\S
     'revoking needs Sys.Modify');
 my $js = do { local $/; open my $f, '<', 'www/manager6/PVEK8sWorkspace.js' or die; <$f> };
 like($js, qr/\['access', gettext\('Access'\)/, 'Access page in the cluster menu');
-like($js, qr/params: \{ hours: me\.down\('#hours'\)\.getValue\(\) \}/, 'validity is chosen in the window');
+like($js, qr/params: auto \? \{ url: window\.location\.origin \} : \{ hours: current \}/,
+    'validity is chosen in the window, or auto-refresh');
+
+# --- the vsock path: identity setup as API requests ---------------
+my $ir = $P->can('identity_requests');
+my @adm = $ir->(namespace => 'pve-k8s-users', sa => 'pve-a-1', role => 'admin',
+    seconds => 3600, userid => 'a@pve');
+is($adm[0]{path}, '/api/v1/namespaces/pve-k8s-users?fieldManager=pve-k8s&force=true',
+    'the namespace first');
+ok(!(grep { $_->{method} ne 'PATCH' || $_->{type} ne 'application/apply-patch+yaml' }
+    grep { $_->{method} eq 'PATCH' } @adm), 'creates are server-side apply (safe to repeat)');
+is($adm[1]{body}{metadata}{annotations}{'pve-k8s.proxmox.com/user'}, 'a@pve',
+    'the account names its PVE user');
+my ($ab) = grep { $_->{path} =~ m|clusterrolebindings/pve-a-1-admin\?| } @adm;
+is($ab->{body}{roleRef}{name}, 'cluster-admin', 'admin binding');
+is($ab->{body}{metadata}{labels}{'pve-k8s.proxmox.com/user-sa'}, 'pve-a-1',
+    'bindings are labelled for the Access list and revoke');
+is_deeply([map { $_->{path} =~ m|/([^/]+)$|; $1 } grep { $_->{method} eq 'DELETE' } @adm],
+    ['pve-a-1-view', 'pve-a-1-view-cluster'], 'a promotion drops the read-only bindings');
+ok((grep { $_ == 404 } $adm[-2]{ok}->@*), 'a binding already gone is fine');
+is($adm[-1]{path}, '/api/v1/namespaces/pve-k8s-users/serviceaccounts/pve-a-1/token',
+    'the TokenRequest comes last');
+is($adm[-1]{body}{spec}{expirationSeconds}, 3600, 'with the asked validity');
+my @view = $ir->(namespace => 'pve-k8s-users', sa => 'pve-b-1', role => 'view', seconds => 600);
+my ($cr) = grep { $_->{path} =~ m|clusterroles/pve-k8s-cluster-view\?| } @view;
+ok($cr, 'read-only: the cluster-scope read role');
+is_deeply([sort map { @{ $_->{resources} } } $cr->{body}{rules}->@*],
+    [qw(namespaces nodes persistentvolumes storageclasses)], 'nodes, namespaces, storage');
+ok(!(grep { ($_->{verbs} // [])->@* != 3 } $cr->{body}{rules}->@*), 'get/list/watch only');
+is_deeply([map { $_->{body}{roleRef}{name} } grep { $_->{path} =~ /clusterrolebindings\/.*\?/ } @view],
+    ['view', 'pve-k8s-cluster-view'], 'read-only bindings');
+ok((grep { $_->{method} eq 'DELETE' && $_->{path} =~ /pve-b-1-admin$/ } @view),
+    'a demotion drops the admin binding');
+ok(!exists $view[1]{body}{metadata}{annotations}, 'no user annotation without a userid');
+my @mgr = $ir->(namespace => 'kube-system', sa => 'pve-k8s-manager', role => 'admin', seconds => 3600);
+ok(!(grep { $_->{path} =~ m|^/api/v1/namespaces/kube-system\?| } @mgr), 'kube-system is never applied');
+
+my @rv = $P->can('revoke_requests')->('pve-a-1');
+is($rv[0]{path}, '/api/v1/namespaces/pve-k8s-users/serviceaccounts/pve-a-1',
+    'revoke deletes the account');
+like($rv[1]{path}, qr/clusterrolebindings\?labelSelector=pve-k8s\.proxmox\.com\/user-sa%3Dpve-a-1$/,
+    'and its labelled bindings');
+
+my $fail = $P->can('api_failure');
+my @r2 = ({ method => 'PATCH', path => '/a', ok => [200, 201] }, { method => 'POST', path => '/b', ok => [201] });
+is($fail->(\@r2, [{ code => 201 }, { code => 201 }]), undef, 'accepted codes pass');
+like($fail->(\@r2, [{ code => 200 }, { code => 403, body => { message => 'forbidden' } }]),
+    qr|^POST /b returned 403: forbidden|, 'the first refusal is the error');
+like($fail->([{ method => 'GET', path => '/c' }], [{ code => 404, body => 'x' }]),
+    qr|GET /c returned 404: x|, 'plain 200 expected by default');
+
+# --- auto-refresh -------------------------------------------------
+is($P->can('refresh_token_id')->('local'), 'k8s-local', 'one API token per cluster');
+my $url = $P->can('pve_url');
+is($url->('https://pve.example.com:8006/'), 'https://pve.example.com:8006', 'trailing slash dropped');
+is($url->('https://[fd00::1]:8006'), 'https://[fd00::1]:8006', 'IPv6 literal');
+for my $bad ('http://pve:8006', 'https://pve:8006/x', 'https://a b', "https://pve\n") {
+    eval { $url->($bad) };
+    like($@, qr/must look like/, "refused: '$bad'");
+}
+is($P->can('yq')->('a"b\\c'), '"a\\"b\\\\c"', 'YAML quoting');
+my $kc = $P->can('kubeconfig_exec_text')->(name => 'local', server => 'https://10.0.0.5:6443',
+    ca => 'Q0E=', user => 'root@pam', url => 'https://pve:8006', pveca => 'UEVWRQ==',
+    secret => 'root@pam!k8s-local=0000-1111');
+like($kc, qr/^      command: pve-k8s-auth$/m, 'kubectl runs pve-k8s-auth');
+like($kc, qr/^      apiVersion: client\.authentication\.k8s\.io\/v1$/m, 'exec credential v1');
+like($kc, qr/- --url\n      - "https:\/\/pve:8006"\n      - --cluster\n      - local\n      - --ca-data\n      - UEVWRQ==/,
+    'where to ask, which cluster, which CA');
+like($kc, qr/name: PVE_K8S_API_TOKEN\n        value: "root\@pam!k8s-local=0000-1111"/,
+    'the API token travels in the environment');
+unlike($kc, qr/^\s+token:/m, 'no Kubernetes token in the file');
+like($kc, qr/interactiveMode: Never/, 'never prompts');
+
+like($src, qr/role => 'admin', seconds => 3600, exec_only => 1,/,
+    'pve-k8s\'s own account bootstraps over guest exec');
+like($src, qr/my \@reqs = \$o\{exec_only\} \? \(\) : identity_requests\(%o\);/,
+    'user identities go over vsock first');
+like($src, qr/privsep => 0,/, 'the API token acts with its user\'s privileges');
+like($src, qr/PVE::API2::User->update_token_info\(\{ %p, regenerate => 1 \}\)/,
+    'a new kubeconfig replaces the secret');
+like($src, qr/# a fresh identity[^\n]*\n\s+remove_identities\(\$name, \$nodes, user_sa_name\(\$full\)\);/,
+    'and the identity, so the old one stops at once');
+like($src, qr/push \@sas, user_sa_name\("\$userid!\$tokenid"\);\n\s+\$pve_token = \$userid;/,
+    'revoking a user also revokes its auto-refresh token');
+like($src, qr/if \$userid =~ \/!\/;/, 'auto-refresh is for user logins');
+like($src, qr/renew_manager_token\(\$name, \$cp, \$tf, \$cf\)/, 'the manager token renews over vsock');
+like($api, qr/path => '\{name\}\/kubeconfig',\s+method => 'POST',[\s\S]*?\['Sys\.Audit'\]/,
+    'auto-refresh kubeconfig: POST, Sys.Audit');
+like($api, qr/path => '\{name\}\/credential',\s+method => 'GET',[\s\S]*?\['Sys\.Audit'\]/,
+    'credential call for pve-k8s-auth');
+like($js, qr/defaultFocus: 'no',/, 'replacing the token is confirmed');
+like($js, qr/itemId: 'helper',/, 'pve-k8s-auth can be downloaded');
+
+# --- the helpers ------------------------------------------------------
+my $vg = do { local $/; open my $f, '<', 'tools/pve-k8s-vsock-get' or die; <$f> };
+like($vg, qr/elsif \(\$arg eq '--requests'\)/, 'vsock helper takes requests');
+like($vg, qr/\(GET\|POST\|PUT\|PATCH\|DELETE\)/, 'only known methods');
+like($vg, qr/Content-Length: " \. length\(\$body\)/, 'bodies are sent with their length');
+my $auth = do { local $/; open my $f, '<', 'tools/pve-k8s-auth' or die; <$f> };
+like($auth, qr/"Authorization": "PVEAPIToken=" \+ token/, 'pve-k8s-auth uses the API token');
+like($auth, qr/cached\.get\("parent"\) != parent/, 'a repeated call from one kubectl refetches');
+like($auth, qr/os\.chmod\(tmp, 0o600\)/, 'the cache is private');
+my $mk = do { local $/; open my $f, '<', 'Makefile' or die; <$f> };
+like($mk, qr|install -m 0755 tools/pve-k8s-auth \$\(STAGE\)/usr/sbin/pve-k8s-auth|, 'packaged');
 
 done_testing;

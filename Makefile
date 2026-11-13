@@ -15,6 +15,7 @@ lint:
 	@awk 'length>100{print FILENAME":"FNR": "length" columns"; bad=1} END{exit bad}' $(PERL_FILES)
 	@for f in $(PERL_FILES); do perl -I. -Itests/stubs -c $$f || exit 1; done
 	@for f in $(JS_FILES); do node --check $$f || exit 1; done
+	@python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' tools/pve-k8s-auth
 	@echo "lint ok: $(words $(PERL_FILES)) perl modules, $(words $(JS_FILES)) js files"
 
 test: lint deb
@@ -69,6 +70,7 @@ deb:
 	@cp -r images $(STAGE)/usr/share/pve-k8s/
 	@install -m 0755 tools/pve-k8s-scaler $(STAGE)/usr/sbin/pve-k8s-scaler
 	@install -m 0755 tools/pve-k8s-vsock-get $(STAGE)/usr/sbin/pve-k8s-vsock-get
+	@install -m 0755 tools/pve-k8s-auth $(STAGE)/usr/sbin/pve-k8s-auth
 	@install -m 0755 tools/pve-k8s-backup $(STAGE)/usr/sbin/pve-k8s-backup
 	@install -m 0755 tools/pve-k8s-template-refresh $(STAGE)/usr/sbin/pve-k8s-template-refresh
 	@install -m 0755 tools/pve-k8s-summary-refresh $(STAGE)/usr/sbin/pve-k8s-summary-refresh

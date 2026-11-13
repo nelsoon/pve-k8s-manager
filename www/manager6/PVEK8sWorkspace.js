@@ -873,6 +873,33 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
             a.click();
             URL.revokeObjectURL(a.href);
         };
+        let saveHelper = function() {
+            Proxmox.Utils.API2Request({
+                url: '/cluster/k8s/' + encodeURIComponent(me.clusterName) + '/auth-helper',
+                method: 'GET',
+                success: function(r) {
+                    let data = r.result.data || {};
+                    let blob = new Blob([data.content || ''], { type: 'text/x-python' });
+                    let a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = data.filename || 'pve-k8s-auth';
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                },
+                failure: function(r) { Ext.Msg.alert(gettext('Error'), r.htmlStatus); },
+            });
+        };
+        let tokenId = 'k8s-' + me.clusterName;
+        let hints = {
+            fixed: gettext('A kubeconfig of your own: the role follows '
+                + 'your Proxmox VE privileges. Save it as ~/.kube/config '
+                + 'or pass it to kubectl with --kubeconfig.'),
+            auto: Ext.String.format(gettext('Auto-refresh: kubectl runs '
+                + 'pve-k8s-auth (Python 3, download it below and put it on '
+                + 'your PATH), which uses your API token {0} to get a 1 hour '
+                + 'Kubernetes token whenever needed. Delete the token, or '
+                + 'revoke your access, to stop it.'), tokenId),
+        };
         let copy = function() {
             if (!text) { return; }
             let area = me.down('textarea');
@@ -887,10 +914,9 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
             items: [
                 {
                     xtype: 'component',
+                    itemId: 'hint',
                     padding: 10,
-                    html: gettext('A kubeconfig of your own: the role follows '
-                        + 'your Proxmox VE privileges. Save it as ~/.kube/config '
-                        + 'or pass it to kubectl with --kubeconfig.'),
+                    html: hints.fixed,
                 },
                 {
                     xtype: 'container',
@@ -907,11 +933,37 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
                             comboItems: choices.map(function(h) {
                                 return [h, h === 1 ? gettext('1 hour')
                                     : Ext.String.format(gettext('{0} hours'), h)];
-                            }),
+                            }).concat([['auto', gettext('Auto-refresh (1 hour tokens)')]]),
                             value: 1,
                             listeners: {
                                 // another validity: issue a new one
-                                select: function() { load(); },
+                                select: function(combo) {
+                                    if (combo.getValue() !== 'auto') {
+                                        current = combo.getValue();
+                                        load();
+                                        return;
+                                    }
+                                    // it creates (or replaces) an API token: ask
+                                    Ext.Msg.show({
+                                        title: gettext('Auto-refresh'),
+                                        icon: Ext.Msg.WARNING,
+                                        buttons: Ext.Msg.YESNO,
+                                        defaultFocus: 'no',
+                                        message: Ext.String.format(gettext(
+                                            'This creates the API token {0} under your '
+                                            + 'user, or gives it a new secret: a previous '
+                                            + 'auto-refresh kubeconfig for this cluster '
+                                            + 'stops working. Continue?'), tokenId),
+                                        fn: function(btn) {
+                                            if (btn === 'yes') {
+                                                current = 'auto';
+                                                load();
+                                            } else {
+                                                combo.setValue(current);
+                                            }
+                                        },
+                                    });
+                                },
                             },
                         },
                         {
@@ -953,30 +1005,46 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
                         disabled: true,
                         handler: save,
                     },
+                    '->',
+                    {
+                        text: gettext('Download pve-k8s-auth'),
+                        iconCls: 'fa fa-download',
+                        itemId: 'helper',
+                        hidden: true,
+                        handler: saveHelper,
+                    },
                 ],
             }],
         });
         me.callParent();
+        let current = 1;
         let load = function() {
+            let auto = current === 'auto';
             text = undefined;
             me.down('#copy').disable();
             me.down('#download').disable();
+            me.down('#helper').setHidden(!auto);
+            me.down('#hint').setHtml(auto ? hints.auto : hints.fixed);
+            me.down('textarea').setValue('');
             me.setLoading(true);
             Proxmox.Utils.API2Request({
                 url: '/cluster/k8s/' + encodeURIComponent(me.clusterName) + '/kubeconfig',
-                method: 'GET',
-                params: { hours: me.down('#hours').getValue() },
+                method: auto ? 'POST' : 'GET',
+                params: auto ? { url: window.location.origin } : { hours: current },
                 success: function(r) {
                     me.setLoading(false);
                     let data = r.result.data || {};
                     text = data.kubeconfig || '';
                     me.down('#server').setValue(data.server || '');
-                    me.down('#info').setValue(Ext.htmlEncode(
-                        (data.role === 'admin' ? gettext('Administrator (cluster-admin)')
-                            : gettext('Read-only (view)'))
-                        + ', ' + Ext.String.format(gettext('expires {0}'),
+                    let role = data.role === 'admin'
+                        ? gettext('Administrator (cluster-admin)')
+                        : gettext('Read-only (view)');
+                    me.down('#info').setValue(Ext.htmlEncode(role + ', ' + (auto
+                        ? Ext.String.format(gettext('renewed hourly with API token {0}'),
+                            data['api-token'])
+                        : Ext.String.format(gettext('expires {0}'),
                             Ext.Date.format(new Date(data['expires-at'] * 1000),
-                                'Y-m-d H:i'))));
+                                'Y-m-d H:i')))));
                     me.down('textarea').setValue(text);
                     me.down('#copy').enable();
                     me.down('#download').enable();
@@ -2488,7 +2556,16 @@ Ext.define('PVE.dc.K8sView', {
                 '/api2/json/cluster/k8s/' + name + '/access',
                 [
                     { text: gettext('User'), dataIndex: 'user', flex: 1,
-                        renderer: Ext.htmlEncode },
+                        renderer: function(v) {
+                            // the user's own auto-refresh token
+                            let auto = '!k8s-' + name;
+                            v = v || '';
+                            if (v.endsWith(auto)) {
+                                return Ext.htmlEncode(v.slice(0, -auto.length))
+                                    + ' (' + gettext('auto-refresh') + ')';
+                            }
+                            return Ext.htmlEncode(v);
+                        } },
                     { text: gettext('Role'), dataIndex: 'role', width: 220,
                         renderer: roleText },
                     { text: gettext('Service Account'), dataIndex: 'service-account',
