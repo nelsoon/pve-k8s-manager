@@ -244,11 +244,20 @@ like($js, qr/if \(target\.lazyBuild\) \{/, 'showing a panel builds it once');
 # The Overview's summary starts with the page, not after the list.
 like($js, qr/if \(fixedClusterName\) \{\s+fetchSummary\(fixedClusterName/,
     'opening a cluster page starts the summary request at once');
-like($js, qr/fetchSummary\(name, function\(r\) \{/, 'the Overview reuses that request');
+like($js, qr/fetchSummary\(name, applySummary, summaryFailed\);/, 'the Overview reuses that request');
+like($js, qr/livePoll\(overview, 10000, function\(\) \{\s+fetchSummary\(name, applySummary, summaryFailed\);/,
+    'the Overview refreshes while it is shown');
+like($js, qr/if \(summaryLoaded\) \{\s+return;/, 'a failed refresh keeps the last values');
+like($js, qr/livePoll\(panel, 15000, function\(\) \{ loadMetrics\(true\); \}\);/,
+    'the Metrics tab refreshes quietly');
+like($js, qr/document\.hidden/, 'no polling from a hidden browser tab');
+like($js, qr/panel\.on\('destroy', function\(\) \{\s+Ext\.util\.TaskManager\.stop\(poll\);/,
+    'polling stops with the panel');
+like($js, qr/let enableBtn = Ext\.create\('Ext\.button\.Button'/, 'the enable button is a real component');
 like($js, qr/Ext\.defer\(function\(\) \{ cb\(r\.resp\); \}, 1\);/,
     'an already answered summary is handed over asynchronously (gauges must be rendered)');
 my $fos = () = $js =~ /fireOnStart: false/g;
-is($fos, 2, 'the 30 s polls do not load the list a second time on start');
+is($fos, 3, 'no poll loads a second time on start (2 list polls + livePoll)');
 
 # Read-only users (Sys.Audit without Sys.Modify) get no write buttons.
 like($js, qr/caps\.dc\['Sys\.Modify'\]/, 'UI reads Sys.Modify from GuiCap');

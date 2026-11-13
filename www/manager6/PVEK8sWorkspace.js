@@ -1450,6 +1450,26 @@ Ext.define('PVE.dc.K8sView', {
             fetchSummary(fixedClusterName, Ext.emptyFn, Ext.emptyFn);
         }
 
+        // Keep a panel's data live: run() every interval while the
+        // panel is on screen (and the browser tab visible), once
+        // more when it is shown again; stops with the panel.
+        let livePoll = function(panel, interval, run) {
+            let tick = function() {
+                if (panel.destroyed || document.hidden
+                    || !panel.rendered || !panel.isVisible(true)) {
+                    return;
+                }
+                run();
+            };
+            let poll = Ext.util.TaskManager.start({
+                run: tick, interval: interval, fireOnStart: false,
+            });
+            panel.on('show', tick);
+            panel.on('destroy', function() {
+                Ext.util.TaskManager.stop(poll);
+            });
+        };
+
         let task = function(upid) {
             if (upid) {
                 Ext.create('Proxmox.window.TaskViewer', {
@@ -1697,7 +1717,9 @@ Ext.define('PVE.dc.K8sView', {
                 gettext('Node VMs memory (cluster average %)'));
             let summaryChartCpu = summaryChart(
                 gettext('Node VMs CPU (cluster average %)'));
-            fetchSummary(name, function(r) {
+            let summaryLoaded = false;
+            let applySummary = function(r) {
+                    summaryLoaded = true;
                     let s = r.result.data || {};
                     let icons = {
                         ok: 'fa fa-check good',
@@ -1852,21 +1874,27 @@ Ext.define('PVE.dc.K8sView', {
                         summaryChartCpu.getStore().loadData(
                             toRows(s.series.cpu));
                     }
-            }, function() {
+            };
+            // a failed refresh keeps the last values on screen
+            let summaryFailed = function() {
+                    if (summaryLoaded) {
+                        return;
+                    }
                     healthInfo.setValue(gettext('unknown'));
                     nodesInfo.setValue(gettext('unknown'));
                     podsInfo.setValue(gettext('unknown'));
                     lbInfo.setValue(gettext('unknown'));
                     backupInfo.setValue(gettext('unknown'));
                     imageInfo.setValue(gettext('unknown'));
-            });
+            };
+            fetchSummary(name, applySummary, summaryFailed);
             let act = function(label, icon, fn, extra) {
                 return Ext.apply({
                     text: label, iconCls: icon,
                     handler: function() { fn(name); },
                 }, extra);
             };
-            return Ext.create('Ext.panel.Panel', {
+            let overview = Ext.create('Ext.panel.Panel', {
                 header: false,
                 border: false,
                 bodyPadding: 10,
@@ -2010,6 +2038,11 @@ Ext.define('PVE.dc.K8sView', {
                     ],
                 }],
             });
+            // live: the summary cache is kept < 30 s old server side
+            livePoll(overview, 10000, function() {
+                fetchSummary(name, applySummary, summaryFailed);
+            });
+            return overview;
         };
 
         let nodesPanel = function(name) {
@@ -2377,7 +2410,8 @@ Ext.define('PVE.dc.K8sView', {
             let note = Ext.create('Ext.form.field.Display', {
                 value: '',
             });
-            let enableBtn = {
+            // a component, not a config: it is shown later
+            let enableBtn = Ext.create('Ext.button.Button', {
                 text: gettext('Enable metrics-server'),
                 iconCls: 'fa fa-fw fa-line-chart',
                 hidden: true,
@@ -2391,7 +2425,7 @@ Ext.define('PVE.dc.K8sView', {
                         },
                     });
                 },
-            };
+            });
             let panel = Ext.create('Ext.panel.Panel', {
                 header: false,
                 border: false,
@@ -2403,19 +2437,30 @@ Ext.define('PVE.dc.K8sView', {
                     Ext.apply(podGrid, { flex: 1 }),
                 ],
             });
-            api({
-                url: '/cluster/k8s/' + name + '/metrics', method: 'GET',
-                success: function(r) {
-                    let d = r.result.data || {};
-                    nodeGrid.getStore().loadData(d.nodes || []);
-                    podGrid.getStore().loadData(d.pods || []);
-                    if (!d.metrics_server) {
-                        enableBtn.show();
-                        note.setValue(gettext('Pod metrics need the '
-                            + 'metrics-server add-on.'));
-                    }
-                },
-            });
+            let busy = false;
+            let loadMetrics = function(quiet) {
+                if (busy) {
+                    return;
+                }
+                busy = true;
+                api(Ext.apply({
+                    url: '/cluster/k8s/' + name + '/metrics', method: 'GET',
+                    callback: function() { busy = false; },
+                    success: function(r) {
+                        let d = r.result.data || {};
+                        // keep the grids' sort and scroll position
+                        nodeGrid.getStore().loadData(d.nodes || []);
+                        podGrid.getStore().loadData(d.pods || []);
+                        enableBtn.setVisible(!d.metrics_server);
+                        note.setValue(d.metrics_server ? ''
+                            : gettext('Pod metrics need the '
+                                + 'metrics-server add-on.'));
+                    },
+                }, quiet ? { failure: Ext.emptyFn } : {}));
+            };
+            loadMetrics(false);
+            // live, quietly: a failed refresh keeps the last values
+            livePoll(panel, 15000, function() { loadMetrics(true); });
             return panel;
         };
 
