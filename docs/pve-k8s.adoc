@@ -513,9 +513,14 @@ pvesh create /cluster/k8s/c1/addons/metrics-server/disable
 == The scaler
 
 One leader (elected via a pmxcfs stamp) runs a periodic
-pass per cluster - systemd `pve-k8s-scaler.timer` where
-enabled - or one pass on demand with the Scale button /
-`POST /cluster/k8s/{name}/scale`. A pass, in order:
+pass per cluster - systemd `pve-k8s-scaler.timer`, every
+3 minutes - or one pass on demand with the Scale button /
+`POST /cluster/k8s/{name}/scale`. Between passes,
+`pve-k8s-scaler-watch.timer` checks every 30 seconds for
+pods waiting to be scheduled (one read over the direct VM
+connection) and starts a pass at once when there are, so
+a scale-out begins within about a minute instead of up to
+3. A pass, in order:
 
 . *Repair*: a worker NotReady for more than 5 minutes
   whose VM does not answer the guest agent is replaced.
@@ -536,10 +541,19 @@ enabled - or one pass on demand with the Scale button /
 . *Local-volume rescue*: pending pods pinned by a local
   PV to a host with no schedulable node get their disk
   moved to a host that has one.
-. *Scale out*: pending pods (older than 2 minutes) are
-  simulated against every group whose labels, taints,
-  affinity, topology and resource requests they match,
-  including `kubernetes.io/arch`. If more nodes of a
+. *Scale out*: pending pods the scheduler marked
+  Unschedulable (older than 30 seconds) are simulated
+  against every group whose labels, taints, node
+  affinity, required pod anti-affinity on the hostname,
+  hard topology spread and resource requests they match,
+  including `kubernetes.io/arch`. Topology spread with
+  `whenUnsatisfiable: DoNotSchedule` is checked like the
+  scheduler does (maxSkew per domain, same namespace,
+  minDomains); a new node is its own hostname domain, but
+  its zone (the PVE host it will land on) is unknown, so
+  a pod held back only by zone spread does not trigger a
+  scale-out. Soft spread (`ScheduleAnyway`) and pod
+  affinity are not modelled. If more nodes of a
   group would place more pods and the group is below
   `max` (and some PVE host has 4 GiB free), `size`
   grows and provision creates the nodes.

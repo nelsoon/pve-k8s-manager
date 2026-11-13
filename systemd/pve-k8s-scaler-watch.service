@@ -1,0 +1,7 @@
+[Unit]
+Description=pve-k8s pending-pod watch (starts a scaler pass when pods wait)
+After=pvedaemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-k8s-scaler --watch

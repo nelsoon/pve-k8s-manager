@@ -167,4 +167,69 @@ like($src, qr/rolled: all nodes on \$version r\$want_rev\\n";\s+run_descheduler\
 like($src, qr/return 0 if time\(\) - \(\$state->\{'descheduled-at'\} \/\/ 0\) < \$DESCHEDULE_COOLDOWN;/,
     'at most every cooldown');
 
+# Hard topology spread (DoNotSchedule) on hostname and zone
+{
+    my $S = 'PVE::K8s::Scaler';
+    my $spread = sub { my ($key, %o) = @_;
+        my $p = pod(name => $o{name} // 'w', labels => { app => 'web' }, cpu => '100m', mem => '64Mi');
+        $p->{spec}{topologySpreadConstraints} = [{ maxSkew => 1, topologyKey => $key,
+            whenUnsatisfiable => $o{when} // 'DoNotSchedule',
+            labelSelector => { matchLabels => { app => 'web' } } }];
+        $p };
+    my $node = sub { my ($n, $zone) = @_;
+        PVE::K8s::Scaler::make_node($n, { 'kubernetes.io/hostname' => $n,
+            ($zone ? ('topology.kubernetes.io/zone' => $zone) : ()) }, [], 4000, 8 * 1024**3) };
+    my @n = ($node->('a', 'h1'), $node->('b', 'h2'));
+    my ($placed, $un) = PVE::K8s::Scaler::place_pods(\@n,
+        [map { $spread->('kubernetes.io/hostname', name => "w$_") } 1 .. 4]);
+    is(scalar @$placed, 4, 'hostname spread: 4 replicas fit on 2 nodes, 2 each');
+    is(scalar $n[0]{pods}->@*, 2, 'evenly');
+    my @one = ($node->('a', 'h1'));
+    push $one[0]{pods}->@*, $spread->('kubernetes.io/hostname', name => 'old');
+    my @two = ($node->('a', 'h1'), $node->('b', 'h2'));
+    push $two[0]{pods}->@*, $spread->('kubernetes.io/hostname', name => 'old1'),
+        $spread->('kubernetes.io/hostname', name => 'old2');
+    ($placed) = PVE::K8s::Scaler::place_pods(\@two,
+        [$spread->('kubernetes.io/hostname', name => 'new')]);
+    is($placed->[0] && scalar $two[1]{pods}->@*, 1, 'skew forces the emptier node');
+    my $full = [$node->('a', 'h1'), $node->('b', 'h2')];
+    $full->[1]{used_cpu} = 4000;
+    push $full->[0]{pods}->@*, $spread->('kubernetes.io/hostname', name => 'o1');
+    ($placed, $un) = PVE::K8s::Scaler::place_pods($full,
+        [$spread->('kubernetes.io/hostname', name => 'n1')]);
+    is(scalar @$un, 1, 'the only domain with room would break maxSkew: unplaced');
+    is(PVE::K8s::Scaler::nodes_needed($full, $un, { name => 'default' }, 2,
+        { cpu => 4000, mem => 8 * 1024**3 }), 1,
+        'one new node (its own hostname domain) places it: scale out');
+    ($placed, $un) = PVE::K8s::Scaler::place_pods([$node->('a', 'h1'), $node->('b', 'h2')],
+        [map { $spread->('kubernetes.io/hostname', name => "s$_", when => 'ScheduleAnyway') } 1 .. 3]);
+    is(scalar @$placed, 3, 'soft spread is not enforced');
+    my $zfull = [$node->('a', 'h1'), $node->('b', 'h2')];
+    $zfull->[1]{used_cpu} = 4000;
+    push $zfull->[0]{pods}->@*, $spread->('topology.kubernetes.io/zone', name => 'z0');
+    ($placed, $un) = PVE::K8s::Scaler::place_pods($zfull,
+        [$spread->('topology.kubernetes.io/zone', name => 'z1')]);
+    is(scalar @$un, 1, 'zone spread blocked like the scheduler would');
+    is(PVE::K8s::Scaler::nodes_needed($zfull, $un, { name => 'default' }, 2,
+        { cpu => 4000, mem => 8 * 1024**3 }), 0,
+        'a new node has no known zone: no blind scale-out for zone spread');
+    my $other = pod(name => 'o', labels => { app => 'web' });
+    $other->{metadata}{namespace} = 'other';
+    my $ns = [$node->('a', 'h1'), $node->('b', 'h2')];
+    $ns->[1]{used_cpu} = 4000;
+    push $ns->[0]{pods}->@*, $other;
+    ($placed) = PVE::K8s::Scaler::place_pods($ns, [$spread->('kubernetes.io/hostname')]);
+    is(scalar @$placed, 1, 'pods of other namespaces do not count');
+}
+
+like($src, qr/our \$PENDING_MIN_AGE = 30;/, 'pending pods wait 30 s, not 2 minutes');
+like($src, qr/sub pending_watch \{[\s\S]*?k8s_read_fast\([\s\S]*?fieldSelector=status\.phase%3DPending[\s\S]*?return scale_cluster\(\$name\);/,
+    'the watch does one vsock read and runs a pass only for waiting pods');
+my $tool = do { local $/; open my $fh, '<', 'tools/pve-k8s-scaler' or die; <$fh> };
+like($tool, qr/'--watch'[\s\S]*?pending_watch\(\$name\)/, 'scaler --watch mode');
+my $timer = do { local $/; open my $fh, '<', 'systemd/pve-k8s-scaler-watch.timer' or die; <$fh> };
+like($timer, qr/OnUnitActiveSec=30s\nAccuracySec=5s/, 'watch every 30 s, accurately');
+my $post = do { local $/; open my $fh, '<', 'debian/postinst.tail' or die; <$fh> };
+like($post, qr/pve-k8s-scaler-watch\.timer/, 'the watch is enabled on install');
+
 done_testing();

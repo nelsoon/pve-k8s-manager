@@ -13,6 +13,7 @@ PVE_K8S_INTEGRATE_EOF
         # Overview cache are part of the product; backup and template
         # timers stay opt-in
         systemctl enable --now pve-k8s-scaler.timer \
+            pve-k8s-scaler-watch.timer \
             pve-k8s-summary.timer >/dev/null 2>&1 || true
     fi
 fi

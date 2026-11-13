@@ -76,6 +76,7 @@ deb:
 	@install -m 0755 tools/pve-k8s-template-refresh $(STAGE)/usr/sbin/pve-k8s-template-refresh
 	@install -m 0755 tools/pve-k8s-summary-refresh $(STAGE)/usr/sbin/pve-k8s-summary-refresh
 	@cp systemd/pve-k8s-scaler.service systemd/pve-k8s-scaler.timer \
+		systemd/pve-k8s-scaler-watch.service systemd/pve-k8s-scaler-watch.timer \
 		systemd/pve-k8s-backup.service systemd/pve-k8s-backup.timer \
 		systemd/pve-k8s-template.service systemd/pve-k8s-template.timer \
 		systemd/pve-k8s-summary.service systemd/pve-k8s-summary.timer \

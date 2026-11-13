@@ -4405,6 +4405,8 @@ my sub record_repair {
 # At most every 10 minutes; nothing when it is turned off or
 # missing. Never fatal.
 our $DESCHEDULE_COOLDOWN = 600;
+# pending pods younger than this are left to the scheduler
+our $PENDING_MIN_AGE = 30;
 # how long a node-problem-detector condition must hold before the
 # node is replaced (a transient read-only remount can recover)
 our $PROBLEM_GRACE = 600;
@@ -4813,7 +4815,9 @@ sub scale_reconcile {
         JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
 
     my $now = time();
-    # Age gate: ignore pods created in the last 2 minutes.
+    # Age gate: ignore pods created in the last $PENDING_MIN_AGE s.
+    # The scheduler has already marked them Unschedulable; the gate
+    # only absorbs pods that a node about to become Ready takes.
     # A negative age means the cluster clock runs ahead of
     # this host (seen in the nested lab, where guest clocks
     # drift days forward); age is then unmeasurable, and
@@ -4822,7 +4826,7 @@ sub scale_reconcile {
     my @pending = grep {
         my $age = $now - iso_epoch(
             $_->{metadata}{creationTimestamp});
-        $age < 0 || $age > 120;
+        $age < 0 || $age > $PENDING_MIN_AGE;
     } PVE::K8s::Scaler::schedulable_pending($kpods)->@*;
 
     # T3.6b: a Pending pod pinned by a local PV to a fabric
@@ -7264,6 +7268,26 @@ my sub cilium_running {
 
     return PVE::K8s::Addons::cilium_running_version(
         kubectl_json($cp, '-n kube-system get daemonset cilium'));
+}
+
+# The 30 s pending watch: one vsock read of Pending pods (no guest
+# exec: when vsock does not answer, the 3-minute pass covers it);
+# a full scaler pass only when a schedulable one is old enough.
+sub pending_watch {
+    my ($name) = @_;
+
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name} or return 0;
+    return 0 if ($scfg->{state} // '') ne 'ready';
+    my $res = k8s_read_fast($name, load_nodes($name, $scfg),
+        '/api/v1/pods?fieldSelector=status.phase%3DPending') or return 0;
+    my $now = time();
+    my $due = grep {
+        my $age = $now - iso_epoch($_->{metadata}{creationTimestamp});
+        $age < 0 || $age > $PENDING_MIN_AGE;
+    } PVE::K8s::Scaler::schedulable_pending($res->[0]{items} // [])->@*;
+    return 0 if !$due;
+    print "watch: $due pending pod(s) on '$name'; scaler pass now\n";
+    return scale_cluster($name);
 }
 
 # Running add-on versions, read from the cluster (one vsock call

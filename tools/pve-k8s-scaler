@@ -13,6 +13,23 @@ use PVE::K8s::Config;
 use PVE::K8s::Provision;
 
 my $cfg = PVE::K8s::Config->config();
+
+# --watch (pve-k8s-scaler-watch.timer, every 30 s): one cheap read
+# per cluster; a full pass only when schedulable pods are waiting.
+if (($ARGV[0] // '') eq '--watch') {
+    for my $name (sort keys $cfg->{ids}->%*) {
+        next if ($cfg->{ids}->{$name}->{state} // '') ne 'ready';
+        my $acted = eval { PVE::K8s::Provision::pending_watch($name) };
+        if (my $err = $@) {
+            $err =~ s/\s+$//;
+            print "cluster $name: pending watch failed: $err\n";
+        } elsif ($acted) {
+            print "cluster $name: action taken\n";
+        }
+    }
+    exit 0;
+}
+
 for my $name (sort keys $cfg->{ids}->%*) {
     my $acted = eval { PVE::K8s::Provision::scale_cluster($name) };
     # Inside a configured maintenance window the same pass also

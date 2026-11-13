@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch pve-k8s clusters for pending pods every 30 seconds
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

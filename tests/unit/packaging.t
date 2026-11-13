@@ -156,13 +156,13 @@ like($mk, qr/integrate\.pl/, 'Makefile embeds the integration patcher');
 # Timers: the scaler and the Overview cache are on after install;
 # upgrades reload the daemons instead of killing running tasks.
 my $postinst = do { open my $f, '<', 'debian/postinst.tail' or die $!; local $/; <$f> };
-like($postinst, qr/enable --now pve-k8s-scaler\.timer \\\n\s+pve-k8s-summary\.timer/,
-    'install enables the scaler and summary timers');
+like($postinst, qr/enable --now pve-k8s-scaler\.timer \\\n\s+pve-k8s-scaler-watch\.timer \\\n\s+pve-k8s-summary\.timer/,
+    'install enables the scaler, pending-watch and summary timers');
 unlike($postinst, qr/systemctl try-restart pvedaemon/,
     'install never restarts pvedaemon (KillMode=control-group kills running tasks)');
 like($postinst, qr/reload-or-try-restart pvedaemon/, 'install reloads the daemons');
 my $prerm = do { open my $f, '<', 'debian/prerm' or die $!; local $/; <$f> };
-like($prerm, qr/disable --now pve-k8s-scaler\.timer pve-k8s-summary\.timer/,
+like($prerm, qr/disable --now pve-k8s-scaler\.timer pve-k8s-scaler-watch\.timer \\\n\s+pve-k8s-summary\.timer/,
     'remove disables the timers while their units still exist');
 ok(-e 'systemd/pve-k8s-summary.timer' && -e 'tools/pve-k8s-summary-refresh',
     'the summary refresher ships');

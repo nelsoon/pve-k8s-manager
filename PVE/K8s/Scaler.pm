@@ -161,6 +161,42 @@ my sub anti_affinity_ok {
     return 1;
 }
 
+# Hard topology spread (whenUnsatisfiable: DoNotSchedule), as the
+# scheduler checks it: placing the pod in this node's domain must
+# keep (pods in that domain + 1) - (fewest in any eligible domain)
+# within maxSkew. Domains are the values of topologyKey on nodes
+# the pod's node selector/affinity allows; a node without the key
+# cannot take the pod. Soft constraints (ScheduleAnyway) are
+# preferences and are ignored, like the scheduler does when it
+# must.
+my sub spread_ok {
+    my ($pod, $node, $nodes) = @_;
+
+    my $ns = $pod->{metadata}{namespace} // '';
+    for my $c (($pod->{spec}{topologySpreadConstraints} // [])->@*) {
+        next if ($c->{whenUnsatisfiable} // 'DoNotSchedule') ne 'DoNotSchedule';
+        my $key = $c->{topologyKey} // next;
+        my $mine = $node->{labels}{$key};
+        return 0 if !defined $mine;
+        my %count;
+        for my $n (($nodes // [$node])->@*) {
+            my $d = $n->{labels}{$key};
+            next if !defined $d || !affinity_ok($pod, $n->{labels});
+            $count{$d} //= 0;
+            $count{$d} += grep {
+                ($_->{metadata}{namespace} // '') eq $ns
+                    && selector_matches($c->{labelSelector},
+                        $_->{metadata}{labels} // {})
+            } ($n->{pods} // [])->@*;
+        }
+        $count{$mine} //= 0;
+        my ($min) = sort { $a <=> $b } values %count;
+        $min = 0 if ($c->{minDomains} // 0) > keys %count;
+        return 0 if $count{$mine} + 1 - $min > ($c->{maxSkew} // 1);
+    }
+    return 1;
+}
+
 # One simulated node: { name, labels, taints, cpu, mem,
 # used_cpu, used_mem, pods }.
 sub make_node {
@@ -172,11 +208,12 @@ sub make_node {
 }
 
 sub pod_fits_node {
-    my ($pod, $node) = @_;
+    my ($pod, $node, $nodes) = @_;
 
     return 0 if !affinity_ok($pod, $node->{labels});
     return 0 if !tolerates($pod, $node->{taints});
     return 0 if !anti_affinity_ok($pod, $node);
+    return 0 if !spread_ok($pod, $node, $nodes);
     my $r = pod_requests($pod);
     return 0 if $node->{used_cpu} + $r->{cpu} > $node->{cpu};
     return 0 if $node->{used_mem} + $r->{mem} > $node->{mem};
@@ -190,7 +227,7 @@ sub place_pods {
 
     my (@placed, @unplaced);
     for my $pod ($pods->@*) {
-        my ($node) = grep { pod_fits_node($pod, $_) } $nodes->@*;
+        my ($node) = grep { pod_fits_node($pod, $_, $nodes) } $nodes->@*;
         if ($node) {
             my $r = pod_requests($pod);
             $node->{used_cpu} += $r->{cpu};
@@ -428,9 +465,13 @@ sub nodes_needed {
     while ($added < $room) {
         my $trial = clone_nodes($nodes);
         for (1 .. $added + 1) {
+            # a new node is its own hostname domain; its zone (the
+            # PVE host it lands on) is unknown, so zone-spread pods
+            # are not placed on it (conservative: no blind scale-out)
             my $sim = make_node("sim-$_",
-                pool_node_labels($pool), parse_taints($pool),
-                $tmpl->{cpu}, $tmpl->{mem});
+                { pool_node_labels($pool)->%*,
+                    'kubernetes.io/hostname' => "sim-$_" },
+                parse_taints($pool), $tmpl->{cpu}, $tmpl->{mem});
             $sim->{used_cpu} = $tmpl->{overhead_cpu} // 0;
             $sim->{used_mem} = $tmpl->{overhead_mem} // 0;
             push $trial->@*, $sim;
