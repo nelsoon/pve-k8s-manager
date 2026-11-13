@@ -760,6 +760,8 @@ Ext.define('PVE.dc.K8sSettings', {
 
     clusterName: undefined,
     onChanged: undefined,
+    // true for a user without Sys.Modify: no Edit button, no editors
+    viewOnly: false,
     cwidth1: 260,
 
     initComponent: function() {
@@ -896,7 +898,12 @@ Ext.define('PVE.dc.K8sSettings', {
             disabled: true,
             handler: function() { me.run_editor(); },
         });
-        me.tbar = [editBtn];
+        if (me.viewOnly) {
+            // no Sys.Modify: the same values, nothing to edit
+            Ext.Object.each(me.rows, function(key, row) { delete row.editor; });
+        } else {
+            me.tbar = [editBtn];
+        }
         me.callParent();
 
         me.on('selectionchange', function(sm, sel) {
@@ -945,6 +952,33 @@ Ext.define('PVE.dc.K8sView', {
         if (fixedClusterName) {
             me.title = gettext('Kubernetes') + ': ' + fixedClusterName;
         }
+
+        // Every write call needs Sys.Modify (the API checks it on
+        // /cluster). A user with only Sys.Audit gets the same pages
+        // without the buttons that could only fail; GuiCap is what
+        // PVE's own panels read.
+        let caps = Ext.state.Manager.get('GuiCap') || {};
+        let canModify = !!(caps.dc && caps.dc['Sys.Modify']);
+        me.canModify = canModify;
+        // Hide every button except those marked k8sReadOnly, and any
+        // toolbar left with nothing to show. Applied to each panel as
+        // it is built and to the page's own top bar.
+        let readOnlyView = function(comp) {
+            if (canModify || !comp || !comp.query) { return comp; }
+            comp.query('button').forEach(function(b) {
+                // tab headers are buttons too: they only switch views
+                if (!b.k8sReadOnly && !(b instanceof Ext.tab.Tab)) { b.hide(); }
+            });
+            comp.query('toolbar').forEach(function(tb) {
+                let shown = tb.items.findBy(function(it) {
+                    return !it.hidden && !(it instanceof Ext.toolbar.Fill)
+                        && !(it instanceof Ext.toolbar.Separator)
+                        && !(it instanceof Ext.toolbar.Spacer);
+                });
+                if (!shown) { tb.hide(); }
+            });
+            return comp;
+        };
 
         let api = function(opts) {
             Proxmox.Utils.API2Request(Ext.apply({
@@ -1598,6 +1632,7 @@ Ext.define('PVE.dc.K8sView', {
                             + 'be provisioned.')),
                     {
                         text: gettext('Reload'),
+                        k8sReadOnly: true,
                         handler: function() { loadNodes(); },
                     },
                     {
@@ -2201,6 +2236,7 @@ Ext.define('PVE.dc.K8sView', {
         let settingsPanel = function(rec) {
             return Ext.create('PVE.dc.K8sSettings', {
                 clusterName: rec.name,
+                viewOnly: !canModify,
                 border: false,
                 onChanged: function() { me.reloadClusters(); },
             });
@@ -2235,7 +2271,7 @@ Ext.define('PVE.dc.K8sView', {
                 layout: 'fit',
                 itemId: id,
                 lazyBuild: function() {
-                    return buildPanel(clusterName, key, rec);
+                    return readOnlyView(buildPanel(clusterName, key, rec));
                 },
             });
             panels[id] = p;
@@ -2538,6 +2574,7 @@ Ext.define('PVE.dc.K8sView', {
                         {
                             text: gettext('Reload'),
                             iconCls: 'fa fa-fw fa-refresh',
+                            k8sReadOnly: true,
                             handler: function() { clusterStore.load(); },
                         },
                     ],
@@ -2559,6 +2596,7 @@ Ext.define('PVE.dc.K8sView', {
                 },
             });
             me.callParent();
+            readOnlyView(me);
             return;
         }
 
@@ -2605,6 +2643,7 @@ Ext.define('PVE.dc.K8sView', {
         });
 
         me.callParent();
+        readOnlyView(me);
     },
 });
 

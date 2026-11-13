@@ -219,7 +219,7 @@ my @oc = $oc =~ /(\w+Info)/g;
 is(scalar @hc, scalar @oc, 'overview columns have the same number of rows');
 
 # Cluster panels are built on first view, not all at once.
-like($js, qr/lazyBuild: function\(\) \{\s+return buildPanel\(clusterName, key, rec\);/,
+like($js, qr/lazyBuild: function\(\) \{\s+return readOnlyView\(buildPanel\(clusterName, key, rec\)\);/,
     'menu entries are placeholders built on first view');
 like($js, qr/if \(target\.lazyBuild\) \{/, 'showing a panel builds it once');
 
@@ -231,5 +231,15 @@ like($js, qr/Ext\.defer\(function\(\) \{ cb\(r\.resp\); \}, 1\);/,
     'an already answered summary is handed over asynchronously (gauges must be rendered)');
 my $fos = () = $js =~ /fireOnStart: false/g;
 is($fos, 2, 'the 30 s polls do not load the list a second time on start');
+
+# Read-only users (Sys.Audit without Sys.Modify) get no write buttons.
+like($js, qr/caps\.dc\['Sys\.Modify'\]/, 'UI reads Sys.Modify from GuiCap');
+like($js, qr/readOnlyView\(buildPanel\(/, 'each lazily built panel is filtered');
+my $ro = () = $js =~ /readOnlyView\(me\);/g;
+is($ro, 2, 'list view and cluster page top bars are filtered');
+like($js, qr/viewOnly: !canModify/, 'settings grid gets no editors without Sys.Modify');
+my $keep = () = $js =~ /k8sReadOnly: true/g;
+is($keep, 2, 'only the two Reload buttons survive for read-only users');
+like($js, qr/instanceof Ext\.tab\.Tab/, 'tab headers (Workloads) stay for read-only users');
 
 done_testing();
