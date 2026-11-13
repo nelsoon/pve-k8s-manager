@@ -402,7 +402,7 @@ replaces anything itself.
 | metrics-server
 | opt-in
 | enable/disable in Add-ons; feeds the pod CPU/memory
-  section of the Metrics panel (0.8.0,
+  section of the Metrics panel (0.9.1,
   `--kubelet-insecure-tls` for the lab PKI)
 |===
 

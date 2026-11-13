@@ -14,8 +14,8 @@ use warnings;
 # 1.37 support lands in Cilium 1.21 (pre-release at pin time),
 # so 1.37 clusters rely on Kubernetes backward compatibility
 # until 1.21 is stable - proven in the lab before release.
-our $CILIUM_VERSION = '1.20.3';
-our $HELM_VERSION = '3.16.3';
+our $CILIUM_VERSION = '1.20.4';
+our $HELM_VERSION = '4.3.2';
 our $POD_CIDR = '10.244.0.0/16';
 
 sub cilium_values_yaml {
@@ -52,9 +52,11 @@ envoy:
 EOF
 }
 
+# Installs the pinned helm, and replaces any other version (an
+# older cluster keeps the helm it was built with otherwise).
 my sub helm_ensure_cmd {
-    return sprintf(<<'EOF', $HELM_VERSION);
-if [ ! -x /usr/local/bin/helm ]; then
+    return sprintf(<<'EOF', $HELM_VERSION, $HELM_VERSION);
+if [ "$(/usr/local/bin/helm version --template '{{.Version}}' 2>/dev/null)" != v%s ]; then
     HA=$(uname -m); [ "$HA" = aarch64 ] && HA=arm64 || HA=amd64
     curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-v%s-linux-$HA.tar.gz
     tar -xzf /tmp/helm.tgz -C /tmp
@@ -67,7 +69,7 @@ EOF
 # Experimental channel: Cilium 1.20's Gateway controller
 # requires TLSRoutes, BackendTLSPolicies and ReferenceGrant
 # v1, which the standard channel does not ship.
-our $GATEWAY_API_VERSION = '1.5.0';
+our $GATEWAY_API_VERSION = '1.5.1';
 
 sub cilium_install_cmd {
     my ($kubeconfig, $vip) = @_;
@@ -139,8 +141,8 @@ kubectl -n kube-system rollout status deploy/proxmox-cloud-controller-manager --
 EOF
 }
 
-our $CSI_VERSION = '0.20.0';
-our $CSI_CHART_VERSION = '0.5.12';
+our $CSI_VERSION = '0.22.0';
+our $CSI_CHART_VERSION = '0.5.15';
 
 sub csi_values_yaml {
     my ($url, $token_id, $token_secret, $region, $storage) = @_;
@@ -170,7 +172,7 @@ EOF
 # driver - nobody creates directories by hand. The export
 # itself (and its no_root_squash tradeoff) stays a
 # one-time admin task on the server.
-our $NFS_CSI_VERSION = '4.11.0';
+our $NFS_CSI_VERSION = '4.13.6';
 
 sub shared_file_class_yaml {
     my ($scfg) = @_;
@@ -221,7 +223,7 @@ EOF
 # PVE/Ceph APIs; here we only install ceph-csi and our
 # own class. The CephX key lives solely in the
 # in-cluster Secret, like every other add-on credential.
-our $CEPH_CSI_VERSION = '3.18.1';
+our $CEPH_CSI_VERSION = '3.18.2';
 
 sub cephfs_class_yaml {
     my ($fsid, $fs) = @_;
@@ -328,14 +330,8 @@ EOF
 sub csi_install_cmd {
     my ($kubeconfig, $values_yaml) = @_;
 
-    return sprintf(<<'EOF', $HELM_VERSION, $kubeconfig, $values_yaml, $CSI_CHART_VERSION);
-if [ ! -x /usr/local/bin/helm ]; then
-    HA=$(uname -m); [ "$HA" = aarch64 ] && HA=arm64 || HA=amd64
-    curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-v%s-linux-$HA.tar.gz
-    tar -xzf /tmp/helm.tgz -C /tmp
-    install -m 0755 /tmp/linux-$HA/helm /usr/local/bin/helm
-    rm -rf /tmp/helm.tgz /tmp/linux-$HA
-fi
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $values_yaml, $CSI_CHART_VERSION);
+%s
 export KUBECONFIG=%s
 cat > /root/proxmox-csi-values.yaml <<'VALUES'
 %sVALUES
@@ -396,7 +392,7 @@ EOF
 # user enables them (UI or API). cert-manager always opens
 # its configuration; the internal-CA issuer is the default.
 
-our $CERTMANAGER_VERSION = '1.18.2';
+our $CERTMANAGER_VERSION = '1.21.3';
 
 sub certmanager_issuer_yaml {
     my ($opts) = @_;
@@ -463,8 +459,8 @@ kubectl wait clusterissuer --all --for=condition=Ready --timeout=300s || true
 EOF
 }
 
-our $EXTDNS_VERSION = '0.20.0';
-our $EXTDNS_CHART_VERSION = '1.20.1';
+our $EXTDNS_VERSION = '0.23.0';
+our $EXTDNS_CHART_VERSION = '1.23.0';
 
 sub external_dns_values_yaml {
     my ($cluster, $opts) = @_;
@@ -520,7 +516,7 @@ EOF
 # --- metrics-server: pod/node CPU+memory via the metrics
 # API (kubectl top). kubeadm kubelets use a self-signed
 # serving cert, so --kubelet-insecure-tls is required.
-our $METRICS_SERVER_VERSION = '0.8.0';
+our $METRICS_SERVER_VERSION = '0.9.1';
 
 sub metrics_server_install_cmd {
     my ($kubeconfig) = @_;

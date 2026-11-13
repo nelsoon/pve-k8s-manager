@@ -118,7 +118,9 @@ def main():
     # kubectl runs the plugin once per process; a second call from the
     # same kubectl means the API server rejected the cached token
     parent = os.getppid()
-    fresh = (cached and cached.get("expires", 0) - now > RENEW_BEFORE
+    fresh = (isinstance(cached, dict) and cached.get("token")
+             and isinstance(cached.get("expires"), int)
+             and cached["expires"] - now > RENEW_BEFORE
              and cached.get("parent") != parent)
     cred = cached if fresh else fetch(args.url, args.cluster, token,
                                       args.ca_data)
