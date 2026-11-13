@@ -64,7 +64,7 @@ is($plan->('delete pv pvc-9 --ignore-not-found --wait=true')->{wait_gone},
 # left to kubectl
 for my $args ('drain local-w1 --ignore-daemonsets --delete-emptydir-data --force --timeout=240s',
     'taint nodes local-w1 a=b:NoSchedule --overwrite', 'apply -f /tmp/move.json',
-    'top pods -A --no-headers', 'get nodes', 'get pv Bad_Name -o json',
+    'get nodes', 'get pv Bad_Name -o json',
     'get pods -n web;rm -rf / -o json', 'cordon local-w1; reboot') {
     is($plan->($args), undef, "kubectl: $args");
 }
@@ -115,6 +115,41 @@ my $v = PVE::K8s::Provision::server_git_version(
     JSON::PP->new->encode({ serverVersion => { gitVersion => 'v1.36.6' } }));
 is($v, 'v1.36.6', 'version text reads like kubectl version -o json');
 
+# top pods from the metrics API, read back by the existing parser
+my $tp = $plan->('top pods -A --no-headers');
+is($tp->{reqs}[0]{path}, '/apis/metrics.k8s.io/v1beta1/pods', 'top pods: metrics API');
+my $q = $P->can('k8s_quantity');
+is($q->('250m'), 0.25, 'millicores');
+is($q->('1500000n'), 0.0015, 'nanocores');
+is($q->('2'), 2, 'cores');
+is($q->('20Mi'), 20 * 1024**2, 'Mi');
+is($q->('1G'), 1e9, 'decimal G');
+is($q->('junk'), 0, 'unparsable is 0');
+my $top = $P->can('top_pods_text')->({ items => [
+    { metadata => { namespace => 'kube-system', name => 'coredns-1' },
+      containers => [{ usage => { cpu => '1500000n', memory => '20480Ki' } }] },
+    { metadata => { namespace => 'web', name => 'app-0' },
+      containers => [{ usage => { cpu => '100m', memory => '64Mi' } },
+          { usage => { cpu => '2m', memory => '1536Ki' } }] },
+] });
+like($top, qr/^kube-system\s+coredns-1\s+2m\s+20Mi$/m, 'CPU rounded up, like kubectl');
+like($top, qr/^web\s+app-0\s+102m\s+65Mi$/m, 'containers summed, memory rounded down');
+is_deeply(PVE::K8s::Provision::parse_top_pods($top),
+    [{ namespace => 'kube-system', name => 'coredns-1', cpu_m => 2, mem_mi => 20 },
+     { namespace => 'web', name => 'app-0', cpu_m => 102, mem_mi => 65 }],
+    'the metrics panel parser reads it');
+
+# moved PV/PVC: server-side apply instead of kubectl apply
+my $ar = $P->can('apply_request');
+my $pvr = $ar->({ apiVersion => 'v1', kind => 'PersistentVolume', metadata => { name => 'pvc-9' } });
+is($pvr->{path}, '/api/v1/persistentvolumes/pvc-9?fieldManager=pve-k8s&force=true', 'PV path');
+is($pvr->{type}, 'application/apply-patch+yaml', 'server-side apply (creates or updates)');
+is($ar->({ kind => 'PersistentVolumeClaim', metadata => { name => 'data-0', namespace => 'web' } })->{path},
+    '/api/v1/namespaces/web/persistentvolumeclaims/data-0?fieldManager=pve-k8s&force=true', 'PVC path');
+is($ar->({ kind => 'Deployment', metadata => { name => 'x' } }), undef, 'other kinds: kubectl');
+is($ar->({ kind => 'PersistentVolume', metadata => { name => '../x' } }), undef, 'bad names: kubectl');
+is($ar->({ kind => 'PersistentVolumeClaim', metadata => { name => 'a' } }), undef, 'PVC needs a namespace');
+
 # wiring
 my $src = do { local $/; open my $f, '<', 'PVE/K8s/Provision.pm' or die; <$f> };
 like($src, qr/if \(my \$plan = kubectl_api_plan\(\$args\)\) \{\n\s+my \$r = kubectl_api_run\(\$cp, \$plan\);\n\s+return kubectl_api_text\(\$plan, \$r->\{data\}\) if \$r;\n\s+\}\n\s+return guest_exec/,
@@ -132,5 +167,8 @@ like($src, qr/VSOCK_SKIP\{\$name\} = \$now \+ \$VSOCK_SKIP_SECONDS/,
 like($src, qr/VSOCK_SKIP\{"vm:\$cp->\{vmid\}"\} = \$now/, 'dead channel: that VM only');
 like($src, qr/kubectl_api_run\(\$candidate, \{ reqs => \[\{ method => 'GET',\n\s+path => '\/version' \}\] \}\)/,
     'ops_cp probes over vsock first');
+
+like($src, qr/if \(my \$req = apply_request\(\$obj\)\) \{\n\s+return '' if kubectl_api_run/,
+    'kubectl_apply_json: vsock first');
 
 done_testing;

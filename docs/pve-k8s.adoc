@@ -269,6 +269,30 @@ anything is stored).
   kubeadm PKI is renewed by rolling or upgrading the
   control plane; the Overview shows the worst level.
 
+=== How pve-k8s reaches the API
+
+The PVE hosts have no IP route into a cluster's node
+subnet. pve-k8s talks to Kubernetes over two channels:
+
+* *vsock* (the default for API calls). Every
+  control-plane VM has a virtio-vsock device, and a
+  small proxy in the guest forwards it to the local API
+  server. Reads, cordon/uncordon, labels, node deletes,
+  PV/PVC changes and re-creation (volume moves), events,
+  pod metrics and token issuing go this way,
+  as HTTPS with pve-k8s's own service-account token, in
+  well under a second per call.
+* *Guest agent exec* (`qm guest exec`, a few seconds
+  per call). It is used for work inside the VM
+  (`kubeadm`, packages, files, etcd snapshots), for the
+  commands that stay with kubectl (`drain`, `taint`,
+  add-on manifests), and as the fallback when vsock does not
+  answer: older nodes, the proxy down, or the API
+  server not up yet. After a failure, vsock is skipped
+  for two minutes for that VM, or for the whole cluster
+  when pve-k8s has no token for it yet, so the
+  fallback costs one try.
+
 == Networking
 
 * One EVPN SDN zone acts as the tenant VRF for all

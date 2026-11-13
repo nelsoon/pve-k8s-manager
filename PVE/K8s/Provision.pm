@@ -3708,6 +3708,8 @@ sub kubectl_api_plan {
         if $args =~ /^get pvc -n ($DNS) ($DNS) -o json$/;
     return $get->("/api/v1/namespaces/$1/pods")
         if $args =~ /^get pods -n ($DNS) -o json$/;
+    return { %{ $get->('/apis/metrics.k8s.io/v1beta1/pods') }, out => 'top-text' }
+        if $args eq 'top pods -A --no-headers';
     if ($args =~ /^(un)?cordon ($DNS)$/) {
         return { out => 'none', reqs => [$merge->("/api/v1/nodes/$2",
             { spec => { unschedulable => $1 ? JSON::PP::false()
@@ -3763,6 +3765,65 @@ sub nodes_text {
             (($n->{status} // {})->{nodeInfo} // {})->{kubeletVersion} // '');
     }
     return join('', map { "$_\n" } @lines);
+}
+
+# Pure: a Kubernetes quantity as a number of base units.
+sub k8s_quantity {
+    my ($q) = @_;
+
+    my %mult = (n => 1e-9, u => 1e-6, m => 1e-3, '' => 1,
+        k => 1e3, M => 1e6, G => 1e9, T => 1e12,
+        Ki => 1024, Mi => 1024**2, Gi => 1024**3, Ti => 1024**4);
+    return 0 if ($q // '') !~ /^(\d+(?:\.\d+)?)(n|u|m|k|M|G|T|Ki|Mi|Gi|Ti)?$/;
+    return $1 * $mult{$2 // ''};
+}
+
+# Pure: `kubectl top pods -A --no-headers` lines from a metrics
+# PodMetricsList (CPU rounded up to millicores, memory down to Mi, as
+# kubectl does).
+sub top_pods_text {
+    my ($list) = @_;
+
+    my @lines;
+    for my $p ((($list // {})->{items} // [])->@*) {
+        # whole nanocores and bytes: no float drift in the sums
+        my ($nano, $mem) = (0, 0);
+        for my $c (($p->{containers} // [])->@*) {
+            $nano += sprintf('%.0f',
+                k8s_quantity(($c->{usage} // {})->{cpu}) * 1e9);
+            $mem += sprintf('%.0f',
+                k8s_quantity(($c->{usage} // {})->{memory}));
+        }
+        my $m = int($nano / 1e6) + ($nano % 1_000_000 ? 1 : 0);
+        push @lines, join('   ', $p->{metadata}{namespace} // '',
+            $p->{metadata}{name} // '', "${m}m",
+            int($mem / 1024**2) . 'Mi');
+    }
+    return join('', map { "$_\n" } sort @lines);
+}
+
+# Pure: server-side apply of one object pve-k8s re-creates (a moved
+# PV or PVC), or undef for other kinds.
+sub apply_request {
+    my ($obj) = @_;
+
+    my $kind = ($obj // {})->{kind} // '';
+    my $meta = $obj->{metadata} // {};
+    my $name = $meta->{name} // '';
+    return undef if $name !~ /^$DNS$/;
+    my $path;
+    if ($kind eq 'PersistentVolume') {
+        $path = "/api/v1/persistentvolumes/$name";
+    } elsif ($kind eq 'PersistentVolumeClaim') {
+        my $ns = $meta->{namespace} // '';
+        return undef if $ns !~ /^$DNS$/;
+        $path = "/api/v1/namespaces/$ns/persistentvolumeclaims/$name";
+    } else {
+        return undef;
+    }
+    return { method => 'PATCH', ok => [200, 201],
+        path => "$path?fieldManager=pve-k8s&force=true",
+        type => 'application/apply-patch+yaml', body => $obj };
 }
 
 # Pure: items sorted like kubectl --sort-by (missing values first).
@@ -3842,6 +3903,7 @@ my sub kubectl_api_text {
     my $out = $plan->{out} // 'json';
     return '' if $out eq 'none';
     return nodes_text($data) if $out eq 'nodes-text';
+    return top_pods_text($data) if $out eq 'top-text';
     my $json = JSON::PP->new->canonical;
     return $json->encode({ serverVersion => $data }) if $out eq 'version';
     return $json->encode($data);
@@ -6432,6 +6494,9 @@ sub extract_task_upid {
 sub kubectl_apply_json {
     my ($cp, $obj, $tag) = @_;
 
+    if (my $req = apply_request($obj)) {
+        return '' if kubectl_api_run($cp, { reqs => [$req], out => 'none' });
+    }
     my $tmp = "/tmp/pve-k8s-move-$tag.json";
     open my $fh, '>', $tmp or die "open $tmp: $!\n";
     print $fh JSON::PP->new->canonical->encode($obj);
