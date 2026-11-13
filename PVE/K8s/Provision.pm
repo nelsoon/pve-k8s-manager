@@ -2765,8 +2765,9 @@ sub provision_cluster {
     # node (lab, 2026-10-28: a post-roll scale re-ran the
     # install on a converged CP and died on localhost:8080).
     my $k8s_minor = $scfg->{'k8s-version'};
+    my $enc = $scfg->{encryption};
     guest_exec($cp1->{vmid}, PVE::K8s::Addons::cilium_install_cmd(
-        '/root/local-super-admin.conf', $vip, $k8s_minor)) if $fresh;
+        '/root/local-super-admin.conf', $vip, $k8s_minor, $enc)) if $fresh;
     set_external_cloud_provider($cp1);
     ensure_kubelet_node_ip($cp1);
     print "control plane initialised on $cp1->{host}\n";
@@ -7386,7 +7387,7 @@ sub update_addon {
         my $have = eval { cilium_running($cp) };
         PVE::K8s::Addons::cilium_step($have, $want);
         guest_exec($cp->{vmid}, PVE::K8s::Addons::cilium_install_cmd(
-            $kc, PVE::K8s::Config::vip_for($scfg), $minor));
+            $kc, PVE::K8s::Config::vip_for($scfg), $minor, $scfg->{encryption}));
     } elsif ($addon eq 'proxmox-ccm') {
         install_ccm($name, $scfg, $cp, $nodes, undef, update => 1);
     } elsif ($addon eq 'proxmox-csi') {
@@ -7419,6 +7420,26 @@ sub update_addon {
     record_addon($name, $addon, { version => $want });
     print "$addon is at $want on cluster '$name'\n";
     return $want;
+}
+
+# Turn encryption of pod traffic between nodes on or off: store the
+# setting, then re-apply Cilium with it (its agents restart one node
+# at a time; connections between pods may drop once while they do).
+sub set_encryption {
+    my ($name, $mode) = @_;
+
+    die "encryption must be off or wireguard\n" if ($mode // '') !~ /^(?:off|wireguard)$/;
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "cluster '$name' is not ready\n" if ($scfg->{state} // '') ne 'ready';
+    PVE::K8s::Config::lock_config(sub {
+        my $locked = PVE::K8s::Config->config();
+        $locked->{ids}->{$name}->{encryption} = $mode;
+        PVE::K8s::Config::store_config($locked);
+    });
+    print "encryption of pod traffic: $mode; re-applying Cilium\n";
+    update_addon($name, 'cilium');
+    return 1;
 }
 
 # Merge fields into an add-on's record (cluster config, under lock).

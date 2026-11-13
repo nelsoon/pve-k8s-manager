@@ -273,6 +273,13 @@ my $defaultData = {
             maximum => 1440,
             optional => 1,
         },
+        encryption => {
+            type => 'string',
+            enum => ['off', 'wireguard'],
+            description => "Pod-to-pod traffic between nodes: off (default) "
+                . "or encrypted by Cilium with WireGuard.",
+            optional => 1,
+        },
         state => {
             type => 'string',
             description => "Lifecycle state recorded by pve-k8sd.",
@@ -329,6 +336,7 @@ sub options {
         'backup-retention' => { optional => 1 },
         'scale-in-cooldown' => { optional => 1 },
         'kubeconfig-max-hours' => { optional => 1 },
+        encryption => { optional => 1 },
         storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },

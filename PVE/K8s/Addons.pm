@@ -59,7 +59,13 @@ our $HELM_VERSION = '4.3.2';
 our $POD_CIDR = '10.244.0.0/16';
 
 sub cilium_values_yaml {
-    my ($vip) = @_;
+    my ($vip, $encryption) = @_;
+
+    # Transparent encryption of pod traffic between nodes. WireGuard
+    # only; Cilium's older mutual authentication is gone in 1.21 and
+    # ztunnel is beta.
+    my $enc = ($encryption // 'off') eq 'wireguard'
+        ? "encryption:\n  enabled: true\n  type: wireguard\n" : '';
 
     # T3.4 re-spec: no Cilium BGP, ever. External
     # reachability of LoadBalancer IPs is a Proxmox SDN
@@ -96,6 +102,7 @@ hubble:
     enabled: true
   ui:
     enabled: true
+${enc}
 EOF
 }
 
@@ -122,13 +129,13 @@ EOF
 our $GATEWAY_API_VERSION = '1.6.3';
 
 sub cilium_install_cmd {
-    my ($kubeconfig, $vip, $minor) = @_;
+    my ($kubeconfig, $vip, $minor, $encryption) = @_;
 
     # Single-quoted heredoc + sprintf: an interpolating heredoc
     # strips backslash-newline continuations, which once made
     # helm run without its namespace/values arguments.
     my @args = (helm_ensure_cmd(), $kubeconfig,
-        $GATEWAY_API_VERSION, cilium_values_yaml($vip),
+        $GATEWAY_API_VERSION, cilium_values_yaml($vip, $encryption),
         cilium_version_for($minor));
     return sprintf(<<'EOF', @args);
 %s

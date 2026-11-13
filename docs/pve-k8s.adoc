@@ -404,7 +404,15 @@ where its running version is read in the cluster.
 | core
 | CNI, LoadBalancer IPs, ingress and Gateway; Hubble
   relay and UI (ClusterIP) for pod-to-pod flows; the
-  Gateway API CRDs update with it
+  Gateway API CRDs update with it. *Pod Traffic
+  Encryption* (create dialog, Settings, `encryption`):
+  `off` or `wireguard`, which encrypts pod traffic between
+  nodes. Changing it re-applies Cilium
+  (`POST .../encryption`, a task): the agents restart one
+  node at a time and pod connections between nodes may
+  drop once. Cilium's older mutual authentication is not
+  offered (removed in Cilium 1.21); its ztunnel mTLS will
+  be once it leaves beta.
 
 | proxmox-ccm
 | core
@@ -750,6 +758,7 @@ privilege).
 | POST | `.../addons/{addon}/disable` | turn off a default add-on
 | POST | `.../addons/{addon}/update` | re-apply one add-on at its pinned version
 | POST | `.../addon-updates` | update every add-on that is behind
+| POST | `.../encryption` | pod traffic encryption off/wireguard (re-applies Cilium)
 | GET | `.../app-backups` | Velero application backups
 | POST | `.../app-backups` | back up every namespace now
 | POST | `.../app-backups/{backup}/restore` | restore one

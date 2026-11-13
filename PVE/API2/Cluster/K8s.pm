@@ -214,6 +214,13 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Control-plane failure policy.",
             },
+            encryption => {
+                type => 'string',
+                enum => ['off', 'wireguard'],
+                optional => 1,
+                description => "Encrypt pod traffic between nodes with "
+                    . "WireGuard (default off).",
+            },
             'maintenance-window' => {
                 type => 'string',
                 pattern => '^\d{2}:\d{2}-\d{2}:\d{2}$',
@@ -332,7 +339,7 @@ __PACKAGE__->register_method({
                         maintenance-window backup-dir sdn-zone
                         public-subnet file-backend file-server
                         file-share cp-arch storage-profile
-                        cp-policy builder-ip
+                        cp-policy builder-ip encryption
                         backup-retention description)),
             };
 
@@ -1267,6 +1274,37 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         return PVE::K8s::Provision::list_backups($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'encryption',
+    path => '{name}/encryption',
+    method => 'POST',
+    protected => 1,
+    description => "Turn encryption of pod traffic between nodes on "
+        . "(WireGuard) or off; re-applies Cilium (a rolling agent restart).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => $cluster_name,
+            encryption => {
+                type => 'string',
+                enum => ['off', 'wireguard'],
+                description => "off or wireguard.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+        return fork_cluster_worker('k8sencryption', $param->{name},
+            'encryption', sub {
+                PVE::K8s::Provision::set_encryption($param->{name},
+                    $param->{encryption});
+            });
     }});
 
 __PACKAGE__->register_method({

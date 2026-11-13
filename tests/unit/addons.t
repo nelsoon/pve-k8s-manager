@@ -415,4 +415,20 @@ like($prov, qr/die "Velero backup \$bname \$st->\{phase\}"/, 'a failed backup st
 like($api, qr/path => '\{name\}\/app-backups\/\{backup\}\/restore',[\s\S]*?Sys\.Modify/,
     'restore needs Sys.Modify');
 
+# Pod traffic encryption (WireGuard)
+like(PVE::K8s::Addons::cilium_values_yaml('10.0.0.5', 'wireguard'),
+    qr/encryption:\n  enabled: true\n  type: wireguard\n/, 'WireGuard on request');
+unlike(PVE::K8s::Addons::cilium_values_yaml('10.0.0.5', 'off'), qr/encryption:/, 'off: nothing');
+unlike(PVE::K8s::Addons::cilium_values_yaml('10.0.0.5'), qr/encryption:/, 'default off');
+like(PVE::K8s::Addons::cilium_install_cmd('/k', '10.0.0.5', '1.36', 'wireguard'),
+    qr/type: wireguard/, 'install carries it');
+like($prov, qr/cilium_install_cmd\(\s*\$kc, PVE::K8s::Config::vip_for\(\$scfg\), \$minor, \$scfg->\{encryption\}\)/,
+    'a Cilium update keeps the setting');
+like($prov, qr/'\/root\/local-super-admin\.conf', \$vip, \$k8s_minor, \$enc\)\) if \$fresh;/,
+    'and so does the first install');
+like($prov, qr/sub set_encryption \{[\s\S]*?update_addon\(\$name, 'cilium'\);/,
+    'changing it re-applies Cilium');
+ok(!eval { PVE::K8s::Provision::set_encryption('x', 'ipsec'); 1 }, 'only off or wireguard');
+like($api, qr/path => '\{name\}\/encryption',[\s\S]*?Sys\.Modify/, 'needs Sys.Modify');
+
 done_testing();

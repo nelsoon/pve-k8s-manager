@@ -338,6 +338,16 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     emptyText: gettext('auto: first free 10.10.x.0/24'),
                 },
                 {
+                    xtype: 'proxmoxKVComboBox',
+                    name: 'encryption',
+                    fieldLabel: gettext('Pod Traffic Encryption'),
+                    comboItems: [
+                        ['off', gettext('Off')],
+                        ['wireguard', gettext('WireGuard (between nodes)')],
+                    ],
+                    value: 'off',
+                },
+                {
                     xtype: 'textfield',
                     name: 'gateway',
                     fieldLabel: gettext('Gateway'),
@@ -1346,6 +1356,34 @@ Ext.define('PVE.dc.K8sSettings', {
                     hint(gettext('HA needs shared storage; the API refuses it otherwise.')),
                 ]),
             },
+            encryption: {
+                header: gettext('Pod Traffic Encryption'),
+                required: true,
+                defaultValue: 'off',
+                renderer: function(v) {
+                    return v === 'wireguard' ? gettext('WireGuard (between nodes)')
+                        : gettext('Off');
+                },
+                // not a plain setting: Cilium is re-applied, as a task
+                editor: Ext.apply(edit(gettext('Pod Traffic Encryption'), [
+                    {
+                        xtype: 'proxmoxKVComboBox', name: 'encryption',
+                        fieldLabel: gettext('Encryption'),
+                        comboItems: [
+                            ['off', gettext('Off')],
+                            ['wireguard', gettext('WireGuard (between nodes)')],
+                        ],
+                        value: 'off', allowBlank: false,
+                    },
+                    hint(gettext('Cilium is re-applied: its agents restart one '
+                        + 'node at a time, and pod connections between nodes '
+                        + 'may drop once.')),
+                ]), {
+                    url: '/cluster/k8s/' + name + '/encryption',
+                    method: 'POST',
+                    showTaskViewer: true,
+                }),
+            },
             'storage-profile': {
                 header: gettext('Storage Profile'),
                 required: false,
@@ -1374,7 +1412,7 @@ Ext.define('PVE.dc.K8sSettings', {
         };
         let order = ['description', 'maintenance-window', 'backup-retention',
             'scale-in-cooldown', 'kubeconfig-max-hours', 'cp-policy',
-            'storage-profile',
+            'storage-profile', 'encryption',
             'k8s-version', 'state', 'cp',
             'storage', 'node-subnet', 'public-subnet', 'sdn-zone',
             'template-rev', 'cp-arch'];
