@@ -89,6 +89,13 @@ gatewayAPI:
   enabled: true
 envoy:
   enabled: true
+# Hubble: pod-to-pod flow visibility (relay + UI, ClusterIP)
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
 EOF
 }
 
@@ -590,6 +597,218 @@ kubectl delete -f /root/ms.yaml --ignore-not-found
 EOF
 }
 
+# --- default add-ons that help pve-k8s itself ---------------
+
+# CSI snapshots: the VolumeSnapshot CRDs and the common
+# snapshot-controller (both Proxmox CSI and ceph-csi take
+# snapshots; Velero's data mover needs them).
+our $SNAPSHOT_VERSION = '8.7.0';
+
+sub snapshot_controller_install_cmd {
+    my ($kubeconfig) = @_;
+
+    my $base = 'https://raw.githubusercontent.com/kubernetes-csi/'
+        . "external-snapshotter/v$SNAPSHOT_VERSION";
+    my @crds = map { "$base/client/config/crd/$_.yaml" } (
+        (map { "snapshot.storage.k8s.io_$_" }
+            qw(volumesnapshotclasses volumesnapshotcontents volumesnapshots)),
+        (map { "groupsnapshot.storage.k8s.io_$_" }
+            qw(volumegroupsnapshotclasses volumegroupsnapshotcontents
+                volumegroupsnapshots)));
+    my $crd_lines = join '',
+        map { "kubectl apply --server-side --force-conflicts -f $_\n" } @crds;
+    my $dep = "$base/deploy/kubernetes/snapshot-controller";
+    my $img = 'registry.k8s.io/sig-storage/snapshot-controller';
+    # the release's manifest can name an older image: pin it
+    return <<"EOF";
+export KUBECONFIG=$kubeconfig
+${crd_lines}kubectl apply -f $dep/rbac-snapshot-controller.yaml
+curl -fsSL $dep/setup-snapshot-controller.yaml \\
+    | sed -E 's#(image: $img):v[0-9.]+#\\1:v$SNAPSHOT_VERSION#' \\
+    | kubectl apply -f -
+kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s
+EOF
+}
+
+sub snapshot_controller_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    # the CRDs stay: deleting them would delete every snapshot
+    my $base = 'https://raw.githubusercontent.com/kubernetes-csi/'
+        . "external-snapshotter/v$SNAPSHOT_VERSION";
+    return <<"EOF";
+export KUBECONFIG=$kubeconfig
+kubectl -n kube-system delete deployment snapshot-controller --ignore-not-found
+EOF
+}
+
+# node-problem-detector: kernel deadlocks and read-only file
+# systems become node conditions (KernelDeadlock,
+# ReadonlyFilesystem) that pve-k8s auto-repair acts on.
+# Released per Kubernetes minor.
+our %NPD_FOR_MINOR = ('1.35' => '1.35.4', '1.36' => '1.36.1', '1.37' => '1.37.0');
+
+sub npd_version_for {
+    my ($minor) = @_;
+
+    ($minor) = ($minor // '') =~ /^v?(\d+\.\d+)/;
+    return $NPD_FOR_MINOR{$minor // ''}
+        // $NPD_FOR_MINOR{(sort { $a <=> $b } keys %NPD_FOR_MINOR)[-1]};
+}
+
+sub npd_install_cmd {
+    my ($kubeconfig, $minor) = @_;
+
+    my $v = npd_version_for($minor);
+    # the image's own configs: kernel + read-only monitors
+    return <<"EOF";
+export KUBECONFIG=$kubeconfig
+kubectl apply -f - <<'NPD'
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: node-problem-detector, namespace: kube-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: pve-k8s-node-problem-detector}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-problem-detector
+subjects:
+- {kind: ServiceAccount, name: node-problem-detector, namespace: kube-system}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-problem-detector
+  namespace: kube-system
+  labels: {app: node-problem-detector}
+spec:
+  selector:
+    matchLabels: {app: node-problem-detector}
+  template:
+    metadata:
+      labels: {app: node-problem-detector}
+    spec:
+      serviceAccountName: node-problem-detector
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: node-problem-detector
+        image: registry.k8s.io/node-problem-detector/node-problem-detector:v$v
+        command:
+        - /node-problem-detector
+        - --logtostderr
+        - --config.system-log-monitor=/config/kernel-monitor.json,/config/readonly-monitor.json
+        securityContext: {privileged: true}
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        resources:
+          requests: {cpu: 10m, memory: 40Mi}
+          limits: {memory: 120Mi}
+        volumeMounts:
+        - {name: log, mountPath: /var/log, readOnly: true}
+        - {name: kmsg, mountPath: /dev/kmsg, readOnly: true}
+        - {name: localtime, mountPath: /etc/localtime, readOnly: true}
+      volumes:
+      - name: log
+        hostPath: {path: /var/log/}
+      - name: kmsg
+        hostPath: {path: /dev/kmsg}
+      - name: localtime
+        hostPath: {path: /etc/localtime, type: FileOrCreate}
+NPD
+kubectl -n kube-system rollout status ds/node-problem-detector --timeout=300s
+EOF
+}
+
+sub npd_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    return <<"EOF";
+export KUBECONFIG=$kubeconfig
+kubectl -n kube-system delete daemonset node-problem-detector --ignore-not-found
+kubectl delete clusterrolebinding pve-k8s-node-problem-detector --ignore-not-found
+kubectl -n kube-system delete serviceaccount node-problem-detector --ignore-not-found
+EOF
+}
+
+# Spegel: nodes serve the image layers they hold to each other
+# (stateless; containerd falls back to the registry). Needs
+# containerd config_path (node template), else it is inert.
+our $SPEGEL_VERSION = '0.8.1';
+
+sub spegel_install_cmd {
+    my ($kubeconfig) = @_;
+
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $SPEGEL_VERSION);
+%s
+export KUBECONFIG=%s
+helm upgrade -i spegel oci://ghcr.io/spegel-org/helm-charts/spegel \
+    --version %s -n spegel --create-namespace
+kubectl -n spegel rollout status ds/spegel --timeout=300s
+EOF
+}
+
+sub spegel_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig);
+%s
+export KUBECONFIG=%s
+helm uninstall spegel -n spegel --ignore-not-found
+EOF
+}
+
+# descheduler: installed suspended; pve-k8s runs it as a one-off
+# Job after a roll or a scale-out (its own timer could evict pods
+# into Pending and start the scaler). Released per minor.
+our %DESCHEDULER_FOR_MINOR = ('1.35' => '0.35.1', '1.36' => '0.36.0', '1.37' => '0.37.0');
+
+sub descheduler_version_for {
+    my ($minor) = @_;
+
+    ($minor) = ($minor // '') =~ /^v?(\d+\.\d+)/;
+    return $DESCHEDULER_FOR_MINOR{$minor // ''}
+        // $DESCHEDULER_FOR_MINOR{(sort { $a <=> $b } keys %DESCHEDULER_FOR_MINOR)[-1]};
+}
+
+sub descheduler_install_cmd {
+    my ($kubeconfig, $minor) = @_;
+
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, descheduler_version_for($minor));
+%s
+export KUBECONFIG=%s
+helm repo add descheduler https://kubernetes-sigs.github.io/descheduler/ >/dev/null 2>&1 || true
+helm repo update descheduler >/dev/null
+helm upgrade -i descheduler descheduler/descheduler --version %s \
+    -n kube-system --set kind=CronJob --set suspend=true \
+    --set schedule='0 0 1 1 *'
+EOF
+}
+
+# One run now, from the suspended CronJob.
+sub descheduler_run_cmd {
+    my ($kubeconfig, $tag) = @_;
+
+    $tag =~ /^[a-z0-9-]{1,30}$/ or die "bad descheduler job tag\n";
+    return "kubectl --kubeconfig $kubeconfig -n kube-system create job "
+        . "--from=cronjob/descheduler descheduler-$tag\n";
+}
+
+sub descheduler_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig);
+%s
+export KUBECONFIG=%s
+helm uninstall descheduler -n kube-system --ignore-not-found
+EOF
+}
+
 # --- Add-on manager catalog ----------------------------------
 # One entry per add-on pve-k8s manages. The manager (list,
 # update, upgrade step) is driven by this table only:
@@ -640,6 +859,24 @@ our @CATALOG = (
       version => sub { $METRICS_SERVER_VERSION },
       probe => { kind => 'deployment', ns => 'kube-system',
           name => 'metrics-server' } },
+    { name => 'snapshot-controller', tier => 'default',
+      title => 'Volume snapshots (VolumeSnapshot CRDs and controller)',
+      version => sub { $SNAPSHOT_VERSION },
+      probe => { kind => 'deployment', ns => 'kube-system',
+          name => 'snapshot-controller' } },
+    { name => 'node-problem-detector', tier => 'default',
+      title => 'Reports kernel and file system faults as node conditions (feeds auto-repair)',
+      version => sub { npd_version_for($_[0]) },
+      probe => { kind => 'daemonset', ns => 'kube-system',
+          name => 'node-problem-detector' } },
+    { name => 'spegel', tier => 'default',
+      title => 'Nodes share cached image layers (faster rolls, scale-out and repairs)',
+      version => sub { $SPEGEL_VERSION },
+      probe => { kind => 'daemonset', ns => 'spegel', name => 'spegel' } },
+    { name => 'descheduler', tier => 'default',
+      title => 'Rebalances pods; run by pve-k8s after rolls and scale-outs',
+      version => sub { descheduler_version_for($_[0]) },
+      probe => { kind => 'cronjob', ns => 'kube-system', name => 'descheduler' } },
     { name => 'cert-manager', tier => 'optional',
       title => 'TLS certificates (internal CA by default, ACME optional)',
       version => sub { $CERTMANAGER_VERSION },
@@ -705,7 +942,7 @@ sub probe_versions {
     my ($lists, $backend) = @_;
 
     my %idx;
-    for my $kind (qw(deployment daemonset crd)) {
+    for my $kind (qw(deployment daemonset cronjob crd)) {
         for my $o ((($lists->{$kind} // {})->{items} // [])->@*) {
             my $m = $o->{metadata} // {};
             $idx{$kind}{($m->{namespace} // '') . '/' . ($m->{name} // '')} = $o;
@@ -721,7 +958,9 @@ sub probe_versions {
                 ->{$p->{annotation}} // '') =~ /^v?(\d+\.\d+\.\d+)/;
         } else {
             my $want = $p->{image} // $p->{name};
-            for my $c (((((($o->{spec} // {})->{template} // {})->{spec} // {})
+            my $spec = $o->{spec} // {};
+            $spec = (($spec->{jobTemplate} // {})->{spec} // {}) if $p->{kind} eq 'cronjob';
+            for my $c (((((($spec)->{template} // {})->{spec} // {})
                     ->{containers}) // [])->@*) {
                 $ver = image_version($c->{image}, $want) and last;
             }

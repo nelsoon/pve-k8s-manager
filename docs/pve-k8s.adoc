@@ -402,7 +402,8 @@ where its running version is read in the cluster.
 
 | cilium (with gateway-api CRDs)
 | core
-| CNI, LoadBalancer IPs, ingress and Gateway; the
+| CNI, LoadBalancer IPs, ingress and Gateway; Hubble
+  relay and UI (ClusterIP) for pod-to-pod flows; the
   Gateway API CRDs update with it
 
 | proxmox-ccm
@@ -423,6 +424,33 @@ where its running version is read in the cluster.
   pod CPU/memory section of the Metrics panel
   (`--kubelet-insecure-tls` for the lab PKI)
 
+| snapshot-controller
+| default
+| VolumeSnapshot CRDs and controller (Proxmox CSI and
+  ceph-csi snapshots, Velero). Turning it off keeps the
+  CRDs, so existing snapshots stay.
+
+| node-problem-detector
+| default
+| kernel deadlocks and read-only file systems become node
+  conditions (`KernelDeadlock`, `ReadonlyFilesystem`);
+  version follows the Kubernetes minor
+
+| spegel
+| default
+| nodes serve the image layers they hold to each other, so
+  a new node (roll, scale-out, repair) pulls mostly from
+  its neighbours; stateless, the registry stays the
+  fallback. Needs node images from this release (containerd
+  `config_path`); on older nodes it is inert.
+
+| descheduler
+| default
+| installed suspended; pve-k8s runs it once after a roll or
+  a scale-out to rebalance pods (its own timer could evict
+  pods into Pending and wake the scaler). Version follows
+  the Kubernetes minor.
+
 | cert-manager
 | optional
 | enable with an issuer: the built-in CA (`ca`,
@@ -435,6 +463,11 @@ where its running version is read in the cluster.
   key and zone; the key is kept only in the in-cluster
   Secret
 |===
+
+Default add-ons are installed by provision and
+reinstalled by it when missing, unless they were turned
+off (*Disable*, `.../addons/{addon}/disable`); *Enable*
+turns one back on. Core add-ons cannot be turned off.
 
 The Add-ons panel shows each add-on's status, the
 version running in the cluster and the version pve-k8s
@@ -614,8 +647,8 @@ privilege).
 | GET | `.../workloads` | deployments, pods, services
 | GET | `.../metrics` | VM metrics (+ pods with metrics-server)
 | GET | `.../addons` | add-on states
-| POST | `.../addons/{addon}/enable` | cert-manager, external-dns, metrics-server
-| POST | `.../addons/{addon}/disable` | metrics-server
+| POST | `.../addons/{addon}/enable` | an optional add-on, or a default one turned off
+| POST | `.../addons/{addon}/disable` | turn off a default add-on
 | POST | `.../addons/{addon}/update` | re-apply one add-on at its pinned version
 | POST | `.../addon-updates` | update every add-on that is behind
 | POST | `.../nodes/{node}/drain` | drain a node

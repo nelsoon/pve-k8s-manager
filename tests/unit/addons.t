@@ -80,8 +80,26 @@ like($api, qr/fork_cluster_worker\('k8saddondisable'/,
     'addon disable runs as a k8saddondisable PVE task');
 like($api, qr/k8spowerstart|k8spowerstop/,
     'power task type carries the action for the task log');
-like($api, qr/pattern => '\^\(cert-manager\|external-dns\|metrics-server\)\$'/,
-    'only cert-manager, external-dns, metrics-server enable');
+like($api, qr/pattern => '\^\(cert-manager\|external-dns\|metrics-server\|'\s+\. 'snapshot-controller\|node-problem-detector\|spegel\|descheduler\)\$'/,
+    'enable takes the optional and default add-ons only');
+for my $e (grep { $_->{tier} eq 'default' } PVE::K8s::Addons::catalog()) {
+    ok(PVE::K8s::Provision::simple_addon_cmds($e->{name}, '/k', '1.36'),
+        "default add-on $e->{name} has install and delete commands");
+}
+like(PVE::K8s::Addons::npd_install_cmd('/k', '1.36'),
+    qr{node-problem-detector:v1\.36\.1\n}, 'node-problem-detector follows the minor');
+like(PVE::K8s::Addons::descheduler_install_cmd('/k', '1.37'),
+    qr/--version 0\.37\.0 \\\n.*--set kind=CronJob --set suspend=true/s,
+    'descheduler follows the minor, installed suspended');
+like(PVE::K8s::Addons::descheduler_run_cmd('/k', 'roll-1'),
+    qr/create job --from=cronjob\/descheduler descheduler-roll-1/, 'pve-k8s runs it on demand');
+ok(!eval { PVE::K8s::Addons::descheduler_run_cmd('/k', 'x; rm'); 1 }, 'job tag is checked');
+like(PVE::K8s::Addons::snapshot_controller_install_cmd('/k'),
+    qr/snapshot-controller\):v\[0-9\.\]\+#\\1:v8\.7\.0#/, 'snapshot-controller image pinned');
+unlike(PVE::K8s::Addons::snapshot_controller_delete_cmd('/k'), qr/crd/i,
+    'turning snapshots off keeps the CRDs (and the snapshots)');
+like(PVE::K8s::Addons::cilium_values_yaml('10.0.0.5'),
+    qr/hubble:\n  enabled: true\n  relay:\n    enabled: true/, 'Hubble relay on with Cilium');
 
 my $cfgpm = do {
     open my $fh, '<', 'PVE/K8s/Config.pm' or die $!;
@@ -246,6 +264,11 @@ like($api, qr/assert_network_config/,
     is($live->{'shared-file'}, '4.13.6', 'NFS driver for an nfs file tier');
     is($live->{'cert-manager'}, 'unknown', 'present but unreadable tag: unknown');
     ok(!exists $live->{'external-dns'}, 'absent: not installed');
+    is($A->can('probe_versions')->({ cronjob => { items => [{
+        metadata => { namespace => 'kube-system', name => 'descheduler' },
+        spec => { jobTemplate => { spec => { template => { spec => { containers => [
+            { image => 'registry.k8s.io/descheduler/descheduler:v0.36.0' }] } } } } } }] } },
+        undef)->{descheduler}, '0.36.0', 'a CronJob image is read through its job template');
     is($A->can('probe_versions')->($lists, 'cephfs')->{'shared-file'}, undef,
         'CephFS tier looks for the CephFS driver');
 

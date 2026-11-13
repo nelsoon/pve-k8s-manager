@@ -3033,12 +3033,17 @@ sub provision_cluster {
     # panels. Only an explicit disable (tombstone in the
     # add-on state) keeps it off; enable/disable in the
     # Add-ons panel still owns it afterwards.
-    my $astate = addons_state($scfg);
-    if (!$astate->{'metrics-server'}) {
-        my $ok = eval {
-            enable_addon($name, 'metrics-server', {}); 1 } // 0;
-        print "warning: default metrics-server install "
-            . "failed: $@" if !$ok;
+    # Every default add-on the same way, checked against what runs:
+    # a missing one is (re)installed unless it was turned off.
+    my $astate = addons_state(
+        PVE::K8s::Config->config()->{ids}->{$name} // $scfg);
+    my $alive = addons_live($name, $scfg, [map { +{ %$_, cluster => $name } } @nodes]);
+    for my $e (grep { $_->{tier} eq 'default' } PVE::K8s::Addons::catalog()) {
+        my $rec = $astate->{$e->{name}};
+        next if $rec && $rec->{disabled};
+        next if $alive ? defined $alive->{$e->{name}} : $rec;
+        my $ok = eval { enable_addon($name, $e->{name}, {}); 1 } // 0;
+        print "warning: default $e->{name} install failed: $@" if !$ok;
     }
     return $total;
 }
@@ -3724,6 +3729,7 @@ sub kubectl_api_plan {
         if $args eq 'get volumeattachments -o json';
     return $get->('/apis/apps/v1/deployments') if $args eq 'get deployments -A -o json';
     return $get->('/apis/apps/v1/daemonsets') if $args eq 'get daemonsets -A -o json';
+    return $get->('/apis/batch/v1/cronjobs') if $args eq 'get cronjobs -A -o json';
     return $get->("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/$1")
         if $args =~ /^get crd ($DNS) -o json$/;
     return $get->("/apis/apps/v1/namespaces/$1/daemonsets/$2")
@@ -7196,6 +7202,7 @@ sub addons_live {
         PVE::K8s::Addons::probe_versions({
             deployment => kubectl_json($cp, 'get deployments -A'),
             daemonset => kubectl_json($cp, 'get daemonsets -A'),
+            cronjob => eval { kubectl_json($cp, 'get cronjobs -A') } // {},
             crd => { items => [$crd ? $crd : ()] },
         }, $scfg->{'file-backend'});
     };
@@ -7224,6 +7231,27 @@ sub list_addons {
             : $where;
     }
     return $rows;
+}
+
+# Add-ons installed by one command without settings (default
+# tier): their apply and delete commands.
+sub simple_addon_cmds {
+    my ($addon, $kc, $minor) = @_;
+
+    my $A = 'PVE::K8s::Addons';
+    my %c = (
+        'metrics-server' => [sub { $A->can('metrics_server_install_cmd')->($kc) },
+            sub { $A->can('metrics_server_delete_cmd')->($kc) }],
+        'snapshot-controller' => [sub { $A->can('snapshot_controller_install_cmd')->($kc) },
+            sub { $A->can('snapshot_controller_delete_cmd')->($kc) }],
+        'node-problem-detector' => [sub { $A->can('npd_install_cmd')->($kc, $minor) },
+            sub { $A->can('npd_delete_cmd')->($kc) }],
+        'spegel' => [sub { $A->can('spegel_install_cmd')->($kc) },
+            sub { $A->can('spegel_delete_cmd')->($kc) }],
+        'descheduler' => [sub { $A->can('descheduler_install_cmd')->($kc, $minor) },
+            sub { $A->can('descheduler_delete_cmd')->($kc) }],
+    );
+    return $c{$addon};
 }
 
 # Re-apply one add-on at the version pve-k8s pins for $o{minor}
@@ -7261,11 +7289,10 @@ sub update_addon {
         die "cluster '$name' has no shared-file storage\n"
             if !$scfg->{'file-backend'};
         install_file_tier($name, $scfg, $cp, $nodes);
-    } elsif ($addon eq 'metrics-server') {
-        die "metrics-server is turned off on '$name'\n"
+    } elsif (my $cmds = simple_addon_cmds($addon, $kc, $minor)) {
+        die "$addon is turned off on '$name'\n"
             if $rec && $rec->{disabled};
-        guest_exec($cp->{vmid},
-            PVE::K8s::Addons::metrics_server_install_cmd($kc));
+        guest_exec($cp->{vmid}, $cmds->[0]->());
     } elsif ($addon eq 'cert-manager') {
         die "cert-manager is not enabled on '$name'\n" if !$rec;
         guest_exec($cp->{vmid}, PVE::K8s::Addons::certmanager_install_cmd(
@@ -7393,15 +7420,12 @@ sub enable_addon {
         );
         print "external-dns enabled on cluster '$name' "
             . "for zone '$record{zone}'\n";
-    } elsif ($addon eq 'metrics-server') {
-        guest_exec($cp->{vmid},
-            PVE::K8s::Addons::metrics_server_install_cmd(
-                $kubeconfig));
-        %record = (version => $PVE::K8s::Addons::METRICS_SERVER_VERSION);
-        print "metrics-server enabled on cluster '$name'\n";
+    } elsif (my $cmds = simple_addon_cmds($addon, $kubeconfig,
+            $scfg->{'k8s-version'})) {
+        guest_exec($cp->{vmid}, $cmds->[0]->());
+        print "$addon enabled on cluster '$name'\n";
     } else {
-        die "add-on '$addon' cannot be enabled "
-            . "(want cert-manager, external-dns or metrics-server)\n";
+        die "add-on '$addon' cannot be enabled\n";
     }
 
     PVE::K8s::Config::lock_config(sub {
@@ -7425,20 +7449,19 @@ sub disable_addon {
         or die "cluster '$name' does not exist\n";
     die "cluster '$name' is not ready\n"
         if ($scfg->{state} // '') ne 'ready';
-    die "add-on '$addon' cannot be disabled "
-        . "(only metrics-server)\n"
-        if $addon ne 'metrics-server';
+    my $cmds = simple_addon_cmds($addon, '/etc/kubernetes/admin.conf',
+        $scfg->{'k8s-version'});
+    die "add-on '$addon' cannot be disabled (only default add-ons)\n"
+        if !$cmds;
 
     my $nodes = load_nodes($name, $scfg);
     my $cp = ops_cp($nodes);
-    guest_exec($cp->{vmid},
-        PVE::K8s::Addons::metrics_server_delete_cmd(
-            '/etc/kubernetes/admin.conf'));
+    guest_exec($cp->{vmid}, $cmds->[1]->());
     PVE::K8s::Config::lock_config(sub {
         my $locked = PVE::K8s::Config->config();
         my $state = addons_state($locked->{ids}->{$name});
         # Tombstone, not a delete: provision installs
-        # metrics-server by default, and only this marker
+        # default add-ons, and only this marker
         # distinguishes "user turned it off" from "never
         # asked" (Increment 7).
         $state->{$addon} = { disabled => 1 };
@@ -7446,7 +7469,7 @@ sub disable_addon {
             JSON::PP->new->canonical->encode($state);
         PVE::K8s::Config::store_config($locked);
     });
-    print "metrics-server disabled on cluster '$name'\n";
+    print "$addon disabled on cluster '$name'\n";
     return 1;
 }
 

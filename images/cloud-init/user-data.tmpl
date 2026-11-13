@@ -49,8 +49,14 @@ write_files:
         bin_dir = "/opt/cni/bin"
       [plugins."io.containerd.grpc.v1.cri"]
         sandbox_image = "registry.k8s.io/pause:3.10"
+      # Spegel (node-to-node image sharing): registry mirrors
+      # from certs.d, and unpacked layers kept so a node can
+      # serve what it has pulled.
+      [plugins."io.containerd.grpc.v1.cri".registry]
+        config_path = "/etc/containerd/certs.d"
       [plugins."io.containerd.grpc.v1.cri".containerd]
         default_runtime_name = "runc"
+        discard_unpacked_layers = false
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
         runtime_type = "io.containerd.runc.v2"
       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]

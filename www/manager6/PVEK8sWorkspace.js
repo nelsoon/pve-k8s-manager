@@ -2520,8 +2520,10 @@ Ext.define('PVE.dc.K8sView', {
                 iconCls: 'fa fa-fw fa-ban',
                 disabled: true,
                 selModel: asm,
+                // default add-ons can be turned off (provision then
+                // leaves them off); core ones cannot
                 enableFn: function(rec) {
-                    return rec.data.name === 'metrics-server'
+                    return rec.data.tier === 'default'
                         && rec.data.status === 'installed';
                 },
                 confirmMsg: function(rec) {

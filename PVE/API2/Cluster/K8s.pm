@@ -1401,7 +1401,8 @@ __PACKAGE__->register_method({
             },
             addon => {
                 type => 'string',
-                pattern => '^(cert-manager|external-dns|metrics-server)$',
+                pattern => '^(cert-manager|external-dns|metrics-server|'
+                    . 'snapshot-controller|node-problem-detector|spegel|descheduler)$',
                 description => "The add-on to enable.",
             },
             issuer => {
@@ -1527,7 +1528,7 @@ __PACKAGE__->register_method({
     path => '{name}/addons/{addon}/disable',
     method => 'POST',
     protected => 1,
-    description => "Disable an add-on (metrics-server).",
+    description => "Turn off a default add-on; provision then leaves it off.",
     permissions => {
         check => ['perm', '/cluster', ['Sys.Modify']],
     },
@@ -1541,8 +1542,9 @@ __PACKAGE__->register_method({
             },
             addon => {
                 type => 'string',
-                pattern => '^metrics-server$',
-                description => "The add-on to disable.",
+                pattern => '^(metrics-server|snapshot-controller|'
+                    . 'node-problem-detector|spegel|descheduler)$',
+                description => "The add-on to disable (default add-ons).",
             },
         },
     },
