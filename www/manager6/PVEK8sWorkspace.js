@@ -749,6 +749,215 @@ Ext.define('PVE.dc.K8sRebuildWindow', {
 });
 
 
+// Add-ons that need answers before they are enabled: a stock Edit
+// window, run as a task. Only the fields that apply are shown (the
+// ACME email only for the ACME issuer).
+Ext.define('PVE.dc.K8sAddonWindow', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pveDcK8sAddonWindow',
+
+    isCreate: true,
+    method: 'POST',
+    showTaskViewer: true,
+    submitText: gettext('Enable'),
+    width: 560,
+    clusterName: undefined,
+    addon: undefined,
+
+    initComponent: function() {
+        let me = this;
+        me.url = '/cluster/k8s/' + encodeURIComponent(me.clusterName)
+            + '/addons/' + me.addon + '/enable';
+        me.title = Ext.String.format(gettext('Enable {0}'), me.addon);
+        let hint = function(text) {
+            return { xtype: 'displayfield', userCls: 'pmx-hint', value: text };
+        };
+        let items;
+        if (me.addon === 'cert-manager') {
+            items = [
+                {
+                    xtype: 'proxmoxKVComboBox',
+                    name: 'issuer',
+                    fieldLabel: gettext('Issuer'),
+                    comboItems: [
+                        ['ca', gettext('Cluster CA (internal names)')],
+                        ['acme', gettext("ACME (Let's Encrypt)")],
+                    ],
+                    value: 'ca',
+                    allowBlank: false,
+                    listeners: {
+                        change: function(field, value) {
+                            let email = me.down('field[name=email]');
+                            let acme = value === 'acme';
+                            email.setHidden(!acme);
+                            email.setDisabled(!acme);
+                        },
+                    },
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'email',
+                    vtype: 'proxmoxMail',
+                    fieldLabel: gettext('ACME Email'),
+                    allowBlank: false,
+                    hidden: true,
+                    disabled: true,
+                },
+            ];
+        } else {
+            items = [
+                {
+                    xtype: 'textfield',
+                    name: 'pdns-url',
+                    fieldLabel: gettext('PowerDNS API URL'),
+                    emptyText: 'http://dns.example.com:8081/api/v1/servers/localhost',
+                    allowBlank: false,
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'zone',
+                    fieldLabel: gettext('Zone'),
+                    emptyText: 'example.com',
+                    allowBlank: false,
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'pdns-api-key',
+                    fieldLabel: gettext('API Key'),
+                    inputType: 'password',
+                    allowBlank: false,
+                },
+                hint(gettext('Publishes DNS records for LoadBalancer services '
+                    + 'and ingresses into this PowerDNS zone.')),
+            ];
+        }
+        Ext.apply(me, {
+            items: [{
+                xtype: 'inputpanel',
+                fieldDefaults: { labelWidth: 150 },
+                items: items,
+            }],
+        });
+        me.callParent();
+    },
+});
+
+
+// Kubeconfig: shaped like the stock Cluster Join Information window
+// (modal, one line of explanation, read-only fields, Copy in a bottom
+// toolbar). Each opening issues a fresh 1-hour token: that GET is the
+// audit record.
+Ext.define('PVE.dc.K8sKubeconfigWindow', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.pveDcK8sKubeconfigWindow',
+
+    width: 760,
+    modal: true,
+    resizable: false,
+    clusterName: undefined,
+
+    initComponent: function() {
+        let me = this;
+        let text;
+        me.title = Ext.String.format(gettext('Kubeconfig: {0}'), me.clusterName);
+        let save = function() {
+            if (!text) { return; }
+            let blob = new Blob([text], { type: 'text/yaml' });
+            let a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = me.clusterName + '.kubeconfig';
+            a.click();
+            URL.revokeObjectURL(a.href);
+        };
+        let copy = function() {
+            if (!text) { return; }
+            let area = me.down('textarea');
+            area.inputEl.dom.select();
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text);
+            } else {
+                document.execCommand('copy');
+            }
+        };
+        Ext.apply(me, {
+            items: [
+                {
+                    xtype: 'component',
+                    padding: 10,
+                    html: gettext('An administrator kubeconfig, valid for one '
+                        + 'hour. Save it as ~/.kube/config or pass it to kubectl '
+                        + 'with --kubeconfig.'),
+                },
+                {
+                    xtype: 'container',
+                    // anchor, not form: a form row will not give the
+                    // textarea its height
+                    layout: 'anchor',
+                    padding: '0 10 10 10',
+                    defaults: { anchor: '100%', labelWidth: 100 },
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            itemId: 'server',
+                            fieldLabel: gettext('API Server'),
+                            editable: false,
+                        },
+                        {
+                            xtype: 'textarea',
+                            fieldLabel: 'Kubeconfig',
+                            height: 280,
+                            editable: false,
+                            fieldStyle: 'font-family: monospace; white-space: pre;',
+                        },
+                    ],
+                },
+            ],
+            dockedItems: [{
+                dock: 'bottom',
+                xtype: 'toolbar',
+                items: [
+                    {
+                        text: gettext('Copy'),
+                        iconCls: 'fa fa-clipboard',
+                        itemId: 'copy',
+                        disabled: true,
+                        handler: copy,
+                    },
+                    {
+                        text: gettext('Download'),
+                        iconCls: 'fa fa-download',
+                        itemId: 'download',
+                        disabled: true,
+                        handler: save,
+                    },
+                ],
+            }],
+        });
+        me.callParent();
+        me.on('show', function() {
+            me.setLoading(true);
+            Proxmox.Utils.API2Request({
+                url: '/cluster/k8s/' + encodeURIComponent(me.clusterName) + '/kubeconfig',
+                method: 'GET',
+                success: function(r) {
+                    me.setLoading(false);
+                    let data = r.result.data || {};
+                    text = data.kubeconfig || '';
+                    me.down('#server').setValue(data.server || '');
+                    me.down('textarea').setValue(text);
+                    me.down('#copy').enable();
+                    me.down('#download').enable();
+                },
+                failure: function(r) {
+                    me.close();
+                    Ext.Msg.alert(gettext('Error'), r.htmlStatus);
+                },
+            });
+        }, me, { single: true });
+    },
+});
+
+
 // Evacuate a PVE host: pick it (stock node selector) instead of
 // typing its name; the API runs it as a task.
 Ext.define('PVE.dc.K8sEvacuateWindow', {
@@ -1144,10 +1353,11 @@ Ext.define('PVE.dc.K8sView', {
 
         let panels = {};   // clusterName:panelKey -> component
 
-        let grid = function(fields, url, columns, tbar) {
+        let grid = function(fields, url, columns, tbar, selModel) {
             return Ext.create('Ext.grid.Panel', {
                 header: false,
                 border: false,
+                selModel: selModel || 'rowmodel',
                 store: Ext.create('Ext.data.Store', {
                     fields: fields,
                     proxy: { type: 'proxmox', url: url },
@@ -1561,37 +1771,9 @@ Ext.define('PVE.dc.K8sView', {
                             });
                     }),
                     act(gettext('Kubeconfig'), 'fa fa-fw fa-key', function(n) {
-                        api({
-                            url: '/cluster/k8s/' + n + '/kubeconfig',
-                            method: 'GET',
-                            success: function(r) {
-                                let data = r.result.data;
-                                let win = Ext.create('Ext.window.Window', {
-                                    title: Ext.String.format(gettext(
-                                        'Kubeconfig for {0} ({1})'),
-                                        n, data.expires),
-                                    width: 680, height: 420, layout: 'fit',
-                                    items: [{
-                                        xtype: 'textarea',
-                                        value: data.kubeconfig,
-                                        readOnly: true,
-                                    }],
-                                    buttons: [{
-                                        text: gettext('Download'),
-                                        handler: function() {
-                                            let blob = new Blob(
-                                                [data.kubeconfig],
-                                                { type: 'text/yaml' });
-                                            let a = document.createElement('a');
-                                            a.href = URL.createObjectURL(blob);
-                                            a.download = name + '.kubeconfig';
-                                            a.click();
-                                            URL.revokeObjectURL(a.href);
-                                        },
-                                    }],
-                                });
-                                win.show();
-                            },
+                        Ext.create('PVE.dc.K8sKubeconfigWindow', {
+                            autoShow: true,
+                            clusterName: n,
                         });
                     }),
                 ],
@@ -2071,43 +2253,31 @@ Ext.define('PVE.dc.K8sView', {
                 },
                 autoLoad: true,
             });
-            let configure = function(addon) {
-                let items = [];
-                if (addon === 'cert-manager') {
-                    items = [
-                        {
-                            xtype: 'combobox', name: 'issuer',
-                            fieldLabel: gettext('Issuer'),
-                            store: ['ca', 'acme'], value: 'ca',
-                            editable: false, allowBlank: false,
-                        },
-                        {
-                            xtype: 'textfield', name: 'email',
-                            fieldLabel: gettext('ACME Email'),
-                            emptyText: gettext('only for the acme issuer'),
-                        },
-                    ];
-                } else if (addon === 'external-dns') {
-                    items = [
-                        {
-                            xtype: 'textfield', name: 'pdns-url',
-                            fieldLabel: gettext('PowerDNS API URL'),
-                            emptyText: 'http://dns.example.com:8081/api/v1/servers/localhost',
-                            allowBlank: false,
-                        },
-                        {
-                            xtype: 'textfield', name: 'zone',
-                            fieldLabel: gettext('Zone'),
-                            emptyText: 'example.com', allowBlank: false,
-                        },
-                        {
-                            xtype: 'textfield', name: 'pdns-api-key',
-                            fieldLabel: gettext('PowerDNS API Key'),
-                            inputType: 'password', allowBlank: false,
-                        },
-                    ];
-                }
-                if (!items.length) {
+            // add-ons that need answers first get a stock Edit window;
+            // the others are enabled directly
+            let configurable = { 'cert-manager': 1, 'external-dns': 1 };
+            let enableable = Ext.apply({ 'metrics-server': 1 }, configurable);
+            let asm = Ext.create('Ext.selection.RowModel', {});
+            let enableBtn = {
+                xtype: 'proxmoxButton',
+                text: gettext('Enable'),
+                iconCls: 'fa fa-fw fa-play',
+                disabled: true,
+                selModel: asm,
+                enableFn: function(rec) { return !!enableable[rec.data.name]; },
+                handler: function(btn, event, rec) {
+                    let addon = rec.data.name;
+                    if (configurable[addon]) {
+                        Ext.create('PVE.dc.K8sAddonWindow', {
+                            autoShow: true,
+                            clusterName: name,
+                            addon: addon,
+                            apiCallDone: function(ok) {
+                                if (ok) { store.load(); }
+                            },
+                        });
+                        return;
+                    }
                     api({
                         url: '/cluster/k8s/' + name + '/addons/' + addon + '/enable',
                         method: 'POST',
@@ -2115,70 +2285,38 @@ Ext.define('PVE.dc.K8sView', {
                             task(r.result.data); store.load();
                         },
                     });
-                    return;
-                }
-                let formWin = Ext.create('Ext.window.Window', {
-                    title: Ext.String.format(gettext('Configure {0}'), addon),
-                    modal: true, width: 560, layout: 'fit',
-                    items: [{
-                        xtype: 'form', bodyPadding: 10, border: false,
-                        fieldDefaults: { labelWidth: 170, anchor: '100%' },
-                        items: items,
-                        buttons: [{
-                            text: gettext('Enable'),
-                            handler: function() {
-                                let form = formWin.down('form').getForm();
-                                if (!form.isValid()) { return; }
-                                api({
-                                    url: '/cluster/k8s/' + name + '/addons/'
-                                        + addon + '/enable',
-                                    method: 'POST',
-                                    params: form.getValues(),
-                                    success: function(r) {
-                                        formWin.close(); store.load();
-                                        task(r.result.data);
-                                    },
-                                });
-                            },
-                        }, {
-                            text: gettext('Cancel'),
-                            handler: function() { formWin.close(); },
-                        }],
-                    }],
-                });
-                formWin.show();
-            };
-            let selectedAddon = null;
-            let enableBtn = Ext.create('Ext.button.Button', {
-                text: gettext('Configure / Enable'),
-                iconCls: 'fa fa-fw fa-cog',
-                disabled: true,
-                handler: function() {
-                    if (selectedAddon) { configure(selectedAddon); }
                 },
-            });
-            let disableBtn = Ext.create('Ext.button.Button', {
+            };
+            let disableBtn = {
+                xtype: 'proxmoxButton',
                 text: gettext('Disable'),
                 iconCls: 'fa fa-fw fa-ban',
                 disabled: true,
-                handler: function() {
-                    let sel = g.getSelection();
-                    if (!sel || !sel.length) { return; }
-                    let addon = sel[0].data.name;
+                selModel: asm,
+                enableFn: function(rec) {
+                    return rec.data.name === 'metrics-server'
+                        && rec.data.status === 'configured';
+                },
+                confirmMsg: function(rec) {
+                    return Ext.String.format(gettext('Disable {0}?'),
+                        Ext.htmlEncode(rec.data.name));
+                },
+                handler: function(btn, event, rec) {
                     api({
                         url: '/cluster/k8s/' + name + '/addons/'
-                            + addon + '/disable',
+                            + rec.data.name + '/disable',
                         method: 'POST',
                         success: function(r) {
                             task(r.result.data); store.load();
                         },
                     });
                 },
-            });
+            };
             let g = Ext.create('Ext.grid.Panel', {
                 header: false,
                 border: false,
                 store: store,
+                selModel: asm,
                 tbar: [enableBtn, disableBtn],
                 columns: [
                     { text: gettext('Add-on'), dataIndex: 'name', width: 160 },
@@ -2192,19 +2330,6 @@ Ext.define('PVE.dc.K8sView', {
                     },
                     { text: gettext('Description'), dataIndex: 'summary', flex: 1 },
                 ],
-                listeners: {
-                    selectionchange: function(model, selected) {
-                        let rec = selected && selected[0];
-                        selectedAddon = rec ? rec.data.name : null;
-                        enableBtn.setDisabled(!rec
-                            || (rec.data.name !== 'cert-manager'
-                                && rec.data.name !== 'external-dns'
-                                && rec.data.name !== 'metrics-server'));
-                        disableBtn.setDisabled(!rec
-                            || rec.data.name !== 'metrics-server'
-                            || rec.data.status !== 'configured');
-                    },
-                },
             });
             return g;
         };
@@ -2223,6 +2348,7 @@ Ext.define('PVE.dc.K8sView', {
         };
 
         let backupsPanel = function(name) {
+            let bsm = Ext.create('Ext.selection.RowModel', {});
             let g = grid(
                 ['file', 'size', 'mtime'],
                 '/api2/json/cluster/k8s/' + name + '/backups',
@@ -2261,35 +2387,33 @@ Ext.define('PVE.dc.K8sView', {
                         },
                     },
                     {
+                        // stock selection button: no "select a file
+                        // first" box, and the restore warning has No
+                        // focused
+                        xtype: 'proxmoxButton',
                         text: gettext('Restore'),
                         iconCls: 'fa fa-fw fa-undo',
-                        handler: function() {
-                            let sel = g.getSelection();
-                            let file = sel && sel.length
-                                ? sel[0].data.file : null;
-                            if (!file) {
-                                Ext.Msg.alert(gettext('Restore'),
-                                    gettext('Select a backup file first.'));
-                                return;
-                            }
-                            Ext.Msg.confirm(gettext('Restore etcd'),
-                                Ext.String.format(gettext(
-                                    'Roll back ALL cluster data to {0}?'),
-                                    file),
-                                function(answer) {
-                                    if (answer !== 'yes') { return; }
-                                    api({
-                                        url: '/cluster/k8s/' + name + '/restore',
-                                        method: 'POST',
-                                        params: { backup: file, force: 1 },
-                                        success: function(r) {
-                                            task(r.result.data);
-                                        },
-                                    });
-                                });
+                        disabled: true,
+                        selModel: bsm,
+                        dangerous: true,
+                        confirmMsg: function(rec) {
+                            return Ext.String.format(gettext(
+                                'Roll back ALL cluster data to {0}? Everything '
+                                + 'changed in the cluster since then is lost.'),
+                                Ext.htmlEncode(rec.data.file));
+                        },
+                        handler: function(btn, event, rec) {
+                            api({
+                                url: '/cluster/k8s/' + name + '/restore',
+                                method: 'POST',
+                                params: { backup: rec.data.file, force: 1 },
+                                success: function(r) {
+                                    task(r.result.data);
+                                },
+                            });
                         },
                     },
-                ]);
+                ], bsm);
             return g;
         };
 

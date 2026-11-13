@@ -65,8 +65,12 @@ like($js, qr|'/events'|,
     'UI events view reads the events endpoint');
 like($js, qr|'/nodes/'\s*\+ encodeURIComponent\(rec\.data\.name\) \+ action|,
     'UI node actions call the per-node endpoints');
-like($js, qr/create token|a\.download = name \+ '\.kubeconfig'/,
+like($js, qr/a\.download = me\.clusterName \+ '\.kubeconfig'/,
     'UI offers the kubeconfig as a download');
+like($js, qr/Ext\.define\('PVE\.dc\.K8sKubeconfigWindow'[\s\S]*?modal: true/,
+    'kubeconfig window is modal, like the stock join-information window');
+like($js, qr/text: gettext\('Copy'\),\s+iconCls: 'fa fa-clipboard'/,
+    'kubeconfig can be copied');
 
 
 # T2.6 force-retire and T3.1 backup/restore endpoints
@@ -153,7 +157,15 @@ unlike($js, qr/itemId: 'nodebtn'/, 'node buttons share no itemId');
 unlike($js, qr/itemId: needsSel/, 'group buttons share no itemId');
 unlike($js, qr/button\[(?:node|group)btn\]/, 'no hand-made selection toggling left');
 my $sel = () = $js =~ /xtype: 'proxmoxButton',/g;
-is($sel, 3, 'node actions (one builder) and group Edit/Delete are stock selection buttons');
+is($sel, 6, 'node actions (one builder), group Edit/Delete, add-on Enable/Disable '
+    . 'and backup Restore are stock selection buttons');
+unlike($js, qr/Select a backup file first/, 'Restore is disabled without a selection, no alert box');
+like($js, qr/selModel: bsm,\s+dangerous: true,/, 'Restore warns with No focused');
+like($js, qr/Ext\.define\('PVE\.dc\.K8sAddonWindow',\s+\{\s+extend: 'Proxmox\.window\.Edit'/,
+    'add-on settings are a stock Edit window');
+like($js, qr/email\.setHidden\(!acme\)/, 'the ACME email is asked only for the ACME issuer');
+my $plain = () = $js =~ /Ext\.create\('Ext\.window\.Window'|extend: 'Ext\.window\.Window'/g;
+is($plain, 1, 'only the kubeconfig window is a plain window (like the stock join-information window)');
 like($js, qr/selModel: sm,\s+dangerous: !!dangerous,/, 'node actions use the stock confirm box');
 like($js, qr/'be provisioned\.'\), true\),/, 'Force Retire is marked dangerous');
 unlike($js, qr/Ext\.Msg\.prompt/, 'no typed-in host names: evacuate picks the host');
