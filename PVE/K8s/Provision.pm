@@ -3266,7 +3266,7 @@ sub assert_maintenance_window {
 # scenario narrows and opens the window around a roll).
 # Settings that may be cleared again (PVE `delete` semantics).
 our @CLEARABLE_OPTIONS = qw(maintenance-window backup-retention
-    scale-in-cooldown description);
+    scale-in-cooldown kubeconfig-max-hours description);
 
 # The record keeps the scale-in cooldown in minutes (what the API and
 # Settings show); the scaler wants seconds. Unset: the scaler default.
@@ -3308,6 +3308,12 @@ sub apply_cluster_options {
         die "scale-in-cooldown must be 1..1440 minutes\n"
             if "$min" !~ /^\d+$/ || $min < 1 || $min > 1440;
         $scfg->{'scale-in-cooldown'} = int $min;
+    }
+    if (defined $opts->{'kubeconfig-max-hours'}) {
+        my $h = $opts->{'kubeconfig-max-hours'};
+        die "kubeconfig-max-hours must be 1..720\n"
+            if "$h" !~ /^\d+$/ || $h < 1 || $h > 720;
+        $scfg->{'kubeconfig-max-hours'} = int $h;
     }
     if (defined $opts->{description}) {
         $scfg->{description} = $opts->{description};
@@ -5201,12 +5207,157 @@ my sub find_node {
     return $node;
 }
 
-# Short-lived (1h) admin kubeconfig: a TokenRequest token
-# for a dedicated service account, never a static credential.
-# The PVE API call itself is the audit record (authenticated
-# user, Sys.Modify required).
-sub kubeconfig_cluster {
-    my ($name) = @_;
+# --- Kubernetes identities -------------------------------
+# Every kubeconfig carries a short-lived TokenRequest token,
+# never a static credential. pve-k8s's own API reads use
+# kube-system/pve-k8s-manager; each PVE user (or API token)
+# gets a service account of its own in pve-k8s-users, so the
+# Kubernetes audit log names the person, and one person's
+# access can be revoked (deleting the account invalidates
+# every token issued to it) without touching anyone else's or
+# pve-k8s's own.
+our $USER_NS = 'pve-k8s-users';
+our $MANAGER_SA = 'pve-k8s-manager';
+our $USER_LABEL = 'pve-k8s.proxmox.com/user-sa';
+our $USER_ANNOTATION = 'pve-k8s.proxmox.com/user';
+our $DEFAULT_KUBECONFIG_MAX_HOURS = 24;
+
+# Pure: a stable, valid service-account name for a PVE userid
+# (user@realm or user@realm!token). The hash keeps two ids that
+# sanitize alike apart.
+sub user_sa_name {
+    my ($userid) = @_;
+
+    require Digest::SHA;
+    my $s = lc $userid;
+    $s =~ s/[^a-z0-9]+/-/g;
+    $s =~ s/^-+|-+$//g;
+    $s = substr($s, 0, 40);
+    $s =~ s/-+$//;
+    return 'pve-' . ($s eq '' ? '' : "$s-")
+        . substr(Digest::SHA::sha1_hex($userid), 0, 8);
+}
+
+# Pure: the Kubernetes role for a PVE privilege level.
+sub user_k8s_role {
+    my ($can_modify) = @_;
+
+    return $can_modify ? 'admin' : 'view';
+}
+
+# Pure: requested validity in hours, checked against the cluster cap.
+sub kubeconfig_hours {
+    my ($scfg, $hours) = @_;
+
+    my $max = ($scfg // {})->{'kubeconfig-max-hours'}
+        // $DEFAULT_KUBECONFIG_MAX_HOURS;
+    $hours //= 1;
+    die "validity must be a whole number of hours\n"
+        if "$hours" !~ /^\d+$/ || $hours < 1;
+    die "validity is limited to $max hour(s) on this cluster\n"
+        if $hours > $max;
+    return int $hours;
+}
+
+# Pure: the shell run in a control plane to set up one identity
+# and print a token, then a marker, then the cluster CA. One guest
+# exec instead of three (each costs seconds).
+sub token_script {
+    my (%o) = @_;
+
+    my $k = 'kubectl --kubeconfig /etc/kubernetes/admin.conf';
+    my $apply = "-o yaml --dry-run=client | $k apply -f - >/dev/null";
+    my ($ns, $sa) = ($o{namespace}, $o{sa});
+    my @cmd = ("set -e");
+    push @cmd, "$k create namespace $ns $apply" if $ns ne 'kube-system';
+    push @cmd, "$k -n $ns create serviceaccount $sa $apply";
+    if (defined $o{userid}) {
+        push @cmd, "$k -n $ns annotate --overwrite serviceaccount $sa "
+            . shq("$USER_ANNOTATION=$o{userid}") . " >/dev/null";
+    }
+    my $bind = sub {
+        my ($bname, $role) = @_;
+        return ("$k create clusterrolebinding $bname --clusterrole=$role "
+            . "--serviceaccount=$ns:$sa $apply",
+            "$k label --overwrite clusterrolebinding $bname "
+            . "$USER_LABEL=$sa >/dev/null");
+    };
+    my $drop = sub {
+        return map { "$k delete clusterrolebinding $_ --ignore-not-found >/dev/null" } @_;
+    };
+    if ($o{role} eq 'admin') {
+        push @cmd, $bind->("$sa-admin", 'cluster-admin'),
+            $drop->("$sa-view", "$sa-view-cluster");
+    } else {
+        # `view` covers namespaced objects; nodes, namespaces and
+        # storage are cluster-scoped and need their own read role
+        push @cmd, "$k create clusterrole pve-k8s-cluster-view "
+            . "--verb=get,list,watch --resource=nodes,namespaces,"
+            . "persistentvolumes,storageclasses.storage.k8s.io $apply";
+        push @cmd, $bind->("$sa-view", 'view'),
+            $bind->("$sa-view-cluster", 'pve-k8s-cluster-view'),
+            $drop->("$sa-admin");
+    }
+    push @cmd, @{ $o{extra} // [] };
+    # `create token` prints no trailing newline: the bare echo ends
+    # its line so the marker stands alone
+    push @cmd, "$k -n $ns create token $sa --duration=$o{seconds}s",
+        "echo", "echo ---PVE-K8S-CA---",
+        "base64 -w0 /etc/kubernetes/pki/ca.crt";
+    return join("\n", @cmd) . "\n";
+}
+
+# Pure: token and CA out of token_script's output.
+sub parse_token_output {
+    my ($out) = @_;
+
+    my ($tok, $ca) = split /---PVE-K8S-CA---/, $out // '', 2;
+    my ($token) = reverse grep { length } split /\s+/, $tok // '';
+    $ca //= '';
+    $ca =~ s/\s+//g;
+    die "could not issue a token\n" if !$token || !$ca;
+    return ($token, $ca);
+}
+
+# Pure: the expiry (epoch) inside a service-account JWT, or undef.
+sub token_expiry {
+    my ($token) = @_;
+
+    my (undef, $payload) = split /\./, $token // '';
+    return undef if !defined $payload;
+    $payload =~ tr{-_}{+/};
+    $payload .= '=' x ((4 - length($payload) % 4) % 4);
+    my $claims = eval {
+        JSON::PP->new->decode(MIME::Base64::decode_base64($payload)) };
+    return ref $claims eq 'HASH' ? $claims->{exp} : undef;
+}
+
+sub kubeconfig_text {
+    my ($name, $server, $ca, $user, $token) = @_;
+
+    return <<EOF;
+apiVersion: v1
+kind: Config
+clusters:
+- name: $name
+  cluster:
+    server: $server
+    certificate-authority-data: $ca
+contexts:
+- name: $name
+  context:
+    cluster: $name
+    user: $user
+current-context: $name
+users:
+- name: $user
+  user:
+    token: $token
+EOF
+}
+
+my sub issue_kubeconfig {
+    my ($name, %o) = @_;
 
     my $cfg = PVE::K8s::Config->config();
     my $scfg = $cfg->{ids}->{$name}
@@ -5214,55 +5365,128 @@ sub kubeconfig_cluster {
     my $subnet = $scfg->{'node-subnet'} or die "no node-subnet\n";
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$| or die "bad node-subnet\n";
     my $vip = PVE::K8s::Config::vip_for($scfg);
-
     my $nodes = load_nodes($name, $scfg);
     my $cp = ops_cp($nodes);
-    guest_exec($cp->{vmid},
-        'kubectl --kubeconfig /etc/kubernetes/admin.conf '
-        . 'create serviceaccount pve-k8s-admin -n kube-system '
-        . '--dry-run=client -o yaml | '
-        . 'kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -; '
-        . 'kubectl --kubeconfig /etc/kubernetes/admin.conf '
-        . 'create clusterrolebinding pve-k8s-admin '
-        . '--clusterrole=cluster-admin '
-        . '--serviceaccount=kube-system:pve-k8s-admin '
-        . '--dry-run=client -o yaml | '
-        . 'kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -');
-    my $token = guest_exec($cp->{vmid},
-        'kubectl --kubeconfig /etc/kubernetes/admin.conf '
-        . 'create token pve-k8s-admin -n kube-system '
-        . '--duration=3600s');
-    $token =~ s/\s+//g;
-    my $ca = guest_exec($cp->{vmid},
-        'base64 -w0 /etc/kubernetes/pki/ca.crt');
-    $ca =~ s/\s+//g;
-    die "could not issue a token for cluster '$name'\n"
-        if !$token || !$ca;
-
+    my ($token, $ca) = parse_token_output(
+        guest_exec($cp->{vmid}, token_script(%o)));
+    my $server = "https://$vip:6443";
     return {
-        kubeconfig => <<EOF,
-apiVersion: v1
-kind: Config
-clusters:
-- name: $name
-  cluster:
-    server: https://$vip:6443
-    certificate-authority-data: $ca
-contexts:
-- name: $name
-  context:
-    cluster: $name
-    user: pve-k8s-admin
-current-context: $name
-users:
-- name: pve-k8s-admin
-  user:
-    token: $token
-EOF
-        expires => '1h (TokenRequest, service account '
-            . 'kube-system/pve-k8s-admin, cluster-admin)',
-        server => "https://$vip:6443",
+        kubeconfig => kubeconfig_text($name, $server, $ca,
+            $o{user_entry} // $o{sa}, $token),
+        server => $server,
+        'expires-at' => token_expiry($token) // time() + $o{seconds},
+        'service-account' => "$o{namespace}/$o{sa}",
     };
+}
+
+# pve-k8s's own credentials (the vsock read cache). The account
+# that once served both pve-k8s and every user is retired here:
+# outstanding 1h tokens of it stop working, which is the point.
+sub kubeconfig_cluster {
+    my ($name) = @_;
+
+    my $k = 'kubectl --kubeconfig /etc/kubernetes/admin.conf';
+    return issue_kubeconfig($name,
+        namespace => 'kube-system', sa => $MANAGER_SA,
+        role => 'admin', seconds => 3600,
+        extra => [
+            "$k -n kube-system delete serviceaccount pve-k8s-admin "
+                . "--ignore-not-found >/dev/null",
+            "$k delete clusterrolebinding pve-k8s-admin "
+                . "--ignore-not-found >/dev/null",
+        ]);
+}
+
+# A kubeconfig for one PVE user: its own service account, the role
+# its PVE privilege allows, the validity it asked for (capped by the
+# cluster). The PVE API call is the audit record on the PVE side.
+sub user_kubeconfig {
+    my ($name, $userid, $can_modify, $hours) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    $hours = kubeconfig_hours($scfg, $hours);
+    my $role = user_k8s_role($can_modify);
+    my $res = issue_kubeconfig($name,
+        namespace => $USER_NS, sa => user_sa_name($userid),
+        role => $role, seconds => $hours * 3600,
+        userid => $userid, user_entry => $userid);
+    $res->{role} = $role;
+    $res->{user} = $userid;
+    $res->{hours} = $hours;
+    return $res;
+}
+
+# Pure: who holds kubeconfig access, from the service accounts in
+# pve-k8s-users and the bindings labelled with them.
+sub access_rows {
+    my ($sas, $bindings) = @_;
+
+    my %role;
+    for my $b ((($bindings // {})->{items} // [])->@*) {
+        my $sa = (($b->{metadata} // {})->{labels} // {})->{$USER_LABEL};
+        next if !defined $sa;
+        my $r = ($b->{roleRef} // {})->{name} // '';
+        $role{$sa} = 'admin' if $r eq 'cluster-admin';
+        $role{$sa} //= 'view' if $r eq 'view';
+    }
+    my @rows;
+    for my $sa ((($sas // {})->{items} // [])->@*) {
+        my $m = $sa->{metadata} // {};
+        my $user = ($m->{annotations} // {})->{$USER_ANNOTATION};
+        next if !defined $user;
+        push @rows, {
+            user => $user,
+            'service-account' => $m->{name},
+            role => $role{$m->{name}} // 'none',
+            created => $m->{creationTimestamp},
+        };
+    }
+    return [ sort { $a->{user} cmp $b->{user} } @rows ];
+}
+
+sub access_list {
+    my ($name) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $sel = "labelSelector=$USER_LABEL";
+    my $fast = k8s_read_fast($name, $nodes,
+        "/api/v1/namespaces/$USER_NS/serviceaccounts",
+        "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings?$sel");
+    my ($sas, $bindings);
+    if ($fast) {
+        ($sas, $bindings) = $fast->@*;
+        # a namespace that does not exist yet reads as a 404 Status
+        $sas = { items => [] } if ($sas->{kind} // '') eq 'Status';
+    } else {
+        my $batch = kubectl_json_batch(ops_cp($nodes),
+            "get serviceaccounts -n $USER_NS --ignore-not-found",
+            "get clusterrolebindings -l $USER_LABEL");
+        ($sas, $bindings) = $batch->@*;
+    }
+    return access_rows($sas, $bindings);
+}
+
+# Revoke one user's kubeconfigs: deleting the service account makes
+# the API server reject every token issued to it, at once.
+sub revoke_access {
+    my ($name, $userid) = @_;
+
+    my $cfg = PVE::K8s::Config->config();
+    my $scfg = $cfg->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    my $nodes = load_nodes($name, $scfg);
+    my $sa = user_sa_name($userid);
+    my $k = 'kubectl --kubeconfig /etc/kubernetes/admin.conf';
+    guest_exec(ops_cp($nodes)->{vmid}, join("\n",
+        "$k -n $USER_NS delete serviceaccount $sa --ignore-not-found",
+        "$k delete clusterrolebinding -l $USER_LABEL=$sa --ignore-not-found",
+    ) . "\n");
+    return undef;
 }
 
 sub drain_node {

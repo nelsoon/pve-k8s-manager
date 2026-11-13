@@ -157,8 +157,8 @@ unlike($js, qr/itemId: 'nodebtn'/, 'node buttons share no itemId');
 unlike($js, qr/itemId: needsSel/, 'group buttons share no itemId');
 unlike($js, qr/button\[(?:node|group)btn\]/, 'no hand-made selection toggling left');
 my $sel = () = $js =~ /xtype: 'proxmoxButton',/g;
-is($sel, 6, 'node actions (one builder), group Edit/Delete, add-on Enable/Disable '
-    . 'and backup Restore are stock selection buttons');
+is($sel, 7, 'node actions (one builder), group Edit/Delete, add-on Enable/Disable, '
+    . 'backup Restore and access Revoke are stock selection buttons');
 unlike($js, qr/Select a backup file first/, 'Restore is disabled without a selection, no alert box');
 like($js, qr/selModel: bsm,\s+dangerous: true,/, 'Restore warns with No focused');
 like($js, qr/Ext\.define\('PVE\.dc\.K8sAddonWindow',\s+\{\s+extend: 'Proxmox\.window\.Edit'/,
@@ -257,7 +257,7 @@ my $ro = () = $js =~ /readOnlyView\(me\);/g;
 is($ro, 2, 'list view and cluster page top bars are filtered');
 like($js, qr/viewOnly: !canModify/, 'settings grid gets no editors without Sys.Modify');
 my $keep = () = $js =~ /k8sReadOnly: true/g;
-is($keep, 2, 'only the two Reload buttons survive for read-only users');
+is($keep, 4, 'only Reload (nodes, list, access) and Kubeconfig survive for read-only users');
 like($js, qr/instanceof Ext\.tab\.Tab/, 'tab headers (Workloads) stay for read-only users');
 
 done_testing();

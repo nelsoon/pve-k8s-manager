@@ -154,9 +154,29 @@ all clean).
 
 === Kubeconfig
 
-`pvesh get /cluster/k8s/c1/kubeconfig` returns an admin
-kubeconfig (requires `Sys.Modify`); the UI Overview
-shows it in a window with a Download button.
+`pvesh get /cluster/k8s/c1/kubeconfig [--hours N]`
+(Overview -> Kubeconfig in the UI) issues a kubeconfig
+for the calling PVE user or API token:
+
+* *Identity*: a service account of its own in
+  `pve-k8s-users`, so the Kubernetes audit log names
+  who acted. pve-k8s itself uses a separate account
+  (`kube-system/pve-k8s-manager`).
+* *Role* from the PVE privilege on `/cluster`:
+  `Sys.Modify` gets `cluster-admin`; `Sys.Audit` gets
+  read-only access (`view`, plus nodes, namespaces and
+  storage; no secrets).
+* *Validity*: a TokenRequest token, 1 hour by default,
+  up to the cluster's `kubeconfig-max-hours` (Settings;
+  default 24, at most 720). Nothing static, nothing
+  that never expires.
+* *Revoke*: the Access page (`GET .../access`) lists who
+  was issued one; `DELETE .../access/{userid}`
+  (`Sys.Modify`) deletes that account, so every token
+  issued to it stops working at once.
+
+The cluster's own admin certificate stays on the
+control-plane VMs and is never handed out.
 
 == Node groups
 
@@ -462,8 +482,9 @@ VM that merely inherited a dead node's ID.
 == API summary
 
 Base: `/cluster/k8s` (UI and `pvesh` share it; reads
-need `Sys.Audit` on `/cluster`, mutations and the
-kubeconfig need `Sys.Modify`).
+need `Sys.Audit` on `/cluster`, mutations need
+`Sys.Modify`; the kubeconfig role follows the caller's
+privilege).
 
 |===
 | Method | Path | Purpose
@@ -478,7 +499,9 @@ kubeconfig need `Sys.Modify`).
 | POST | `.../upgrade` | one minor up (`--to`)
 | POST | `.../scale` | one scaler pass
 | POST | `.../power` | start (CP first) / stop (workers first) all VMs
-| GET | `.../kubeconfig` | admin kubeconfig
+| GET | `.../kubeconfig` | kubeconfig for the caller (`--hours`)
+| GET | `.../access` | who was issued a kubeconfig, and the role
+| DELETE | `.../access/{userid}` | revoke a user's kubeconfigs
 | GET | `.../certificates` | PKI expiry report
 | GET | `.../events` | recent events
 | GET | `.../workloads` | deployments, pods, services

@@ -617,6 +617,14 @@ __PACKAGE__->register_method({
                 description => "Minutes after any scale action before "
                     . "the scaler may remove a node (default 10).",
             },
+            'kubeconfig-max-hours' => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 720,
+                optional => 1,
+                description => "Longest kubeconfig validity users may "
+                    . "ask for, in hours (default 24).",
+            },
             'cp-policy' => {
                 type => 'string',
                 enum => ['ha', 'replace'],
@@ -640,7 +648,7 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "Comma-separated settings to clear: "
                     . "maintenance-window, backup-retention, "
-                    . "scale-in-cooldown, description.",
+                    . "scale-in-cooldown, kubeconfig-max-hours, description.",
             },
         },
     },
@@ -655,6 +663,7 @@ __PACKAGE__->register_method({
             && !defined $param->{pools}
             && !defined $param->{'backup-retention'}
             && !defined $param->{'scale-in-cooldown'}
+            && !defined $param->{'kubeconfig-max-hours'}
             && !defined $param->{description}
             && !defined $param->{'cp-policy'}
             && !defined $param->{'storage-profile'};
@@ -664,6 +673,7 @@ __PACKAGE__->register_method({
             pools => $param->{pools},
             'backup-retention' => $param->{'backup-retention'},
             'scale-in-cooldown' => $param->{'scale-in-cooldown'},
+            'kubeconfig-max-hours' => $param->{'kubeconfig-max-hours'},
             description => $param->{description},
             'cp-policy' => $param->{'cp-policy'},
             'storage-profile' => $param->{'storage-profile'},
@@ -679,11 +689,52 @@ __PACKAGE__->register_method({
     path => '{name}/kubeconfig',
     method => 'GET',
     protected => 1,
-    description => "Issue a short-lived (1h) admin kubeconfig "
-        . "for the cluster (TokenRequest token; the call is "
-        . "the audit record).",
+    description => "Issue a short-lived kubeconfig for the calling user "
+        . "(or API token): a TokenRequest token of a service account of "
+        . "its own, cluster-admin with Sys.Modify, read-only (view) with "
+        . "Sys.Audit. The call is the audit record.",
     permissions => {
-        check => ['perm', '/cluster', ['Sys.Modify']],
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            hours => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 720,
+                optional => 1,
+                default => 1,
+                description => "Validity in hours (at most the cluster's "
+                    . "kubeconfig-max-hours, default 24).",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $user = $rpcenv->get_user();
+        my $admin = $rpcenv->check($user, '/cluster', ['Sys.Modify'], 1);
+        return PVE::K8s::Provision::user_kubeconfig($param->{name},
+            $user, $admin ? 1 : 0, $param->{hours});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'access',
+    path => '{name}/access',
+    method => 'GET',
+    protected => 1,
+    description => "PVE users and API tokens that were issued a "
+        . "kubeconfig for this cluster, with their Kubernetes role.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
     },
     parameters => {
         additionalProperties => 0,
@@ -695,11 +746,58 @@ __PACKAGE__->register_method({
             },
         },
     },
-    returns => { type => 'object' },
+    returns => {
+        type => 'array',
+        items => {
+            type => 'object',
+            properties => {
+                user => { type => 'string' },
+                'service-account' => { type => 'string' },
+                role => { type => 'string' },
+                created => { type => 'string', optional => 1 },
+            },
+        },
+    },
     code => sub {
         my ($param) = @_;
 
-        return PVE::K8s::Provision::kubeconfig_cluster($param->{name});
+        return PVE::K8s::Provision::access_list($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'revoke_access',
+    path => '{name}/access/{userid}',
+    method => 'DELETE',
+    protected => 1,
+    description => "Revoke every kubeconfig issued to a PVE user or API "
+        . "token: its service account is deleted, so the API server "
+        . "rejects its tokens at once. A new kubeconfig can be issued "
+        . "afterwards.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => {
+                type => 'string',
+                format => 'pve-configid',
+                description => "The name of the Kubernetes cluster.",
+            },
+            userid => {
+                type => 'string',
+                maxLength => 128,
+                description => "PVE user (user\@realm) or API token "
+                    . "(user\@realm!token).",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::revoke_access($param->{name},
+            $param->{userid});
     }});
 
 __PACKAGE__->register_method({

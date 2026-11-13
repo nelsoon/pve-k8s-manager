@@ -855,10 +855,14 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
     modal: true,
     resizable: false,
     clusterName: undefined,
+    maxHours: undefined,
 
     initComponent: function() {
         let me = this;
         let text;
+        let max = parseInt(me.maxHours, 10) || 24;
+        let choices = [1, 8, 24].filter(function(h) { return h <= max; });
+        if (choices.indexOf(max) < 0) { choices.push(max); }
         me.title = Ext.String.format(gettext('Kubeconfig: {0}'), me.clusterName);
         let save = function() {
             if (!text) { return; }
@@ -884,9 +888,9 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
                 {
                     xtype: 'component',
                     padding: 10,
-                    html: gettext('An administrator kubeconfig, valid for one '
-                        + 'hour. Save it as ~/.kube/config or pass it to kubectl '
-                        + 'with --kubeconfig.'),
+                    html: gettext('A kubeconfig of your own: the role follows '
+                        + 'your Proxmox VE privileges. Save it as ~/.kube/config '
+                        + 'or pass it to kubectl with --kubeconfig.'),
                 },
                 {
                     xtype: 'container',
@@ -896,6 +900,25 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
                     padding: '0 10 10 10',
                     defaults: { anchor: '100%', labelWidth: 100 },
                     items: [
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            itemId: 'hours',
+                            fieldLabel: gettext('Validity'),
+                            comboItems: choices.map(function(h) {
+                                return [h, h === 1 ? gettext('1 hour')
+                                    : Ext.String.format(gettext('{0} hours'), h)];
+                            }),
+                            value: 1,
+                            listeners: {
+                                // another validity: issue a new one
+                                select: function() { load(); },
+                            },
+                        },
+                        {
+                            xtype: 'displayfield',
+                            itemId: 'info',
+                            fieldLabel: gettext('Role'),
+                        },
                         {
                             xtype: 'textfield',
                             itemId: 'server',
@@ -934,16 +957,26 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
             }],
         });
         me.callParent();
-        me.on('show', function() {
+        let load = function() {
+            text = undefined;
+            me.down('#copy').disable();
+            me.down('#download').disable();
             me.setLoading(true);
             Proxmox.Utils.API2Request({
                 url: '/cluster/k8s/' + encodeURIComponent(me.clusterName) + '/kubeconfig',
                 method: 'GET',
+                params: { hours: me.down('#hours').getValue() },
                 success: function(r) {
                     me.setLoading(false);
                     let data = r.result.data || {};
                     text = data.kubeconfig || '';
                     me.down('#server').setValue(data.server || '');
+                    me.down('#info').setValue(Ext.htmlEncode(
+                        (data.role === 'admin' ? gettext('Administrator (cluster-admin)')
+                            : gettext('Read-only (view)'))
+                        + ', ' + Ext.String.format(gettext('expires {0}'),
+                            Ext.Date.format(new Date(data['expires-at'] * 1000),
+                                'Y-m-d H:i'))));
                     me.down('textarea').setValue(text);
                     me.down('#copy').enable();
                     me.down('#download').enable();
@@ -953,7 +986,9 @@ Ext.define('PVE.dc.K8sKubeconfigWindow', {
                     Ext.Msg.alert(gettext('Error'), r.htmlStatus);
                 },
             });
-        }, me, { single: true });
+        };
+        me.on('show', function() {
+            load();        }, me, { single: true });
     },
 });
 
@@ -1117,6 +1152,21 @@ Ext.define('PVE.dc.K8sSettings', {
                 }, hint(gettext('After any scale action, the scaler waits '
                     + 'this long before it removes a node.'))]),
             },
+            'kubeconfig-max-hours': {
+                header: gettext('Kubeconfig Max Validity'),
+                required: true,
+                defaultValue: '',
+                renderer: function(v) {
+                    return v ? Ext.String.format(gettext('{0} h'), v)
+                        : gettext('default') + ' (24 h)';
+                },
+                editor: edit(gettext('Kubeconfig Max Validity'), [{
+                    xtype: 'proxmoxintegerfield', name: 'kubeconfig-max-hours',
+                    fieldLabel: gettext('Hours'), minValue: 1, maxValue: 720,
+                    deleteEmpty: true, emptyText: '24',
+                }, hint(gettext('The longest validity users can pick when '
+                    + 'they get a kubeconfig.'))]),
+            },
             'cp-policy': {
                 header: gettext('Control Plane Failure Policy'),
                 required: false,
@@ -1161,7 +1211,8 @@ Ext.define('PVE.dc.K8sSettings', {
             'cp-arch': readonly(gettext('Control Plane Architecture')),
         };
         let order = ['description', 'maintenance-window', 'backup-retention',
-            'scale-in-cooldown', 'cp-policy', 'storage-profile',
+            'scale-in-cooldown', 'kubeconfig-max-hours', 'cp-policy',
+            'storage-profile',
             'k8s-version', 'state', 'cp',
             'storage', 'node-subnet', 'public-subnet', 'sdn-zone',
             'template-rev', 'cp-arch'];
@@ -1347,7 +1398,8 @@ Ext.define('PVE.dc.K8sView', {
                 'cp', 'workers', 'node-subnet', 'gateway', 'lb-range',
                 'storage', 'sdn-zone', 'public-subnet',
                 'maintenance-window', 'pools', 'action-state',
-                'storage-profile', 'cp-policy', 'scaler-state'],
+                'storage-profile', 'cp-policy', 'scaler-state',
+                'kubeconfig-max-hours'],
             proxy: { type: 'proxmox', url: '/api2/json/cluster/k8s' },
         });
 
@@ -1689,11 +1741,11 @@ Ext.define('PVE.dc.K8sView', {
                     backupInfo.setValue(gettext('unknown'));
                     imageInfo.setValue(gettext('unknown'));
             });
-            let act = function(label, icon, fn) {
-                return {
+            let act = function(label, icon, fn, extra) {
+                return Ext.apply({
                     text: label, iconCls: icon,
                     handler: function() { fn(name); },
-                };
+                }, extra);
             };
             return Ext.create('Ext.panel.Panel', {
                 header: false,
@@ -1774,7 +1826,11 @@ Ext.define('PVE.dc.K8sView', {
                         Ext.create('PVE.dc.K8sKubeconfigWindow', {
                             autoShow: true,
                             clusterName: n,
+                            maxHours: (me.clusterIndex[n] || {})['kubeconfig-max-hours'],
                         });
+                    }, {
+                        // Sys.Audit users get a read-only kubeconfig
+                        k8sReadOnly: true,
                     }),
                 ],
                 items: [{
@@ -2417,6 +2473,64 @@ Ext.define('PVE.dc.K8sView', {
             return g;
         };
 
+        // Who holds kubeconfigs (EKS "access entries"): one service
+        // account per PVE user or API token. Revoke deletes it, which
+        // invalidates every token issued to it at once.
+        let accessPanel = function(name) {
+            let xsm = Ext.create('Ext.selection.RowModel', {});
+            let roleText = function(v) {
+                return v === 'admin' ? gettext('Administrator (cluster-admin)')
+                    : v === 'view' ? gettext('Read-only (view)')
+                    : Ext.htmlEncode(v || '');
+            };
+            let g = grid(
+                ['user', 'role', 'service-account', 'created'],
+                '/api2/json/cluster/k8s/' + name + '/access',
+                [
+                    { text: gettext('User'), dataIndex: 'user', flex: 1,
+                        renderer: Ext.htmlEncode },
+                    { text: gettext('Role'), dataIndex: 'role', width: 220,
+                        renderer: roleText },
+                    { text: gettext('Service Account'), dataIndex: 'service-account',
+                        flex: 1, renderer: Ext.htmlEncode },
+                    { text: gettext('First Issued'), dataIndex: 'created', width: 170,
+                        renderer: function(v) {
+                            let d = v ? new Date(v) : null;
+                            return d && !isNaN(d) ? Ext.Date.format(d, 'Y-m-d H:i') : '';
+                        } },
+                ], [
+                    {
+                        xtype: 'proxmoxButton',
+                        text: gettext('Revoke'),
+                        disabled: true,
+                        selModel: xsm,
+                        dangerous: true,
+                        confirmMsg: function(rec) {
+                            return Ext.String.format(gettext(
+                                'Revoke every kubeconfig of {0}? They stop working '
+                                + 'at once; a new one can be issued later.'),
+                                Ext.htmlEncode(rec.data.user));
+                        },
+                        handler: function(btn, event, rec) {
+                            api({
+                                url: '/cluster/k8s/' + name + '/access/'
+                                    + encodeURIComponent(rec.data.user),
+                                method: 'DELETE',
+                                waitMsgTarget: g,
+                                success: function() { g.getStore().load(); },
+                            });
+                        },
+                    },
+                    {
+                        text: gettext('Reload'),
+                        iconCls: 'fa fa-fw fa-refresh',
+                        k8sReadOnly: true,
+                        handler: function() { g.getStore().load(); },
+                    },
+                ], xsm);
+            return g;
+        };
+
         let settingsPanel = function(rec) {
             return Ext.create('PVE.dc.K8sSettings', {
                 clusterName: rec.name,
@@ -2442,6 +2556,7 @@ Ext.define('PVE.dc.K8sView', {
             if (key === 'addons') { return addonsPanel(clusterName); }
             if (key === 'events') { return eventsPanel(clusterName); }
             if (key === 'backups') { return backupsPanel(clusterName); }
+            if (key === 'access') { return accessPanel(clusterName); }
             return settingsPanel(rec);
         };
         // Each menu entry is a light placeholder; its panel (and its
@@ -2514,6 +2629,7 @@ Ext.define('PVE.dc.K8sView', {
                 ['addons', gettext('Add-ons'), 'fa fa-puzzle-piece'],
                 ['events', gettext('Events'), 'fa fa-list'],
                 ['backups', gettext('Backups'), 'fa fa-archive'],
+                ['access', gettext('Access'), 'fa fa-key'],
                 ['settings', gettext('Settings'), 'fa fa-cog'],
             ];
             let activeKey = me.activePanelKey || 'overview';

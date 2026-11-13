@@ -257,6 +257,14 @@ my $defaultData = {
             maximum => 100,
             optional => 1,
         },
+        'kubeconfig-max-hours' => {
+            type => 'integer',
+            description => "Longest kubeconfig validity users may ask "
+                . "for, in hours (default 24).",
+            minimum => 1,
+            maximum => 720,
+            optional => 1,
+        },
         'scale-in-cooldown' => {
             type => 'integer',
             description => "Minutes after any scale action before the "
@@ -320,6 +328,7 @@ sub options {
         'backup-dir' => { optional => 1 },
         'backup-retention' => { optional => 1 },
         'scale-in-cooldown' => { optional => 1 },
+        'kubeconfig-max-hours' => { optional => 1 },
         storage => { optional => 1 },
         state => { optional => 1 },
         created => { optional => 1 },
