@@ -147,7 +147,7 @@ unlike($prov2, qr/eval \{ qm_on\(\$svhost, 'stop', \$svmid\) \};/, 'scale-in no 
 open my $pf, '<', 'PVE/K8s/Provision.pm' or die $!;
 my $prov = do { local $/; <$pf> };
 my $recs = () = $prov =~ /record_repair\(\$name, \$node->\{host\}, '(?:control-plane|worker)'/g;
-is($recs, 2, 'control-plane and worker repairs are both recorded');
+is($recs, 3, 'control-plane, dead-worker and problem-worker repairs are all recorded');
 like($prov, qr/\$out->\{repairs\} = \$rstate->\{repairs\}/, 'the Summary carries the repairs');
 
 done_testing;

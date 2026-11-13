@@ -4400,6 +4400,42 @@ my sub record_repair {
     };
 }
 
+# Run the descheduler once (pve-k8s owns its timing): after a
+# roll, a node replacement, or a scale-out whose pods were placed.
+# At most every 10 minutes; nothing when it is turned off or
+# missing. Never fatal.
+our $DESCHEDULE_COOLDOWN = 600;
+# how long a node-problem-detector condition must hold before the
+# node is replaced (a transient read-only remount can recover)
+our $PROBLEM_GRACE = 600;
+
+sub run_descheduler {
+    my ($name, $cp, $reason) = @_;
+
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name} or return 0;
+    my $rec = addons_state($scfg)->{descheduler};
+    return 0 if $rec && $rec->{disabled};
+    my $state = eval {
+        JSON::PP->new->decode($scfg->{'scaler-state'} // '{}') } // {};
+    return 0 if time() - ($state->{'descheduled-at'} // 0) < $DESCHEDULE_COOLDOWN;
+    my $kc = '/etc/kubernetes/admin.conf';
+    my $ok = eval {
+        # finished runs from earlier passes go first
+        guest_exec($cp->{vmid}, "kubectl --kubeconfig $kc -n kube-system get jobs -o name "
+            . "| grep '^job.batch/descheduler-' "
+            . "| xargs -r kubectl --kubeconfig $kc -n kube-system delete\n"
+            . PVE::K8s::Addons::descheduler_run_cmd($kc, "$reason-" . time()));
+        1;
+    };
+    if (!$ok) {
+        print "descheduler: not run after $reason: $@";
+        return 0;
+    }
+    scaler_state_update($name, sub { $_[0]->{'descheduled-at'} = time() });
+    print "descheduler: rebalancing pods after $reason\n";
+    return 1;
+}
+
 my sub set_parked_state {
     my ($name, $msg) = @_;
 
@@ -4711,6 +4747,42 @@ sub scale_reconcile {
         return 1;
     }
 
+    # node-problem-detector: a worker whose kernel deadlocked or
+    # whose file system went read-only (VM alive, kubelet maybe
+    # still Ready) is drained and replaced after a grace, one per
+    # pass and only while every other node is Ready. Control
+    # planes are reported, never replaced here (a roll does that).
+    my $not_ready = grep {
+        my ($r) = grep { ($_->{type} // '') eq 'Ready' }
+            ($_->{status}{conditions} // [])->@*;
+        !$r || ($r->{status} // '') ne 'True';
+    } $knodes->@*;
+    for my $node (@nodes) {
+        my $kn = $k8s_node{$node->{host}} or next;
+        my $p = PVE::K8s::Scaler::node_problem($kn->{status}{conditions})
+            or next;
+        my $since = time() - iso_epoch($p->{since});
+        if ($node->{role} eq 'cp') {
+            print "repair: control plane $node->{host} reports "
+                . "$p->{type} for ${since}s; replace it with a roll\n";
+            next;
+        }
+        next if $since < $PROBLEM_GRACE;
+        if ($not_ready) {
+            print "repair: $node->{host} reports $p->{type} but "
+                . "$not_ready node(s) are not Ready; waiting\n";
+            last;
+        }
+        print "repair: replacing $node->{host} ($p->{type} for "
+            . "${since}s: $p->{message})\n";
+        record_repair($name, $node->{host}, 'worker',
+            "$p->{type} for ${since}s (node-problem-detector)");
+        replace_node($name, $node->{host});
+        # $cp is a control plane: a worker replacement leaves it
+        run_descheduler($name, $cp, 'repair');
+        return 1;
+    }
+
     # Build simulator state from the live cluster.
     my %pods_by_node;
     push $pods_by_node{$_->{spec}{nodeName}}->@*, $_
@@ -4809,6 +4881,9 @@ sub scale_reconcile {
         $sstate->{'scale-out'}, \@pending_uids, $now);
     if ($outcome eq 'ok') {
         scaler_state_update($name, sub { delete $_[0]->{'scale-out'} });
+        # its pods are placed: now spreading the rest cannot
+        # push them back into Pending
+        run_descheduler($name, $cp, 'scaleout');
     } elsif ($outcome eq 'failed') {
         my $rec = $sstate->{'scale-out'};
         my $level = ($sstate->{'pool-backoff'}{$rec->{pool}}{level} // -1) + 1;
@@ -5547,6 +5622,7 @@ sub roll_cluster {
     unlink cert_cache_path($name);
     set_state($name, 'ready');
     print "cluster '$name' rolled: all nodes on $version r$want_rev\n";
+    run_descheduler($name, $cp1, 'roll');
     return 1;
 }
 

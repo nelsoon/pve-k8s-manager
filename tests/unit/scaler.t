@@ -139,4 +139,32 @@ like($provsrc, qr/timeout 240 kubectl .*drain \$host/s,
 like($provsrc, qr/drain of \$host blocked \(likely a /,
     'blocked drain is reported, not forced');
 
+# node-problem-detector conditions that trigger a replacement
+{
+    my $np = \&PVE::K8s::Scaler::node_problem;
+    is($np->([{ type => 'Ready', status => 'True' }]), undef, 'healthy node: none');
+    is($np->([{ type => 'KernelDeadlock', status => 'False' }]), undef, 'condition False: none');
+    my $p = $np->([{ type => 'Ready', status => 'True' },
+        { type => 'ReadonlyFilesystem', status => 'True',
+          lastTransitionTime => '2026-11-13T10:00:00Z', message => 'ro remount' }]);
+    is($p->{type}, 'ReadonlyFilesystem', 'read-only file system found');
+    is($p->{since}, '2026-11-13T10:00:00Z', 'with the time it started');
+    is($np->([{ type => 'FrequentDockerRestart', status => 'True' }]), undef,
+        'other conditions are not acted on');
+    is($np->(undef), undef, 'no conditions: none');
+}
+
+my $src = do { local $/; open my $fh, '<', 'PVE/K8s/Provision.pm' or die; <$fh> };
+like($src, qr/next if \$since < \$PROBLEM_GRACE;\s+if \(\$not_ready\) \{/,
+    'problem nodes wait out the grace and never while another node is down');
+like($src, qr/control plane \$node->\{host\} reports/, 'control planes are only reported');
+like($src, qr/replace_node\(\$name, \$node->\{host\}\);\s+#[^\n]*\n\s+run_descheduler\(\$name, \$cp, 'repair'\);/,
+    'a replaced node is drained first (replace_node), then pods rebalance');
+like($src, qr/delete \$_\[0\]->\{'scale-out'\} \}\);\s+#[^\n]*\n\s+#[^\n]*\n\s+run_descheduler\(\$name, \$cp, 'scaleout'\);/,
+    'the descheduler runs after a scale-out only once its pods are placed');
+like($src, qr/rolled: all nodes on \$version r\$want_rev\\n";\s+run_descheduler\(\$name, \$cp1, 'roll'\);/,
+    'and after a roll');
+like($src, qr/return 0 if time\(\) - \(\$state->\{'descheduled-at'\} \/\/ 0\) < \$DESCHEDULE_COOLDOWN;/,
+    'at most every cooldown');
+
 done_testing();

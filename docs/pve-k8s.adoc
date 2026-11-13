@@ -522,6 +522,17 @@ enabled - or one pass on demand with the Scale button /
   A NotReady node whose VM is alive is reported and
   left alone - the plugin never destroys a live VM on a
   kubelet's say-so.
+  With node-problem-detector (a default add-on), a worker
+  whose `KernelDeadlock` or `ReadonlyFilesystem`
+  condition has been True for 10 minutes is drained and
+  replaced, one per pass and only while every other node
+  is Ready; a control plane in that state is reported
+  (replace it with a roll). Every automatic replacement
+  is listed on the Overview (Auto-repair).
+. *Rebalance*: after a roll, a node replacement, or a
+  scale-out whose pending pods were placed, the
+  descheduler (a default add-on) runs once, at most every
+  10 minutes, to spread pods onto the new nodes.
 . *Local-volume rescue*: pending pods pinned by a local
   PV to a host with no schedulable node get their disk
   moved to a host that has one.

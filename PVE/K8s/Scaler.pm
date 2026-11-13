@@ -552,4 +552,23 @@ sub schedulable_pending {
     return \@out;
 }
 
+# node-problem-detector conditions that make a node unfit to keep:
+# the kernel deadlocked or a file system went read-only. Both are
+# set True by node-problem-detector and do not clear by themselves.
+our @PROBLEM_CONDITIONS = qw(KernelDeadlock ReadonlyFilesystem);
+
+# Pure: the first problem condition that is True on a node, as
+# {type, since => lastTransitionTime, message}, or undef.
+sub node_problem {
+    my ($conditions) = @_;
+
+    my %want = map { $_ => 1 } @PROBLEM_CONDITIONS;
+    for my $c (($conditions // [])->@*) {
+        next if !$want{$c->{type} // ''} || ($c->{status} // '') ne 'True';
+        return { type => $c->{type}, since => $c->{lastTransitionTime},
+            message => $c->{message} // '' };
+    }
+    return undef;
+}
+
 1;
