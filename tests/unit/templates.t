@@ -126,6 +126,39 @@ ok(!$im->{auto} && !defined $im->{window}, 'no window: manual roll only');
 is(PVE::K8s::Provision::image_status($sc, undef, $ts, 1)->{pending}, 0,
     'no template known: nothing pending');
 
+# Size drift (an edited node group) counts as pending, without a deadline.
+$im = PVE::K8s::Provision::image_status(
+    { %$sc, nodes => '[{"name":"a","rev":5},{"name":"b","rev":4},{"name":"c","rev":5}]' },
+    5, $ts, 101 * $day, { a => 1, b => 1 });
+is($im->{pending}, 2, 'resized and old-image nodes are both pending');
+is($im->{resize}, 1, 'a node behind on both counts once, as an image replacement');
+$im = PVE::K8s::Provision::image_status(
+    { %$sc, nodes => '[{"name":"a","rev":5}]' }, 5, $ts, 110 * $day, { a => 1 });
+is($im->{overdue}, 0, 'a resize never carries an image deadline');
+is(PVE::K8s::Provision::image_status($sc, 5, $ts, 101 * $day)->{resize}, 0,
+    'no drift information: no resize');
+
+my $drift_cfg = { pools => '[{"name":"default","size":2,"cpu":4,"memory":8192}]',
+    nodes => '[{"name":"x-cp1","pool":"control-plane","vmid":"100","pvehost":"h1"},'
+        . '{"name":"x-w1","pool":"default","vmid":"101","pvehost":"h1"},'
+        . '{"name":"x-w2","pool":"default","vmid":"102","pvehost":"h2"},'
+        . '{"name":"x-w3","pool":"default","vmid":"103","pvehost":"h2"}]' };
+my %conf = (
+    'h1/100' => "cores: 4\nmemory: 3072\n",
+    'h1/101' => "cores: 4\nmemory: 8192\n",
+    # resized in the config but not restarted: still runs at 4096
+    'h2/102' => "cores: 4\nmemory: 4096\n[PENDING]\nmemory: 8192\n",
+);
+my $drift = PVE::K8s::Provision::size_drift_nodes($drift_cfg, sub {
+    my ($h, $id) = @_;
+    return $conf{"$h/$id"} // die "no config\n";
+});
+is_deeply($drift, { 'x-w2' => 1 },
+    'the running shape counts, pending values do not, control plane and unreadable configs are skipped');
+is_deeply(PVE::K8s::Provision::size_drift_nodes({ %$drift_cfg, pools => undef },
+    sub { "cores: 1\nmemory: 512\n" }), {},
+    'a node group without a size never drifts');
+
 # Pruning inputs.
 my @cp = PVE::K8s::Provision::template_copies({
     cloud1 => "  9000 k8s-node-1.36-r4 stopped 4096 20.00 0\n  105 k8s-node-1.36-r5 stopped 4096 20.00 0\n  200 other stopped 1 1 0\n",

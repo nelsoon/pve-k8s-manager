@@ -1328,9 +1328,21 @@ Ext.define('PVE.dc.K8sView', {
                         imageInfo.setValue(checkIcon(true, false)
                             + gettext('up to date'));
                     } else {
-                        let msg = Ext.String.format(gettext(
-                            '{0} node(s) pending replacement by the '
-                            + 'newest image'), im.pending);
+                        // image replacements and resizes (an edited
+                        // node group) are rolled the same way
+                        let parts = [];
+                        let byImage = im.pending - (im.resize || 0);
+                        if (byImage > 0) {
+                            parts.push(Ext.String.format(gettext(
+                                '{0} node(s) pending replacement by the '
+                                + 'newest image'), byImage));
+                        }
+                        if (im.resize) {
+                            parts.push(Ext.String.format(gettext(
+                                '{0} node(s) pending resize to their '
+                                + 'node group'), im.resize));
+                        }
+                        let msg = parts.join(', ');
                         if (im.deadline) {
                             msg += ', ' + Ext.String.format(gettext(
                                 '{0} deadline {1}'), im.severity,

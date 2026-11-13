@@ -3803,6 +3803,47 @@ sub cluster_template_names {
         sort { $a <=> $b } keys $props->%*;
 }
 
+# Worker nodes whose VM shape (cores, memory, disk, device) differs
+# from their node group, e.g. after the group was edited. Read from
+# pmxcfs, no ssh and no qm: the top section of a VM config is what
+# runs; pending values sit in [PENDING], which live_size ignores, as
+# `qm config --current` does for the roll. Returns { name => 1 }.
+sub size_drift_nodes {
+    my ($scfg, $read_conf) = @_;
+
+    $read_conf //= sub {
+        my ($host, $vmid) = @_;
+        return PVE::Tools::file_get_contents(
+            "/etc/pve/nodes/$host/qemu-server/$vmid.conf");
+    };
+    my $pools = eval { PVE::K8s::Config::parse_pools(
+        $scfg->{pools}, $scfg->{workers} // 2) } // [];
+    my %pdef = map { $_->{name} => $_ } $pools->@*;
+    my $nodes = eval { JSON::PP->new->decode($scfg->{nodes} // '[]') } // [];
+    my $ids = eval {
+        require PVE::Cluster;
+        PVE::Cluster::get_vmlist()->{ids};
+    } // {};
+    my %out;
+    for my $n ($nodes->@*) {
+        my $def = $pdef{$n->{pool} // ''};
+        next if !$def || !$n->{vmid} || !defined $n->{name};
+        # the VM may have migrated since the record was written
+        my $host = ($ids->{$n->{vmid}} // {})->{node} // $n->{pvehost};
+        next if !defined $host;
+        my $cfg = eval { $read_conf->($host, $n->{vmid}) };
+        next if !defined $cfg;
+        my ($c, $m, $d, $dev) = live_size($cfg);
+        next if !defined $c || !defined $m;
+        $out{$n->{name}} = 1 if size_drift({
+            cpu => $def->{cpu}, memory => $def->{memory},
+            disk => $def->{disk},
+            device_profile => $def->{'device-profile'},
+        }, $c, $m, $d, $dev);
+    }
+    return \%out;
+}
+
 # HA services in error state, from the HA manager's status file on
 # pmxcfs (what `ha-manager status` reads) instead of spawning it.
 sub ha_error_services {
@@ -7053,16 +7094,25 @@ sub summary_cache_write {
 # template state (PVE::K8s::Templates). Nodes behind it are
 # "pending replacement"; one past a high/critical deadline is
 # "overdue" and the Summary shows it as an error.
+# $resized (optional) names the nodes whose VM shape differs from
+# their node group: the window roll replaces them too, so they
+# count as pending (and as "resize", without an image deadline).
 sub image_status {
-    my ($scfg, $best_rev, $tstate, $now) = @_;
+    my ($scfg, $best_rev, $tstate, $now, $resized) = @_;
 
     my $nodes = eval { JSON::PP->new->decode($scfg->{nodes} // '[]') } // [];
     my $minor = $scfg->{'k8s-version'} // '';
-    my ($pending, $overdue, $deadline, $severity) = (0, 0);
+    my ($pending, $overdue, $deadline, $severity, $resize) = (0, 0, undef, undef, 0);
     for my $n ($nodes->@*) {
         my $rev = $n->{rev} // 0;
-        next if !defined $best_rev || $rev >= $best_rev;
+        my $old_image = defined $best_rev && $rev < $best_rev;
+        my $wrong_size = ($resized // {})->{$n->{name} // ''} ? 1 : 0;
+        next if !$old_image && !$wrong_size;
         $pending++;
+        if (!$old_image) {
+            $resize++;
+            next;
+        }
         my $r = PVE::K8s::Templates::remediation($tstate, $minor,
             $n->{arch} // 'amd64', $rev, $now);
         $overdue++ if $r->{overdue};
@@ -7075,6 +7125,7 @@ sub image_status {
     return {
         latest => defined $best_rev ? $best_rev + 0 : undef,
         pending => $pending,
+        resize => $resize,
         overdue => $overdue,
         deadline => $deadline,
         severity => $severity,
@@ -7234,7 +7285,8 @@ sub summary_cluster {
             cluster_template_names(), $scfg->{'k8s-version'},
             $scfg->{'cp-arch'} // 'amd64');
         $out->{image} = image_status($scfg, $best,
-            PVE::K8s::Templates::read_state(), time());
+            PVE::K8s::Templates::read_state(), time(),
+            size_drift_nodes($scfg));
     };
     $out->{health} = summary_health($out->{state},
         $out->{cp}, $out->{cp_ready}, $out->{nodes_ready},
