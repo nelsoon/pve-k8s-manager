@@ -10,11 +10,51 @@ use warnings;
 # inside the cluster. Install commands run on the first
 # control-plane node via the guest agent.
 
-# Cilium 1.20.x is e2e-tested upstream up to Kubernetes 1.36;
-# 1.37 support lands in Cilium 1.21 (pre-release at pin time),
-# so 1.37 clusters rely on Kubernetes backward compatibility
-# until 1.21 is stable - proven in the lab before release.
+# Cilium 1.20.x is e2e-tested upstream up to Kubernetes 1.36.
+# Kubernetes 1.37 is tested only by Cilium 1.21, still a
+# pre-release: 1.37 clusters get that pre-release (a preview,
+# see PVE::K8s::Config %PREVIEW_VERSIONS) until 1.21.0 is out;
+# then $CILIUM_VERSION moves to 1.21.x and the map empties.
 our $CILIUM_VERSION = '1.20.4';
+our %CILIUM_FOR_MINOR = ('1.37' => '1.21.0-pre.4');
+
+# The Cilium version a cluster on Kubernetes $minor runs.
+sub cilium_version_for {
+    my ($minor) = @_;
+
+    ($minor) = ($minor // '') =~ /^v?(\d+\.\d+)/;
+    return $CILIUM_FOR_MINOR{$minor // ''} // $CILIUM_VERSION;
+}
+
+# Pure: "1.20.4" from the cilium DaemonSet's agent image
+# (quay.io/cilium/cilium:v1.20.4@sha256:...), or undef.
+sub cilium_running_version {
+    my ($ds) = @_;
+
+    for my $c (((((($ds // {})->{spec} // {})->{template} // {})
+            ->{spec} // {})->{containers} // [])->@*) {
+        my ($v) = ($c->{image} // '') =~ m{/cilium(?:-ci)?:v([0-9][0-9A-Za-z.+-]*?)(?:@|$)};
+        return $v if defined $v;
+    }
+    return undef;
+}
+
+# Pure: what moving Cilium from $have to $want means: 'none',
+# 'upgrade', or a refusal. Cilium supports one minor at a time
+# and no downgrades.
+sub cilium_step {
+    my ($have, $want) = @_;
+
+    return 'none' if !defined $have || $have eq $want;
+    my ($hm, $hn) = $have =~ /^(\d+)\.(\d+)/;
+    my ($wm, $wn) = $want =~ /^(\d+)\.(\d+)/;
+    die "cannot read Cilium version '$have'\n" if !defined $hn;
+    my $gap = ($wm - $hm) * 100 + ($wn - $hn);
+    return 'upgrade' if $gap == 0 || $gap == 1;
+    die "Cilium $have -> $want skips a minor; upgrade Cilium one minor "
+        . "at a time first\n" if $gap > 1;
+    die "Cilium $have is newer than $want; pve-k8s does not downgrade it\n";
+}
 our $HELM_VERSION = '4.3.2';
 our $POD_CIDR = '10.244.0.0/16';
 
@@ -66,27 +106,30 @@ fi
 EOF
 }
 
-# Experimental channel: Cilium 1.20's Gateway controller
-# requires TLSRoutes, BackendTLSPolicies and ReferenceGrant
-# v1, which the standard channel does not ship.
-our $GATEWAY_API_VERSION = '1.5.1';
+# The Gateway API CRDs Cilium's docs require (1.20.4 and
+# 1.21.0-pre.4 both name v1.6.3). Experimental channel: a
+# superset of standard, kept so clusters created with it are
+# never downgraded to standard (that would drop stored
+# versions). Applied server-side: the CRDs are too large for
+# the client-side last-applied annotation.
+our $GATEWAY_API_VERSION = '1.6.3';
 
 sub cilium_install_cmd {
-    my ($kubeconfig, $vip) = @_;
+    my ($kubeconfig, $vip, $minor) = @_;
 
     # Single-quoted heredoc + sprintf: an interpolating heredoc
     # strips backslash-newline continuations, which once made
     # helm run without its namespace/values arguments.
     my @args = (helm_ensure_cmd(), $kubeconfig,
         $GATEWAY_API_VERSION, cilium_values_yaml($vip),
-        $CILIUM_VERSION);
+        cilium_version_for($minor));
     return sprintf(<<'EOF', @args);
 %s
 export KUBECONFIG=%s
 # Gateway API CRDs are not part of the Cilium chart; install
 # them first or the Gateway resources cannot be created.
 GW=https://github.com/kubernetes-sigs/gateway-api/releases/download/v%s/experimental-install.yaml
-kubectl apply -f $GW
+kubectl apply --server-side --force-conflicts -f $GW
 cat > /root/cilium-values.yaml <<'VALUES'
 %s
 VALUES

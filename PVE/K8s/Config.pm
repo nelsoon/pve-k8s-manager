@@ -488,10 +488,22 @@ sub parse_pools {
 # upgrade one minor at a time until they are back inside
 # the window, so the upgrade path is not gated on this
 # list. Templates in the lab: v1.35.9 and v1.36.5.
-our @SUPPORTED_VERSIONS = ('1.35', '1.36');
+our @SUPPORTED_VERSIONS = ('1.35', '1.36', '1.37');
+
+# Creatable minors whose add-on stack is still a pre-release:
+# never the default, labelled preview everywhere. 1.37 needs
+# Cilium 1.21 (pre-release, see PVE::K8s::Addons).
+our %PREVIEW_VERSIONS = ('1.37' => 'Cilium 1.21 is a pre-release');
 
 sub supported_versions {
     return [@SUPPORTED_VERSIONS];
+}
+
+sub preview_reason {
+    my ($version) = @_;
+
+    my ($minor) = ($version // '') =~ /^v?(\d+\.\d+)/;
+    return defined $minor ? $PREVIEW_VERSIONS{$minor} : undef;
 }
 
 # Upstream support dates per minor (kubernetes.io/releases): patch
@@ -527,11 +539,14 @@ sub version_support {
         : $now >= ymd_epoch($d->{maintenance}) ? 'maintenance' : 'supported';
     return { minor => $minor, status => $status,
         maintenance => $d->{maintenance}, eol => $d->{eol},
-        days => int(($eol - $now) / 86400) };
+        days => int(($eol - $now) / 86400),
+        ($PREVIEW_VERSIONS{$minor} ? (preview => $PREVIEW_VERSIONS{$minor}) : ()) };
 }
 
+# The default for new clusters: the newest minor that is not a preview.
 sub latest_supported_version {
-    return $SUPPORTED_VERSIONS[-1];
+    my @ga = grep { !$PREVIEW_VERSIONS{$_} } @SUPPORTED_VERSIONS;
+    return $ga[-1];
 }
 
 # A minor this release can create. A listed minor past its upstream

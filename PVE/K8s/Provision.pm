@@ -2685,9 +2685,9 @@ sub provision_cluster {
     # super-admin kubeconfig only ever existed on the init
     # node (lab, 2026-10-28: a post-roll scale re-ran the
     # install on a converged CP and died on localhost:8080).
-    guest_exec($cp1->{vmid},
-        PVE::K8s::Addons::cilium_install_cmd(
-            '/root/local-super-admin.conf', $vip)) if $fresh;
+    my $k8s_minor = $scfg->{'k8s-version'};
+    guest_exec($cp1->{vmid}, PVE::K8s::Addons::cilium_install_cmd(
+        '/root/local-super-admin.conf', $vip, $k8s_minor)) if $fresh;
     set_external_cloud_provider($cp1);
     ensure_kubelet_node_ip($cp1);
     print "control plane initialised on $cp1->{host}\n";
@@ -8439,6 +8439,14 @@ sub build_template {
     return $found;
 }
 
+# The Cilium version running in a cluster, from its DaemonSet.
+my sub cilium_running {
+    my ($cp) = @_;
+
+    return PVE::K8s::Addons::cilium_running_version(
+        kubectl_json($cp, '-n kube-system get daemonset cilium'));
+}
+
 sub upgrade_cluster {
     my ($name, $target, %opts) = @_;
 
@@ -8458,6 +8466,17 @@ sub upgrade_cluster {
     die "no template k8s-node-$to-r* found on any host; "
         . "build one first (images/)\n"
         if !defined $upgrade_tpl;
+    # Cilium first: the target minor may need a newer one (1.37
+    # needs 1.21), which still runs on the current minor.
+    my $nodes = load_nodes($name, $scfg);
+    my $cp = ops_cp($nodes);
+    my $have = cilium_running($cp);
+    my $want = PVE::K8s::Addons::cilium_version_for($to);
+    if (PVE::K8s::Addons::cilium_step($have, $want) eq 'upgrade') {
+        print "upgrading Cilium $have -> $want before Kubernetes $to\n";
+        guest_exec($cp->{vmid}, PVE::K8s::Addons::cilium_install_cmd(
+            '/etc/kubernetes/admin.conf', PVE::K8s::Config::vip_for($scfg), $to));
+    }
     return roll_cluster($name, target_version => $to, force => $opts{force});
 }
 
@@ -8791,6 +8810,8 @@ sub upgrade_check {
                 . "life on $vs->{eol}")
             : $add->('supported', 'ok', "Kubernetes $to is supported"
                 . ($vs->{eol} ? " (upstream until $vs->{eol})" : ''));
+        $add->('preview', 'warn', "Kubernetes $to is a preview: "
+            . "$vs->{preview}") if $vs->{preview};
     }
     ($scfg->{state} // '') eq 'ready'
         ? $add->('cluster-state', 'ok', 'cluster is ready')
@@ -8847,6 +8868,20 @@ sub upgrade_check {
                 . 'disruptions left can stall node drains: '
                 . join(', ', @blocked))
             : $add->('pdb', 'ok', 'no PodDisruptionBudget blocks eviction');
+        my $have = cilium_running($cp);
+        my $want = PVE::K8s::Addons::cilium_version_for($to);
+        my $step = eval { PVE::K8s::Addons::cilium_step($have, $want) };
+        if (my $e = $@) {
+            $e =~ s/\s+$//;
+            $add->('cilium', 'block', $e);
+        } elsif ($step eq 'upgrade') {
+            $add->('cilium', 'ok', "Cilium $have -> $want is upgraded "
+                . "first (Kubernetes $to needs it)");
+        } else {
+            $add->('cilium', defined $have ? 'ok' : 'warn', defined $have
+                ? "Cilium $have already fits Kubernetes $to"
+                : 'could not read the running Cilium version');
+        }
         my $m = guest_exec($cp->{vmid},
             'kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw '
             . '/metrics 2>/dev/null | grep ^apiserver_requested_deprecated_apis');

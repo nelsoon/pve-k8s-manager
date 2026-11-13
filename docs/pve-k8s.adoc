@@ -61,11 +61,16 @@ pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \
 ----
 
 Creating records the cluster (`state: config-only`);
-nothing is built until provision. Only Kubernetes 1.35
-and 1.36 can be created: the version dropdown and the
-backend accept exactly the add-on-tested minors. Newer
-minors are admitted only after add-on compatibility is
-proven; 1.37 is held for that reason.
+nothing is built until provision. Kubernetes 1.35, 1.36
+and 1.37 can be created; 1.36 is the default. 1.37 is a
+*preview*: only Cilium 1.21 is tested with it, and 1.21
+is still a pre-release, so 1.37 clusters get that
+pre-release (1.21.0-pre.4). Once Cilium 1.21.0 is
+released, the pin moves to it and the preview label goes
+away. Upgrading to a minor that needs a newer Cilium
+upgrades Cilium first, one Cilium minor at a time; the
+upgrade check shows that step and refuses a jump of two
+Cilium minors.
 
 Each minor shows its upstream support window: the
 create dialog shows the end-of-life date, and the
@@ -322,7 +327,10 @@ subnet. pve-k8s talks to Kubernetes over two channels:
   reconfiguration.
 * Cilium is the CNI (eBPF, kube-proxy replacement) and
   provides the ingress controller and Gateway API by
-  default. LoadBalancer services draw IPs from the
+  default. pve-k8s installs the Gateway API CRDs itself
+  (v1.6.3, experimental channel, applied server-side)
+  before Cilium, at the version Cilium documents.
+  LoadBalancer services draw IPs from the
   cluster's LB range (Cilium LB IPAM) and are announced
   with L2 announcements, so a laptop on another subnet
   can reach a service IP through the normal gateway;

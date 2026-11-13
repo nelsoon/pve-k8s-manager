@@ -14,8 +14,22 @@ require PVE::K8s::Config;
 
 my $supported = PVE::K8s::Config::supported_versions();
 ok(scalar $supported->@* >= 1, 'supported version list is not empty');
-is(PVE::K8s::Config::latest_supported_version(), $supported->[-1],
-    'latest supported is the last entry');
+my %preview = do { no warnings 'once'; %PVE::K8s::Config::PREVIEW_VERSIONS };
+my @ga = grep { !$preview{$_} } $supported->@*;
+is(PVE::K8s::Config::latest_supported_version(), $ga[-1],
+    'the default is the newest non-preview minor');
+ok(!$preview{PVE::K8s::Config::latest_supported_version()}, 'a preview is never the default');
+is(PVE::K8s::Config::preview_reason('1.37.1'), $preview{'1.37'}, 'patch versions map to their minor');
+is(PVE::K8s::Config::preview_reason('1.36'), undef, '1.36 is no preview');
+require PVE::K8s::Addons;
+for my $v (keys %preview) {
+    like(PVE::K8s::Addons::cilium_version_for($v), qr/-pre\./,
+        "preview $v runs a Cilium pre-release");
+}
+for my $v (@ga) {
+    is(PVE::K8s::Addons::cilium_version_for($v), $PVE::K8s::Addons::CILIUM_VERSION,
+        "$v runs the stable Cilium pin");
+}
 
 for my $v ($supported->@*) {
     is(PVE::K8s::Config::assert_supported_version($v), $v,
@@ -25,9 +39,8 @@ for my $v ($supported->@*) {
     ok(-f "images/versions/$v.env", "template pin exists for $v");
 }
 
-# 1.37 is upstream-maintained but held back until the add-on
-# stack officially tests it; it must be rejected like the EOL lines.
-for my $v (qw(1.31 1.32 1.33 1.34 1.37)) {
+# Older lines are rejected for new clusters.
+for my $v (qw(1.31 1.32 1.33 1.34)) {
     ok(!grep({ $_ eq $v } $supported->@*), "$v is outside the window");
     ok(!eval { PVE::K8s::Config::assert_supported_version($v); 1 },
         "$v is rejected for new clusters");
@@ -45,13 +58,16 @@ my $js = do {
 };
 my ($store) = $js =~ /supportedVersions: \[([^\]]+)\]/s;
 ok(defined $store, 'create dialog declares the creatable minors');
-like($js, qr/name: 'k8s-version',.*?store: versions,/s,
+like($js, qr/name: 'k8s-version',.*?store: versionStore,/s,
     'the k8s-version dropdown offers exactly that list');
 my @offered = $store =~ /'(\d+\.\d+)'/g;
 is_deeply(\@offered, $supported,
     'wizard dropdown matches the supported version list');
-like($js, qr/let latest = versions\[versions\.length - 1\];.*?name: 'k8s-version',.*?value: latest,/s,
-    'wizard defaults to the latest supported version');
+my ($pjs) = $js =~ /previewVersions: \[([^\]]*)\]/;
+is_deeply([sort(($pjs // '') =~ /'(\d+\.\d+)'/g)], [sort keys %preview],
+    'the dialog labels the same previews');
+like($js, qr/let latest = ga\[ga\.length - 1\];.*?name: 'k8s-version',.*?value: latest,/s,
+    'wizard defaults to the newest non-preview version');
 
 # The API enforces the same window at create time.
 my $api = do {

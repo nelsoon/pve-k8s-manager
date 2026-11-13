@@ -179,4 +179,33 @@ unlike($js, qr/name: 'bgp-peer-address'/,
 like($api, qr/assert_network_config/,
     'create validates the network config eagerly');
 
+# Cilium per Kubernetes minor, its running version, upgrade steps.
+{
+    my $A = 'PVE::K8s::Addons';
+    is($A->can('cilium_running_version')->({ spec => { template => { spec => {
+        containers => [{ image => 'quay.io/cilium/cilium:v1.20.4@sha256:abc' }] } } } }),
+        '1.20.4', 'running Cilium read from the agent image');
+    is($A->can('cilium_running_version')->({ spec => { template => { spec => {
+        containers => [{ image => 'quay.io/cilium/cilium:v1.21.0-pre.4' }] } } } }),
+        '1.21.0-pre.4', 'pre-release tags too');
+    is($A->can('cilium_running_version')->(undef), undef, 'no DaemonSet: unknown');
+    my $step = $A->can('cilium_step');
+    is($step->('1.20.4', '1.20.4'), 'none', 'same version: nothing');
+    is($step->(undef, '1.21.0'), 'none', 'unknown running version: nothing');
+    is($step->('1.20.3', '1.20.4'), 'upgrade', 'a patch');
+    is($step->('1.20.4', '1.21.0-pre.4'), 'upgrade', 'one minor, pre-release target');
+    is($step->('1.21.0-pre.4', '1.21.0'), 'upgrade', 'pre-release to its release');
+    ok(!eval { $step->('1.19.9', '1.21.0'); 1 }, 'two minors refused');
+    like($@, qr/one minor at a time/, 'and says why');
+    ok(!eval { $step->('1.21.0', '1.20.4'); 1 }, 'no downgrade');
+    my $cmd = $A->can('cilium_install_cmd')->('/k', '10.0.0.5', '1.37');
+    like($cmd, qr/--version 1\.21\.0-pre\.4 /, '1.37 installs the Cilium pre-release');
+    like($A->can('cilium_install_cmd')->('/k', '10.0.0.5', '1.36'),
+        qr/--version \Q$PVE::K8s::Addons::CILIUM_VERSION\E /, '1.36 the stable pin');
+    like($cmd, qr{kubectl apply --server-side --force-conflicts -f \$GW},
+        'Gateway API CRDs applied server-side');
+    like($cmd, qr{gateway-api/releases/download/v1\.6\.3/experimental-install\.yaml},
+        'Gateway API v1.6.3 (what Cilium documents)');
+}
+
 done_testing();

@@ -23,7 +23,10 @@ Ext.define('PVE.dc.K8sCreateWindow', {
 
     // Minors this release can create. Kept in step with
     // PVE::K8s::Config::supported_versions by tests/unit/ui-k8s.t.
-    supportedVersions: ['1.35', '1.36'],
+    supportedVersions: ['1.35', '1.36', '1.37'],
+    // Minors whose add-on stack is a pre-release (PVE::K8s::Config
+    // %PREVIEW_VERSIONS): labelled, never the default.
+    previewVersions: ['1.37'],
     // Upstream end of life per minor, kept in step with
     // PVE::K8s::Config %VERSION_DATES by tests/unit/supported-versions.t.
     versionEol: { '1.35': '2027-02-28', '1.36': '2027-06-28', '1.37': '2027-10-28' },
@@ -71,7 +74,19 @@ Ext.define('PVE.dc.K8sCreateWindow', {
         let me = this;
 
         let versions = me.supportedVersions;
-        let latest = versions[versions.length - 1];
+        let ga = versions.filter(v => me.previewVersions.indexOf(v) < 0);
+        let latest = ga[ga.length - 1];
+        let versionStore = versions.map(v => [v,
+            me.previewVersions.indexOf(v) < 0 ? v : v + ' (' + gettext('preview') + ')']);
+        let supportText = function(v) {
+            let eol = me.versionEol[v];
+            let txt = eol ? Ext.String.format(gettext('Upstream support until {0}'), eol) : '';
+            if (me.previewVersions.indexOf(v) >= 0) {
+                txt += (txt ? '. ' : '')
+                    + gettext('Preview: its Cilium is a pre-release');
+            }
+            return txt;
+        };
 
         let zoneStore = Ext.create('Ext.data.Store', {
             fields: ['zone'],
@@ -244,16 +259,13 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     xtype: 'combobox',
                     name: 'k8s-version',
                     fieldLabel: gettext('Kubernetes Version'),
-                    store: versions,
+                    store: versionStore,
                     value: latest,
                     editable: false,
                     allowBlank: false,
                     listeners: {
                         change: function(f, v) {
-                            let eol = me.versionEol[v];
-                            get('k8s-support').setValue(eol
-                                ? Ext.String.format(gettext('Upstream support until {0}'), eol)
-                                : '');
+                            get('k8s-support').setValue(supportText(v));
                             updateSummary();
                         },
                     },
@@ -263,10 +275,7 @@ Ext.define('PVE.dc.K8sCreateWindow', {
                     name: 'k8s-support',
                     submitValue: false,
                     fieldLabel: gettext('Support'),
-                    value: me.versionEol[latest]
-                        ? Ext.String.format(gettext('Upstream support until {0}'),
-                            me.versionEol[latest])
-                        : '',
+                    value: supportText(latest),
                 },
                 {
                     xtype: 'combobox',
@@ -1717,7 +1726,9 @@ Ext.define('PVE.dc.K8sView', {
                     } else if (vs.status === 'supported') {
                         versionInfo.setValue(ver + ' - ' + Ext.String.format(
                             gettext('upstream support until {0}'),
-                            Ext.htmlEncode(vs.eol)));
+                            Ext.htmlEncode(vs.eol))
+                            + (vs.preview ? ' (' + gettext('preview') + ': '
+                                + Ext.htmlEncode(vs.preview) + ')' : ''));
                     }
                     // Datacenter-Health idiom: every
                     // check carries its own status icon
