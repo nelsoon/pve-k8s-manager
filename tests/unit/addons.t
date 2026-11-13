@@ -80,8 +80,10 @@ like($api, qr/fork_cluster_worker\('k8saddondisable'/,
     'addon disable runs as a k8saddondisable PVE task');
 like($api, qr/k8spowerstart|k8spowerstop/,
     'power task type carries the action for the task log');
-like($api, qr/pattern => '\^\(cert-manager\|external-dns\|metrics-server\|'\s+\. 'snapshot-controller\|node-problem-detector\|spegel\|descheduler\)\$'/,
+like($api, qr/die "add-on '\$addon' is not one you enable\\n"\s+if \$e->\{tier\} !~ \/\^\(\?:optional\|default\)\$\/;/,
     'enable takes the optional and default add-ons only');
+like($api, qr/PVE::K8s::Addons::addon_options\(\$e, \\%opts\) if \$e->\{install\};/,
+    'settings are checked before the task starts');
 for my $e (grep { $_->{tier} eq 'default' } PVE::K8s::Addons::catalog()) {
     ok(PVE::K8s::Provision::simple_addon_cmds($e->{name}, '/k', '1.36'),
         "default add-on $e->{name} has install and delete commands");
@@ -318,5 +320,99 @@ like($api, qr/path => '\{name\}\/addons\/\{addon\}\/update',[\s\S]*?Sys\.Modify/
     'per add-on update needs Sys.Modify');
 like($api, qr/path => '\{name\}\/addon-updates',[\s\S]*?Sys\.Modify/,
     'update all needs Sys.Modify');
+
+# Opt-in catalog: settings, commands
+{
+    my $A = 'PVE::K8s::Addons';
+    my $v = $A->can('catalog_entry')->('velero');
+    my ($all, $store) = $A->can('addon_options')->($v, { 's3-url' => 'https://s3:7480',
+        bucket => 'b', 'access-key' => 'AK', 'secret-key' => 'SK' });
+    is($all->{region}, 'default', 'defaults filled in');
+    is($all->{'secret-key'}, 'SK', 'secrets reach the install');
+    ok(!exists $store->{'secret-key'} && !exists $store->{'access-key'},
+        'secrets are never stored');
+    ok(!eval { $A->can('addon_options')->($v, { bucket => 'b' }); 1 }, 'required setting missing');
+    like($@, qr/needs 's3-url'/, 'names it');
+    ok(!eval { $A->can('addon_options')->($v, { nope => 1 }); 1 }, 'unknown setting refused');
+    my $o = $A->can('catalog_entry')->('observability');
+    ok(!eval { $A->can('addon_options')->($o, { retention => 0 }); 1 }, 'int range checked');
+    ok(!eval { $A->can('addon_options')->($o, { ha => 'yes' }); 1 }, 'bool checked');
+    ok(!eval { $A->can('addon_options')->($v, { 's3-url' => "a\nb", bucket => 'b',
+        'access-key' => 'x', 'secret-key' => 'y' }); 1 }, 'control characters refused');
+    is(($A->can('addon_options')->($o, { ha => 'true' }))[0]{ha}, 1, 'true means 1');
+
+    my $single = $A->can('observability_values_yaml')->();
+    like($single, qr/vmsingle:\n  enabled: true/, 'single: VMSingle');
+    like($single, qr/vlsingle:\n  enabled: true/, 'logs on by default');
+    unlike($single, qr/vtsingle/, 'traces off by default');
+    like($single, qr/kubeProxy:\n  enabled: false/, 'no kube-proxy target (Cilium replaces it)');
+    my $ha = $A->can('observability_values_yaml')->(ha => 1, traces => 1, retention => 30);
+    like($ha, qr/vmcluster:\n  enabled: true\n  spec:\n    retentionPeriod: "30d"\n    replicationFactor: 2/,
+        'HA: metrics cluster, replication factor 2');
+    like($ha, qr/vlcluster:\n  enabled: true/, 'HA: logs on a cluster');
+    like($ha, qr/vtsingle:\n  enabled: true/, 'traces when asked (single)');
+
+    my $vel = $A->can('velero_install_cmd')->('/k', '1.36', { 's3-url' => 'https://s3:7480',
+        bucket => 'b', region => 'default', 'access-key' => 'AK', 'secret-key' => 'S/K' });
+    like($vel, qr/create secret generic velero-s3/, 'credentials go into a cluster Secret');
+    like($vel, qr/existingSecret: velero-s3/, 'the chart uses that Secret');
+    like($vel, qr/velero\.io\/csi-volumesnapshot-class: "true"/, 'a snapshot class for Proxmox CSI');
+    unlike($A->can('velero_install_cmd')->('/k', '1.36', { 's3-url' => 'https://s3:7480',
+        bucket => 'b', region => 'default' }), qr/create secret/, 'an update keeps the Secret');
+    ok(!eval { $A->can('velero_install_cmd')->('/k', '1.36', { 's3-url' => 'https://s3',
+        bucket => 'b', 'access-key' => "x'y", 'secret-key' => 'z' }); 1 }, 'quoted key refused');
+    ok(!eval { $A->can('velero_install_cmd')->('/k', '1.36', { 's3-url' => 'ftp://x',
+        bucket => 'b' }); 1 }, 'non-http S3 URL refused');
+
+    like($A->can('flux_install_cmd')->('/k', '1.36', {}), qr/annotate deploy source-controller\s+\\\n\s+pve-k8s\.proxmox\.com\/version=/,
+        'Flux records its release version');
+    unlike($A->can('flux_install_cmd')->('/k', '1.36', {}), qr/flagger/, 'no Flagger unless asked');
+    like($A->can('flux_install_cmd')->('/k', '1.36', { flagger => 1 }),
+        qr/--set meshProvider=gatewayapi:v1/, 'Flagger drives the Gateway API');
+    like($A->can('chart_install_cmd')->('kyverno', '/k', { ha => 1 }),
+        qr/admissionController\.replicas=3/, 'Kyverno HA: 3 admission controllers');
+    like($A->can('chart_install_cmd')->('kyverno', '/k', {}),
+        qr/admissionController\.replicas=1/, 'otherwise 1');
+    for my $n (qw(headlamp tetragon keda kyverno observability velero flux)) {
+        my $e = $A->can('catalog_entry')->($n);
+        ok($e->{install} && $e->{delete}, "$n can be enabled and removed");
+    }
+    my $live = $A->can('probe_versions')->({ deployment => { items => [{
+        metadata => { namespace => 'flux-system', name => 'source-controller',
+            annotations => { 'pve-k8s.proxmox.com/version' => '2.10.0' } },
+        spec => { template => { spec => { containers => [{ image => 'ghcr.io/fluxcd/source-controller:v1.10.1' }] } } } }] } });
+    is($live->{flux}, '2.10.0', 'Flux version read from the annotation, not the image');
+}
+
+# Application backups (Velero)
+{
+    my $P = 'PVE::K8s::Provision';
+    my $rows = $P->can('app_backup_rows')->({ items => [
+        { metadata => { name => 'a', creationTimestamp => '2026-11-01T00:00:00Z',
+            labels => { 'pve-k8s.proxmox.com/reason' => 'pre-upgrade' } },
+          status => { phase => 'Completed', progress => { itemsBackedUp => 42 } } },
+        { metadata => { name => 'b', creationTimestamp => '2026-11-02T00:00:00Z' },
+          status => { phase => 'PartiallyFailed', errors => 1 } },
+        { metadata => { name => 'c', creationTimestamp => '2026-11-03T00:00:00Z' } },
+    ] });
+    is_deeply([map { $_->{name} } @$rows], [qw(c b a)], 'newest first');
+    is($rows->[0]{phase}, 'New', 'no status yet: New');
+    is($rows->[2]{items}, 42, 'items backed up');
+    is($rows->[2]{reason}, 'pre-upgrade', 'why it was taken');
+    is($P->can('velero_name')->('pre-upgrade-1.37', 1731500000), 'pre-upgrade-1-37-1731500000',
+        'object names are DNS labels');
+    is(length($P->can('velero_name')->('restore-' . ('x' x 80), 1)), 63, 'and at most 63 long');
+    my $b = $P->can('app_backup_object')->('n', 'manual');
+    is_deeply($b->{spec}{includedNamespaces}, ['*'], 'every namespace');
+    ok($b->{spec}{snapshotMoveData}, 'volume data moved to the bucket');
+    is($b->{spec}{ttl}, '720h0m0s', 'kept 30 days');
+    ok(!$P->can('velero_enabled')->({}), 'no record: not enabled');
+    ok($P->can('velero_enabled')->({ addons => '{"velero":{"bucket":"b"}}' }), 'record: enabled');
+}
+like($prov, qr/app_backup\(\$name, reason => 'pre-upgrade', prefix => "pre-upgrade-\$to",\s+wait => 1\) if velero_enabled\(\$scfg\);\s+#[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*\n\s+update_addons\(/,
+    'with Velero, the upgrade backs up first, then add-ons, then the roll');
+like($prov, qr/die "Velero backup \$bname \$st->\{phase\}"/, 'a failed backup stops it');
+like($api, qr/path => '\{name\}\/app-backups\/\{backup\}\/restore',[\s\S]*?Sys\.Modify/,
+    'restore needs Sys.Modify');
 
 done_testing();

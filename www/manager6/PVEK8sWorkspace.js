@@ -782,6 +782,70 @@ Ext.define('PVE.dc.K8sRebuildWindow', {
 // Add-ons that need answers before they are enabled: a stock Edit
 // window, run as a task. Only the fields that apply are shown (the
 // ACME email only for the ACME issuer).
+// Generic settings window for catalog add-ons: one field per option
+// the add-on declares (enum, bool, int, string; secret ones are
+// password fields and never stored). A dedicated panel can replace
+// it for an add-on later.
+Ext.define('PVE.dc.K8sAddonOptionsWindow', {
+    extend: 'Proxmox.window.Edit',
+    alias: 'widget.pveDcK8sAddonOptionsWindow',
+
+    isCreate: true,
+    method: 'POST',
+    showTaskViewer: true,
+    submitText: gettext('Enable'),
+    width: 560,
+    clusterName: undefined,
+    addon: undefined,
+    options: [],
+
+    initComponent: function() {
+        let me = this;
+        me.url = '/cluster/k8s/' + encodeURIComponent(me.clusterName)
+            + '/addons/' + me.addon + '/enable';
+        me.title = Ext.String.format(gettext('Enable {0}'), me.addon);
+        let items = (me.options || []).map(function(o) {
+            let f = {
+                name: o.name,
+                fieldLabel: Ext.htmlEncode(o.name),
+                allowBlank: !o.required,
+                value: o['default'],
+            };
+            if (o.type === 'bool') {
+                Ext.apply(f, { xtype: 'proxmoxcheckbox', uncheckedValue: 0,
+                    inputValue: 1, value: o['default'] ? 1 : 0 });
+            } else if (o.type === 'int') {
+                Ext.apply(f, { xtype: 'proxmoxintegerfield', minValue: o.min,
+                    maxValue: o.max });
+            } else if (o.type === 'enum') {
+                Ext.apply(f, { xtype: 'proxmoxKVComboBox',
+                    comboItems: o.values.map(v => [v, v]) });
+            } else {
+                Ext.apply(f, { xtype: 'textfield',
+                    inputType: o.secret ? 'password' : 'text' });
+            }
+            if (o.description) {
+                f.autoEl = { tag: 'div', 'data-qtip': o.description };
+                f.emptyText = o.type === 'string' ? o.description : undefined;
+            }
+            return f;
+        });
+        items.push({ xtype: 'displayfield', userCls: 'pmx-hint',
+            value: gettext('Secret settings are written into the cluster '
+                + 'only, never stored in Proxmox VE.') });
+        Ext.apply(me, { items: [{ xtype: 'inputpanel',
+            onGetValues: function(values) {
+                let config = {};
+                Ext.Object.each(values, function(k, v) {
+                    if (v !== '' && v !== null && v !== undefined) { config[k] = v; }
+                });
+                return { config: Ext.encode(config) };
+            },
+            items: items }] });
+        me.callParent();
+    },
+});
+
 Ext.define('PVE.dc.K8sAddonWindow', {
     extend: 'Proxmox.window.Edit',
     alias: 'widget.pveDcK8sAddonWindow',
@@ -2470,7 +2534,8 @@ Ext.define('PVE.dc.K8sView', {
             // version this pve-k8s release pins.
             let store = Ext.create('Ext.data.Store', {
                 fields: ['name', 'title', 'tier', 'status', 'installed',
-                    'pinned', 'update', 'via', 'configurable', 'detail'],
+                    'pinned', 'update', 'via', 'configurable', 'detail',
+                    'options', 'removable'],
                 proxy: {
                     type: 'proxmox',
                     url: '/api2/json/cluster/k8s/' + name + '/addons',
@@ -2496,6 +2561,19 @@ Ext.define('PVE.dc.K8sView', {
                     let addon = rec.data.name;
                     // add-ons that need answers get their own window
                     // (a dedicated configuration panel can replace it)
+                    if (rec.data.configurable && addon !== 'cert-manager'
+                        && addon !== 'external-dns') {
+                        Ext.create('PVE.dc.K8sAddonOptionsWindow', {
+                            autoShow: true,
+                            clusterName: name,
+                            addon: addon,
+                            options: rec.data.options,
+                            apiCallDone: function(ok) {
+                                if (ok) { reload(); }
+                            },
+                        });
+                        return;
+                    }
                     if (rec.data.configurable) {
                         Ext.create('PVE.dc.K8sAddonWindow', {
                             autoShow: true,
@@ -2523,12 +2601,16 @@ Ext.define('PVE.dc.K8sView', {
                 // default add-ons can be turned off (provision then
                 // leaves them off); core ones cannot
                 enableFn: function(rec) {
-                    return rec.data.tier === 'default'
-                        && rec.data.status === 'installed';
+                    return rec.data.status === 'installed'
+                        && (rec.data.tier === 'default' || !!rec.data.removable);
                 },
                 confirmMsg: function(rec) {
-                    return Ext.String.format(gettext('Disable {0}?'),
-                        Ext.htmlEncode(rec.data.name));
+                    return rec.data.tier === 'default'
+                        ? Ext.String.format(gettext('Disable {0}?'),
+                            Ext.htmlEncode(rec.data.name))
+                        : Ext.String.format(gettext('Remove {0}? Its data '
+                            + 'volumes and backups are kept.'),
+                            Ext.htmlEncode(rec.data.name));
                 },
                 handler: function(btn, event, rec) {
                     api({
@@ -2713,7 +2795,97 @@ Ext.define('PVE.dc.K8sView', {
                         },
                     },
                 ], bsm);
-            return g;
+            // application backups (Velero add-on)
+            let vsm = Ext.create('Ext.selection.RowModel', {});
+            let vg = Ext.create('Ext.grid.Panel', {
+                title: gettext('Applications (Velero)'),
+                border: false,
+                selModel: vsm,
+                emptyText: gettext('No application backups. Enable the velero '
+                    + 'add-on to back up namespaces and volumes to S3.'),
+                store: Ext.create('Ext.data.Store', {
+                    fields: ['name', 'phase', 'reason', 'created', 'completed',
+                        'expires', 'errors', 'warnings', 'items'],
+                    proxy: { type: 'proxmox',
+                        url: '/api2/json/cluster/k8s/' + name + '/app-backups' },
+                    autoLoad: true,
+                }),
+                tbar: [
+                    {
+                        text: gettext('Backup Now'),
+                        iconCls: 'fa fa-fw fa-save',
+                        handler: function() {
+                            api({
+                                url: '/cluster/k8s/' + name + '/app-backups',
+                                method: 'POST',
+                                success: function(r) {
+                                    task(r.result.data); vg.getStore().load();
+                                },
+                            });
+                        },
+                    },
+                    {
+                        xtype: 'proxmoxButton',
+                        text: gettext('Restore'),
+                        iconCls: 'fa fa-fw fa-undo',
+                        disabled: true,
+                        selModel: vsm,
+                        enableFn: function(rec) {
+                            return /^(Completed|PartiallyFailed)$/.test(rec.data.phase);
+                        },
+                        confirmMsg: function(rec) {
+                            return Ext.String.format(gettext('Restore {0}? Objects '
+                                + 'that are missing are re-created; existing ones '
+                                + 'are left as they are.'), Ext.htmlEncode(rec.data.name));
+                        },
+                        handler: function(btn, event, rec) {
+                            api({
+                                url: '/cluster/k8s/' + name + '/app-backups/'
+                                    + encodeURIComponent(rec.data.name) + '/restore',
+                                method: 'POST',
+                                success: function(r) { task(r.result.data); },
+                            });
+                        },
+                    },
+                    '->',
+                    {
+                        text: gettext('Reload'),
+                        iconCls: 'fa fa-fw fa-refresh',
+                        k8sReadOnly: true,
+                        handler: function() { vg.getStore().load(); },
+                    },
+                ],
+                columns: [
+                    { text: gettext('Backup'), dataIndex: 'name', flex: 1 },
+                    { text: gettext('Reason'), dataIndex: 'reason', width: 110 },
+                    { text: gettext('Status'), dataIndex: 'phase', width: 130 },
+                    { text: gettext('Created'), dataIndex: 'created', width: 170 },
+                    { text: gettext('Items'), dataIndex: 'items', width: 80 },
+                    {
+                        text: gettext('Errors/Warnings'), width: 130,
+                        renderer: function(v, m, rec) {
+                            return rec.data.errors + ' / ' + rec.data.warnings;
+                        },
+                    },
+                    { text: gettext('Expires'), dataIndex: 'expires', width: 170 },
+                ],
+            });
+            return Ext.create('Ext.panel.Panel', {
+                header: false,
+                border: false,
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [
+                    {
+                        xtype: 'panel',
+                        title: gettext('Control plane (etcd)'),
+                        border: false,
+                        layout: 'fit',
+                        flex: 1,
+                        items: [g],
+                    },
+                    Ext.apply(vg, { flex: 1 }),
+                ],
+            });
         };
 
         // Who holds kubeconfigs (EKS "access entries"): one service

@@ -809,6 +809,326 @@ helm uninstall descheduler -n kube-system --ignore-not-found
 EOF
 }
 
+# --- opt-in add-ons (step 3) ----------------------------------
+# Each takes its settings as %o (validated against the catalog
+# entry's options); 'secret' options arrive only at enable time and
+# are written into an in-cluster Secret, so an update (stored
+# settings, no secrets) keeps that Secret.
+
+my sub yq1 {
+    my ($v) = @_;
+
+    $v //= '';
+    $v =~ s/(["\\])/\\$1/g;
+    return "\"$v\"";
+}
+
+# Observability: VictoriaMetrics k8s stack (operator, vmagent,
+# metrics store, vmalert, Alertmanager, Grafana, node-exporter,
+# kube-state-metrics) plus VictoriaLogs with its collector and,
+# as a preview, VictoriaTraces. HA: metrics as a cluster with
+# replication factor 2; logs on 2 storage nodes (available, not
+# replicated); traces stay single.
+our $OBS_CHART_VERSION = '0.98.1';
+our $OBS_VERSION = '1.156.0';
+
+sub observability_values_yaml {
+    my (%o) = @_;
+
+    my $days = ($o{retention} // 14) . 'd';
+    my $size = ($o{'storage-size'} // 20) . 'Gi';
+    my $ha = $o{ha} ? 1 : 0;
+    my $logs = $o{logs} // 1;
+    my $traces = $o{traces} // 0;
+    my $metrics = $ha ? <<EOF : <<EOF;
+vmsingle:
+  enabled: false
+vmcluster:
+  enabled: true
+  spec:
+    retentionPeriod: "$days"
+    replicationFactor: 2
+    vmstorage:
+      replicaCount: 2
+      storage:
+        volumeClaimTemplate:
+          spec:
+            resources:
+              requests:
+                storage: $size
+    vmselect:
+      replicaCount: 2
+    vminsert:
+      replicaCount: 2
+EOF
+vmsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "$days"
+    storage:
+      resources:
+        requests:
+          storage: $size
+EOF
+    my $lg = !$logs ? '' : $ha ? <<EOF : <<EOF;
+vlcluster:
+  enabled: true
+  spec:
+    vlstorage:
+      replicaCount: 2
+      retentionPeriod: "$days"
+    vlselect:
+      replicaCount: 2
+    vlinsert:
+      replicaCount: 2
+vlagent:
+  enabled: true
+EOF
+vlsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "$days"
+vlagent:
+  enabled: true
+EOF
+    my $tr = !$traces ? '' : <<EOF;
+vtsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "$days"
+EOF
+    # kubeadm binds scheduler, controller-manager and etcd metrics
+    # to localhost, and Cilium replaces kube-proxy: no targets
+    return <<EOF . $metrics . $lg . $tr;
+fullnameOverride: vm
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+grafana:
+  enabled: true
+EOF
+}
+
+sub observability_install_cmd {
+    my ($kubeconfig, $minor, $o) = @_;
+
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig,
+%s
+export KUBECONFIG=%s
+cat > /root/observability-values.yaml <<'VALUES'
+%sVALUES
+helm repo add vm https://victoriametrics.github.io/helm-charts/ >/dev/null 2>&1 || true
+helm repo update vm >/dev/null
+helm upgrade -i observability vm/victoria-metrics-k8s-stack --version %s \
+    -n observability --create-namespace -f /root/observability-values.yaml
+kubectl -n observability rollout status deploy/observability-grafana --timeout=600s || true
+EOF
+        observability_values_yaml(%{ $o // {} }), $OBS_CHART_VERSION);
+}
+
+sub observability_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    # the volumes (metrics, logs, traces) are kept: delete the
+    # namespace to drop the data too
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig);
+%s
+export KUBECONFIG=%s
+helm uninstall observability -n observability --ignore-not-found
+EOF
+}
+
+# Velero: application backups to S3 (Ceph RGW, pve-s3, any S3),
+# CSI snapshots moved to the bucket by the data mover (Kopia).
+our $VELERO_CHART_VERSION = '12.2.5';
+our $VELERO_VERSION = '1.18.2';
+our $VELERO_AWS_PLUGIN = '1.14.4';
+
+sub velero_values_yaml {
+    my (%o) = @_;
+
+    my $prefix = defined $o{prefix} && $o{prefix} ne ''
+        ? "\n    prefix: " . yq1($o{prefix}) : '';
+    return <<EOF;
+initContainers:
+- name: velero-plugin-for-aws
+  image: velero/velero-plugin-for-aws:v$VELERO_AWS_PLUGIN
+  volumeMounts:
+  - {mountPath: /target, name: plugins}
+credentials:
+  useSecret: true
+  existingSecret: velero-s3
+deployNodeAgent: true
+snapshotsEnabled: false
+configuration:
+  features: EnableCSI
+  defaultSnapshotMoveData: true
+  backupStorageLocation:
+  - name: default
+    provider: aws
+    default: true
+    bucket: @{[ yq1($o{bucket}) ]}$prefix
+    config:
+      region: @{[ yq1($o{region} // 'default') ]}
+      s3ForcePathStyle: "true"
+      s3Url: @{[ yq1($o{'s3-url'}) ]}
+      checksumAlgorithm: ""
+EOF
+}
+
+sub velero_install_cmd {
+    my ($kubeconfig, $minor, $o) = @_;
+
+    my %o = %{ $o // {} };
+    die "velero needs s3-url and bucket\n" if !$o{'s3-url'} || !$o{bucket};
+    die "s3-url must be an http(s) URL\n" if $o{'s3-url'} !~ m{^https?://[^\s'"]+$};
+    my $secret = '';
+    if (defined $o{'access-key'} || defined $o{'secret-key'}) {
+        for my $k (qw(access-key secret-key)) {
+            ($o{$k} // '') =~ m{^[A-Za-z0-9/+=._-]{1,200}$}
+                or die "invalid $k characters\n";
+        }
+        $secret = "kubectl -n velero create secret generic velero-s3 "
+            . "--from-literal=cloud=\"\$(printf '[default]\\naws_access_key_id=%s\\n"
+            . "aws_secret_access_key=%s\\n' '$o{'access-key'}' '$o{'secret-key'}')\" "
+            . "--dry-run=client -o yaml | kubectl apply -f -\n";
+    }
+    # a snapshot class Velero picks for Proxmox CSI volumes
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $secret,
+%s
+export KUBECONFIG=%s
+kubectl create namespace velero --dry-run=client -o yaml | kubectl apply -f -
+%skubectl apply -f - <<'VSC'
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: proxmox-velero
+  labels: {velero.io/csi-volumesnapshot-class: "true"}
+driver: csi.proxmox.sinextra.dev
+deletionPolicy: Delete
+VSC
+cat > /root/velero-values.yaml <<'VALUES'
+%sVALUES
+helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts >/dev/null 2>&1 || true
+helm repo update vmware-tanzu >/dev/null
+helm upgrade -i velero vmware-tanzu/velero --version %s -n velero \
+    -f /root/velero-values.yaml
+kubectl -n velero rollout status deploy/velero --timeout=600s
+EOF
+        velero_values_yaml(%o), $VELERO_CHART_VERSION);
+}
+
+sub velero_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    # backups stay in the bucket
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig);
+%s
+export KUBECONFIG=%s
+helm uninstall velero -n velero --ignore-not-found
+EOF
+}
+
+# Flux (GitOps controllers; point them at a repository yourself)
+# and, optionally, Flagger for progressive delivery through the
+# Gateway API (weights on the Cilium HTTPRoute).
+our $FLUX_VERSION = '2.10.0';
+our $FLAGGER_VERSION = '1.45.0';
+
+sub flux_install_cmd {
+    my ($kubeconfig, $minor, $o) = @_;
+
+    my $flagger = '';
+    if (($o // {})->{flagger}) {
+        my $metrics = ($o // {})->{'metrics-url'} // 'http://vmsingle-vm.observability.svc:8428';
+        $metrics =~ m{^https?://[A-Za-z0-9.:/_-]+$} or die "invalid metrics-url\n";
+        $flagger = <<"EOF";
+helm repo add flagger https://flagger.app >/dev/null 2>&1 || true
+helm repo update flagger >/dev/null
+helm upgrade -i flagger flagger/flagger --version $FLAGGER_VERSION \\
+    -n flagger-system --create-namespace \\
+    --set meshProvider=gatewayapi:v1 --set metricsServer=$metrics
+EOF
+    }
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $FLUX_VERSION, $FLUX_VERSION, $flagger);
+%s
+export KUBECONFIG=%s
+kubectl apply --server-side --force-conflicts \
+    -f https://github.com/fluxcd/flux2/releases/download/v%s/install.yaml
+kubectl -n flux-system rollout status deploy/source-controller --timeout=600s
+# Flux images carry controller versions: record the release
+kubectl -n flux-system annotate deploy source-controller \
+    pve-k8s.proxmox.com/version=%s --overwrite
+%s
+EOF
+}
+
+sub flux_delete_cmd {
+    my ($kubeconfig) = @_;
+
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $FLUX_VERSION);
+%s
+export KUBECONFIG=%s
+helm uninstall flagger -n flagger-system --ignore-not-found
+kubectl delete -f https://github.com/fluxcd/flux2/releases/download/v%s/install.yaml \
+    --ignore-not-found
+EOF
+}
+
+# One Helm chart, no settings beyond a few --set: Headlamp, Tetragon,
+# KEDA, Kyverno.
+our %SIMPLE_CHARTS = (
+    headlamp => { repo => 'https://kubernetes-sigs.github.io/headlamp/',
+        chart => 'headlamp', version => '0.46.0', ns => 'headlamp' },
+    tetragon => { repo => 'https://helm.cilium.io', alias => 'cilium',
+        chart => 'tetragon', version => '1.8.0', ns => 'kube-system' },
+    keda => { repo => 'https://kedacore.github.io/charts',
+        chart => 'keda', version => '2.21.0', ns => 'keda' },
+    kyverno => { repo => 'https://kyverno.github.io/kyverno/',
+        chart => 'kyverno', version => '3.10.0', app => '1.20.0', ns => 'kyverno' },
+);
+
+sub chart_install_cmd {
+    my ($addon, $kubeconfig, $o) = @_;
+
+    my $c = $SIMPLE_CHARTS{$addon} or die "no chart for $addon\n";
+    my $alias = $c->{alias} // $addon;
+    my @set;
+    if ($addon eq 'kyverno') {
+        # one replica each on a small cluster; 3 admission
+        # controllers with ha (the webhook must answer)
+        my $n = ($o // {})->{ha} ? 3 : 1;
+        push @set, "admissionController.replicas=$n",
+            map { "$_.replicas=1" }
+                qw(backgroundController cleanupController reportsController);
+    }
+    my $sets = join '', map { " \\\n    --set $_" } @set;
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $alias, $c->{repo},
+%s
+export KUBECONFIG=%s
+helm repo add %s %s >/dev/null 2>&1 || true
+helm repo update %s >/dev/null
+helm upgrade -i %s %s/%s --version %s -n %s --create-namespace%s
+EOF
+        $alias, $addon, $alias, $c->{chart}, $c->{version}, $c->{ns}, $sets);
+}
+
+sub chart_delete_cmd {
+    my ($addon, $kubeconfig) = @_;
+
+    my $c = $SIMPLE_CHARTS{$addon} or die "no chart for $addon\n";
+    return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $addon, $c->{ns});
+%s
+export KUBECONFIG=%s
+helm uninstall %s -n %s --ignore-not-found
+EOF
+}
+
 # --- Add-on manager catalog ----------------------------------
 # One entry per add-on pve-k8s manages. The manager (list,
 # update, upgrade step) is driven by this table only:
@@ -898,7 +1218,122 @@ our @CATALOG = (
           { name => 'pdns-api-key', type => 'string', required => 1, secret => 1 },
           { name => 'zone', type => 'string', required => 1 },
       ] },
+    { name => 'observability', tier => 'optional',
+      title => 'Metrics, logs and traces (VictoriaMetrics, VictoriaLogs, '
+          . 'VictoriaTraces preview) with Grafana',
+      version => sub { $OBS_VERSION },
+      probe => { kind => 'deployment', ns => 'observability',
+          name => 'vmagent-vm', image => 'vmagent' },
+      install => \&observability_install_cmd, delete => \&observability_delete_cmd,
+      options => [
+          { name => 'retention', type => 'int', default => 14, min => 1, max => 3650,
+            description => 'days to keep metrics, logs and traces' },
+          { name => 'storage-size', type => 'int', default => 20, min => 5, max => 4096,
+            description => 'GiB per metrics volume' },
+          { name => 'logs', type => 'bool', default => 1 },
+          { name => 'traces', type => 'bool', default => 0,
+            description => 'VictoriaTraces (preview, pre-1.0)' },
+          { name => 'ha', type => 'bool', default => 0,
+            description => 'metrics replicated twice, logs on 2 nodes (3+ workers)' },
+      ] },
+    { name => 'velero', tier => 'optional',
+      title => 'Application backups to S3 (volume snapshots moved to the bucket)',
+      version => sub { $VELERO_VERSION },
+      probe => { kind => 'deployment', ns => 'velero', name => 'velero' },
+      install => \&velero_install_cmd, delete => \&velero_delete_cmd,
+      options => [
+          { name => 's3-url', type => 'string', required => 1,
+            description => 'S3 endpoint, e.g. https://s3.example.com' },
+          { name => 'bucket', type => 'string', required => 1 },
+          { name => 'region', type => 'string', default => 'default' },
+          { name => 'prefix', type => 'string' },
+          { name => 'access-key', type => 'string', required => 1, secret => 1 },
+          { name => 'secret-key', type => 'string', required => 1, secret => 1 },
+      ] },
+    { name => 'flux', tier => 'optional',
+      title => 'GitOps controllers (Flux), optional progressive delivery (Flagger)',
+      version => sub { $FLUX_VERSION },
+      probe => { kind => 'deployment', ns => 'flux-system', name => 'source-controller',
+          annotation => 'pve-k8s.proxmox.com/version' },
+      install => \&flux_install_cmd, delete => \&flux_delete_cmd,
+      options => [
+          { name => 'flagger', type => 'bool', default => 0,
+            description => 'canary releases through the Gateway API' },
+          { name => 'metrics-url', type => 'string',
+            description => 'Prometheus-compatible URL for Flagger analysis '
+                . '(default: the observability add-on)' },
+      ] },
+    { name => 'headlamp', tier => 'optional',
+      title => 'In-cluster web UI (kubectl port-forward -n headlamp svc/headlamp 8080:80)',
+      version => sub { $SIMPLE_CHARTS{headlamp}{version} },
+      probe => { kind => 'deployment', ns => 'headlamp', name => 'headlamp' },
+      install => sub { chart_install_cmd('headlamp', $_[0], $_[2]) },
+      delete => sub { chart_delete_cmd('headlamp', $_[0]) } },
+    { name => 'tetragon', tier => 'optional',
+      title => 'Runtime security observability and enforcement (eBPF)',
+      version => sub { $SIMPLE_CHARTS{tetragon}{version} },
+      probe => { kind => 'daemonset', ns => 'kube-system', name => 'tetragon' },
+      install => sub { chart_install_cmd('tetragon', $_[0], $_[2]) },
+      delete => sub { chart_delete_cmd('tetragon', $_[0]) } },
+    { name => 'keda', tier => 'optional',
+      title => 'Event-driven pod autoscaling (queues, streams, schedules)',
+      version => sub { $SIMPLE_CHARTS{keda}{version} },
+      probe => { kind => 'deployment', ns => 'keda', name => 'keda-operator', image => 'keda' },
+      install => sub { chart_install_cmd('keda', $_[0], $_[2]) },
+      delete => sub { chart_delete_cmd('keda', $_[0]) } },
+    { name => 'kyverno', tier => 'optional',
+      title => 'Policy engine (validate, mutate, generate, verify images)',
+      version => sub { $SIMPLE_CHARTS{kyverno}{app} },
+      probe => { kind => 'deployment', ns => 'kyverno',
+          name => 'kyverno-admission-controller', image => 'kyverno' },
+      install => sub { chart_install_cmd('kyverno', $_[0], $_[2]) },
+      delete => sub { chart_delete_cmd('kyverno', $_[0]) },
+      options => [
+          { name => 'ha', type => 'bool', default => 0,
+            description => '3 admission controllers instead of 1' },
+      ] },
 );
+
+# Pure: check settings against a catalog entry's options. Returns
+# (all settings with defaults, the ones to store: no secrets).
+# Unknown keys, missing required ones and bad values die.
+sub addon_options {
+    my ($e, $in) = @_;
+
+    my %spec = map { $_->{name} => $_ } (($e // {})->{options} // [])->@*;
+    for my $k (sort keys %{ $in // {} }) {
+        die "add-on '$e->{name}' has no setting '$k'\n" if !$spec{$k};
+    }
+    my (%all, %store);
+    for my $o ((($e // {})->{options} // [])->@*) {
+        my $v = ($in // {})->{$o->{name}};
+        $v = $o->{default} if !defined $v || $v eq '';
+        if (!defined $v || $v eq '') {
+            die "add-on '$e->{name}' needs '$o->{name}'\n" if $o->{required};
+            next;
+        }
+        my $t = $o->{type} // 'string';
+        if ($t eq 'bool') {
+            $v =~ /^(?:0|1|true|false)$/ or die "'$o->{name}' must be 0 or 1\n";
+            $v = $v =~ /^(?:1|true)$/ ? 1 : 0;
+        } elsif ($t eq 'int') {
+            $v =~ /^\d+$/ or die "'$o->{name}' must be a whole number\n";
+            die "'$o->{name}' must be between $o->{min} and $o->{max}\n"
+                if (defined $o->{min} && $v < $o->{min})
+                    || (defined $o->{max} && $v > $o->{max});
+            $v += 0;
+        } elsif ($t eq 'enum') {
+            die "'$o->{name}' must be one of " . join(', ', $o->{values}->@*) . "\n"
+                if !grep { $_ eq $v } $o->{values}->@*;
+        } else {
+            die "'$o->{name}' is too long or has control characters\n"
+                if length($v) > 512 || $v =~ /[\x00-\x1f]/;
+        }
+        $all{$o->{name}} = $v;
+        $store{$o->{name}} = $v if !$o->{secret};
+    }
+    return (\%all, \%store);
+}
 
 # Update order: what others depend on first.
 sub catalog { return @CATALOG }
@@ -953,7 +1388,7 @@ sub probe_versions {
         my $p = ref $e->{probe} eq 'CODE' ? $e->{probe}->($backend) : $e->{probe};
         my $o = $idx{$p->{kind}}{($p->{ns} // '') . '/' . $p->{name}} or next;
         my $ver;
-        if ($p->{kind} eq 'crd') {
+        if ($p->{annotation}) {
             ($ver) = ((($o->{metadata} // {})->{annotations} // {})
                 ->{$p->{annotation}} // '') =~ /^v?(\d+\.\d+\.\d+)/;
         } else {
@@ -1007,6 +1442,8 @@ sub addon_rows {
             (defined $installed ? (installed => $installed) : ()),
             update => $update,
             configurable => $e->{options} ? 1 : 0,
+            ($e->{options} ? (options => $e->{options}) : ()),
+            removable => $e->{delete} ? 1 : 0,
             ($rec && !$rec->{disabled} ? (config => $rec) : ()),
         };
     }

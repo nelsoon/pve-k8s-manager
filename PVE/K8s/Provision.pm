@@ -3730,6 +3730,12 @@ sub kubectl_api_plan {
     return $get->('/apis/apps/v1/deployments') if $args eq 'get deployments -A -o json';
     return $get->('/apis/apps/v1/daemonsets') if $args eq 'get daemonsets -A -o json';
     return $get->('/apis/batch/v1/cronjobs') if $args eq 'get cronjobs -A -o json';
+    return $get->('/apis/velero.io/v1/namespaces/velero/backups')
+        if $args eq '-n velero get backups.velero.io -o json';
+    return $get->("/apis/velero.io/v1/namespaces/velero/backups/$1")
+        if $args =~ /^-n velero get backups\.velero\.io ($DNS) -o json$/;
+    return $get->("/apis/velero.io/v1/namespaces/velero/restores/$1")
+        if $args =~ /^-n velero get restores\.velero\.io ($DNS) -o json$/;
     return $get->("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/$1")
         if $args =~ /^get crd ($DNS) -o json$/;
     return $get->("/apis/apps/v1/namespaces/$1/daemonsets/$2")
@@ -7393,6 +7399,11 @@ sub update_addon {
         die "$addon is turned off on '$name'\n"
             if $rec && $rec->{disabled};
         guest_exec($cp->{vmid}, $cmds->[0]->());
+    } elsif ($e->{install}) {
+        die "$addon is not enabled on '$name'\n" if !$rec;
+        my ($all) = PVE::K8s::Addons::addon_options($e,
+            { map { $_ => $rec->{$_} } grep { $_ ne 'version' } keys %$rec });
+        guest_exec($cp->{vmid}, $e->{install}->($kc, $minor, $all, $scfg));
     } elsif ($addon eq 'cert-manager') {
         die "cert-manager is not enabled on '$name'\n" if !$rec;
         guest_exec($cp->{vmid}, PVE::K8s::Addons::certmanager_install_cmd(
@@ -7524,6 +7535,18 @@ sub enable_addon {
             $scfg->{'k8s-version'})) {
         guest_exec($cp->{vmid}, $cmds->[0]->());
         print "$addon enabled on cluster '$name'\n";
+    } elsif (my $e = PVE::K8s::Addons::catalog_entry($addon)) {
+        die "add-on '$addon' cannot be enabled\n" if !$e->{install};
+        my ($all, $store) = PVE::K8s::Addons::addon_options($e, $opts);
+        if ($all->{ha}) {
+            my $workers = grep { $_->{role} eq 'worker' } $nodes->@*;
+            die "$addon in HA mode needs at least 3 workers ($workers now)\n"
+                if $workers < 3;
+        }
+        guest_exec($cp->{vmid}, $e->{install}->($kubeconfig,
+            $scfg->{'k8s-version'}, $all, $scfg));
+        %record = %$store;
+        print "$addon enabled on cluster '$name'\n";
     } else {
         die "add-on '$addon' cannot be enabled\n";
     }
@@ -7549,14 +7572,28 @@ sub disable_addon {
         or die "cluster '$name' does not exist\n";
     die "cluster '$name' is not ready\n"
         if ($scfg->{state} // '') ne 'ready';
-    my $cmds = simple_addon_cmds($addon, '/etc/kubernetes/admin.conf',
-        $scfg->{'k8s-version'});
-    die "add-on '$addon' cannot be disabled (only default add-ons)\n"
-        if !$cmds;
+    my $kc = '/etc/kubernetes/admin.conf';
+    my $cmds = simple_addon_cmds($addon, $kc, $scfg->{'k8s-version'});
+    my $e = PVE::K8s::Addons::catalog_entry($addon);
+    my $remove = !$cmds && $e && $e->{delete};
+    die "add-on '$addon' cannot be disabled\n" if !$cmds && !$remove;
 
     my $nodes = load_nodes($name, $scfg);
     my $cp = ops_cp($nodes);
-    guest_exec($cp->{vmid}, $cmds->[1]->());
+    guest_exec($cp->{vmid}, $cmds ? $cmds->[1]->() : $e->{delete}->($kc));
+    if ($remove) {
+        # an opt-in add-on: removed, back to available
+        PVE::K8s::Config::lock_config(sub {
+            my $locked = PVE::K8s::Config->config();
+            my $state = addons_state($locked->{ids}->{$name});
+            delete $state->{$addon};
+            $locked->{ids}->{$name}->{addons} =
+                JSON::PP->new->canonical->encode($state);
+            PVE::K8s::Config::store_config($locked);
+        });
+        print "$addon removed from cluster '$name'\n";
+        return 1;
+    }
     PVE::K8s::Config::lock_config(sub {
         my $locked = PVE::K8s::Config->config();
         my $state = addons_state($locked->{ids}->{$name});
@@ -7571,6 +7608,138 @@ sub disable_addon {
     });
     print "$addon disabled on cluster '$name'\n";
     return 1;
+}
+
+# --- application backups (Velero add-on) -----------------------
+
+sub velero_enabled {
+    my ($scfg) = @_;
+
+    my $r = addons_state($scfg)->{velero};
+    return $r && !$r->{disabled} ? 1 : 0;
+}
+
+# Pure: Velero Backup objects as rows, newest first.
+sub app_backup_rows {
+    my ($list) = @_;
+
+    my @rows = map {
+        my $st = $_->{status} // {};
+        {
+            name => $_->{metadata}{name},
+            phase => $st->{phase} // 'New',
+            reason => ($_->{metadata}{labels} // {})->{'pve-k8s.proxmox.com/reason'} // '',
+            created => $_->{metadata}{creationTimestamp} // '',
+            completed => $st->{completionTimestamp} // '',
+            expires => $st->{expiration} // '',
+            errors => $st->{errors} // 0,
+            warnings => $st->{warnings} // 0,
+            items => ($st->{progress} // {})->{itemsBackedUp} // 0,
+        }
+    } ((($list // {})->{items}) // [])->@*;
+    return [ sort { $b->{created} cmp $a->{created} } @rows ];
+}
+
+sub list_app_backups {
+    my ($name) = @_;
+
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    return [] if !velero_enabled($scfg);
+    my $cp = ops_cp(load_nodes($name, $scfg));
+    return app_backup_rows(kubectl_json($cp, '-n velero get backups.velero.io'));
+}
+
+# Pure: a Velero object name (DNS label) from parts and a time.
+sub velero_name {
+    my ($prefix, $now) = @_;
+
+    (my $n = lc "$prefix-$now") =~ s/[^a-z0-9-]+/-/g;
+    $n =~ s/-+/-/g;
+    return substr($n, 0, 63) =~ s/-+$//r;
+}
+
+# Pure: the Backup object pve-k8s creates (every namespace, volume
+# data moved to the bucket, kept 30 days).
+sub app_backup_object {
+    my ($bname, $reason) = @_;
+
+    return {
+        apiVersion => 'velero.io/v1', kind => 'Backup',
+        metadata => { name => $bname, namespace => 'velero',
+            labels => { 'pve-k8s.proxmox.com/reason' => $reason } },
+        spec => { includedNamespaces => ['*'], snapshotMoveData => JSON::PP::true(),
+            storageLocation => 'default', ttl => '720h0m0s' },
+    };
+}
+
+my sub velero_create {
+    my ($cp, $obj) = @_;
+
+    my $json = JSON::PP->new->canonical->encode($obj);
+    guest_exec($cp->{vmid}, "kubectl --kubeconfig /etc/kubernetes/admin.conf "
+        . "create -f - <<'VELERO'\n$json\nVELERO\n");
+}
+
+my sub velero_wait {
+    my ($cp, $kind, $oname, $timeout) = @_;
+
+    my $phase = '';
+    for (1 .. int(($timeout // 1800) / 10)) {
+        my $o = eval { kubectl_json($cp, "-n velero get $kind.velero.io $oname") } // {};
+        $phase = ($o->{status} // {})->{phase} // '';
+        return $o if $phase =~ /^(?:Completed|PartiallyFailed|Failed|FailedValidation)$/;
+        sleep 10;
+    }
+    die "Velero $kind $oname did not finish (phase '$phase')\n";
+}
+
+# Back up every namespace now. With wait, returns when Velero is done
+# and dies when the backup failed.
+sub app_backup {
+    my ($name, %o) = @_;
+
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "the velero add-on is not enabled on '$name'\n" if !velero_enabled($scfg);
+    my $cp = ops_cp(load_nodes($name, $scfg));
+    my $reason = $o{reason} // 'manual';
+    my $bname = velero_name($o{prefix} // "pve-k8s-$reason", time());
+    velero_create($cp, app_backup_object($bname, $reason));
+    print "Velero backup $bname started\n";
+    return $bname if !$o{wait};
+    my $b = velero_wait($cp, 'backups', $bname, $o{timeout});
+    my $st = $b->{status} // {};
+    die "Velero backup $bname $st->{phase}"
+        . (($st->{failureReason} // '') ne '' ? ": $st->{failureReason}" : '') . "\n"
+        if $st->{phase} =~ /^Failed/;
+    print "Velero backup $bname $st->{phase}: "
+        . (($st->{progress} // {})->{itemsBackedUp} // 0) . " items, "
+        . ($st->{errors} // 0) . " errors, " . ($st->{warnings} // 0) . " warnings\n";
+    return $bname;
+}
+
+# Restore a Velero backup into the cluster. Existing objects are
+# left as they are (Velero's default): it re-creates what is missing.
+sub app_restore {
+    my ($name, $backup) = @_;
+
+    $backup =~ /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/ or die "invalid backup name\n";
+    my $scfg = PVE::K8s::Config->config()->{ids}->{$name}
+        or die "cluster '$name' does not exist\n";
+    die "the velero add-on is not enabled on '$name'\n" if !velero_enabled($scfg);
+    my $cp = ops_cp(load_nodes($name, $scfg));
+    my $rname = velero_name("restore-$backup", time());
+    velero_create($cp, { apiVersion => 'velero.io/v1', kind => 'Restore',
+        metadata => { name => $rname, namespace => 'velero' },
+        spec => { backupName => $backup } });
+    print "Velero restore $rname of $backup started\n";
+    my $r = velero_wait($cp, 'restores', $rname, 3600);
+    my $st = $r->{status} // {};
+    die "Velero restore $rname $st->{phase}\n" if $st->{phase} =~ /^Failed/;
+    print "Velero restore $rname $st->{phase}: " . ($st->{errors} // 0)
+        . " errors, " . ($st->{warnings} // 0) . " warnings\n";
+    return $rname;
 }
 
 sub list_backups {
@@ -8701,6 +8870,10 @@ sub upgrade_cluster {
     die "no template k8s-node-$to-r* found on any host; "
         . "build one first (images/)\n"
         if !defined $upgrade_tpl;
+    # With the Velero add-on, back every namespace up first; a failed
+    # backup stops the upgrade before anything changed.
+    app_backup($name, reason => 'pre-upgrade', prefix => "pre-upgrade-$to",
+        wait => 1) if velero_enabled($scfg);
     # Add-ons first, at their pins for the target minor: the target
     # may need newer ones (1.37 needs Cilium 1.21), which still run
     # on the current minor. A core add-on failure stops here, before
@@ -9078,6 +9251,9 @@ sub upgrade_check {
     } else {
         $add->('etcd-backup', 'ok', 'a recent etcd backup exists');
     }
+
+    $add->('app-backup', 'ok', 'a Velero backup of every namespace is '
+        . 'taken before the roll') if velero_enabled($scfg);
 
     my $certs = eval { cert_expiry($name) } // [];
     my $worst = worst_cert_days($certs);

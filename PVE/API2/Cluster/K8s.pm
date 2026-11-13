@@ -5,6 +5,7 @@ package PVE::API2::Cluster::K8s;
 use strict;
 use warnings;
 
+use JSON::PP;
 use PVE::K8s::Addons;
 use PVE::K8s::Config;
 use PVE::K8s::Provision;
@@ -1269,6 +1270,83 @@ __PACKAGE__->register_method({
     }});
 
 __PACKAGE__->register_method({
+    name => 'app_backups',
+    path => '{name}/app-backups',
+    method => 'GET',
+    description => "List the application backups the Velero add-on holds "
+        . "(empty when it is not enabled).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { name => $cluster_name },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::K8s::Provision::list_app_backups($param->{name});
+    }});
+
+__PACKAGE__->register_method({
+    name => 'app_backup',
+    path => '{name}/app-backups',
+    method => 'POST',
+    protected => 1,
+    description => "Back up every namespace with Velero now (volume data "
+        . "moved to the bucket, kept 30 days).",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { name => $cluster_name },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+        return fork_cluster_worker('k8sappbackup', $param->{name},
+            'app-backup', sub {
+                PVE::K8s::Provision::app_backup($param->{name}, wait => 1);
+            });
+    }});
+
+__PACKAGE__->register_method({
+    name => 'app_restore',
+    path => '{name}/app-backups/{backup}/restore',
+    method => 'POST',
+    protected => 1,
+    description => "Restore a Velero backup: objects that are missing are "
+        . "re-created, existing ones are left as they are.",
+    permissions => {
+        check => ['perm', '/cluster', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            name => $cluster_name,
+            backup => {
+                type => 'string',
+                pattern => '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$',
+                maxLength => 253,
+                description => "The Velero backup.",
+            },
+        },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+        return fork_cluster_worker('k8sapprestore', $param->{name},
+            "app-restore:$param->{backup}", sub {
+                PVE::K8s::Provision::app_restore($param->{name}, $param->{backup});
+            });
+    }});
+
+__PACKAGE__->register_method({
     name => 'restore',
     path => '{name}/restore',
     method => 'POST',
@@ -1401,9 +1479,9 @@ __PACKAGE__->register_method({
             },
             addon => {
                 type => 'string',
-                pattern => '^(cert-manager|external-dns|metrics-server|'
-                    . 'snapshot-controller|node-problem-detector|spegel|descheduler)$',
-                description => "The add-on to enable.",
+                pattern => '^[a-z][a-z0-9-]{1,40}$',
+                description => "The add-on to enable (an optional add-on, or a "
+                    . "default one that was turned off).",
             },
             issuer => {
                 type => 'string',
@@ -1445,6 +1523,14 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "DNS zone (domain filter).",
             },
+            config => {
+                type => 'string',
+                optional => 1,
+                maxLength => 8192,
+                description => "The add-on's settings as a JSON object (see "
+                    . "'options' in the add-on list). Secret settings are only "
+                    . "written into the cluster, never stored in Proxmox VE.",
+            },
         },
     },
     returns => { type => 'string' },
@@ -1452,10 +1538,22 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $addon = $param->{addon};
+        my $e = PVE::K8s::Addons::catalog_entry($addon)
+            or die "unknown add-on '$addon'\n";
+        die "add-on '$addon' is not one you enable\n"
+            if $e->{tier} !~ /^(?:optional|default)$/;
         my %opts = map { $_ => $param->{$_} }
             grep { defined $param->{$_} }
             qw(issuer email acme-server provider
                 pdns-url pdns-api-key zone);
+        if (defined $param->{config}) {
+            my $c = eval { JSON::PP->new->decode($param->{config}) };
+            die "config must be a JSON object\n" if ref $c ne 'HASH';
+            die "config values must be plain values\n" if grep { ref } values %$c;
+            %opts = (%opts, %$c);
+        }
+        # catalog-driven add-ons check their settings before a task starts
+        PVE::K8s::Addons::addon_options($e, \%opts) if $e->{install};
 
         return fork_cluster_worker('k8saddonenable',
             $param->{name}, "addon-enable:$addon", sub {
@@ -1528,7 +1626,8 @@ __PACKAGE__->register_method({
     path => '{name}/addons/{addon}/disable',
     method => 'POST',
     protected => 1,
-    description => "Turn off a default add-on; provision then leaves it off.",
+    description => "Turn off a default add-on (provision then leaves it off) "
+        . "or remove an optional one.",
     permissions => {
         check => ['perm', '/cluster', ['Sys.Modify']],
     },
@@ -1542,9 +1641,9 @@ __PACKAGE__->register_method({
             },
             addon => {
                 type => 'string',
-                pattern => '^(metrics-server|snapshot-controller|'
-                    . 'node-problem-detector|spegel|descheduler)$',
-                description => "The add-on to disable (default add-ons).",
+                pattern => '^[a-z][a-z0-9-]{1,40}$',
+                description => "The add-on to turn off (a default add-on) or "
+                    . "remove (an optional one).",
             },
         },
     },

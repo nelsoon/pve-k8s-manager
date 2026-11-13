@@ -462,7 +462,72 @@ where its running version is read in the cluster.
 | enable with the PowerDNS provider (`pdns`), API URL,
   key and zone; the key is kept only in the in-cluster
   Secret
+
+| observability
+| optional
+| VictoriaMetrics k8s stack: metrics (vmagent, metrics
+  store, vmalert, Alertmanager, node-exporter,
+  kube-state-metrics), logs (VictoriaLogs and its pod log
+  collector, `logs`), traces (VictoriaTraces, `traces`,
+  preview: OTLP in, Jaeger and Tempo-compatible queries)
+  and Grafana with all three as data sources. Settings:
+  `retention` (days), `storage-size` (GiB), `ha`: metrics
+  as a cluster with replication factor 2 and logs on 2
+  storage nodes (available, not replicated; needs 3+
+  workers); traces stay single. Grafana: `kubectl -n
+  observability port-forward svc/observability-grafana
+  3000:80` (admin password in the
+  `observability-grafana` Secret). Removing it keeps the
+  volumes.
+
+| velero
+| optional
+| application backups to any S3 (`s3-url`, `bucket`,
+  `region`, `prefix`; `access-key`/`secret-key` only go
+  into the cluster's `velero-s3` Secret). Volume
+  snapshots of Proxmox CSI volumes are moved to the
+  bucket (data mover, Kopia). See Backups.
+
+| flux
+| optional
+| Flux GitOps controllers (point them at your repository
+  with a `GitRepository`/`Kustomization`). `flagger`:
+  Flagger for canary releases through the Gateway API
+  (weights on the Cilium HTTPRoute), analysed against
+  `metrics-url` (default: the observability add-on).
+
+| headlamp
+| optional
+| in-cluster web UI (`kubectl -n headlamp port-forward
+  svc/headlamp 8080:80`, log in with a kubeconfig token)
+
+| tetragon
+| optional
+| eBPF runtime security observability and enforcement
+
+| keda
+| optional
+| event-driven pod autoscaling (queues, streams,
+  schedules); new pods are placed by the scaler as usual
+
+| kyverno
+| optional
+| policy engine; one replica per controller, `ha`: 3
+  admission controllers
 |===
+
+Optional add-ons with settings take them as a JSON object
+(the add-on list shows each one's `options`); the
+Add-ons panel builds the form from it. *Disable* removes
+an optional add-on (back to available).
+
+[source,sh]
+----
+pvesh create /cluster/k8s/c1/addons/observability/enable \
+    --config '{"retention":30,"traces":1}'
+pvesh create /cluster/k8s/c1/addons/velero/enable --config \
+    '{"s3-url":"https://s3.example.com","bucket":"k8s","access-key":"AK","secret-key":"SK"}'
+----
 
 Default add-ons are installed by provision and
 reinstalled by it when missing, unless they were turned
@@ -588,6 +653,15 @@ metrics-server is a normal add-on.
   control plane if the original members are gone.
   Restore probing is exit-status based today; making
   it fail-closed is a recorded follow-up.
+* With the velero add-on, the Backups panel also lists
+  application backups. *Backup Now*
+  (`POST .../app-backups`) backs up every namespace,
+  moving volume data to the bucket, and keeps it 30 days;
+  *Restore* (`POST .../app-backups/{backup}/restore`)
+  re-creates the objects that are missing and leaves
+  existing ones as they are. A Kubernetes upgrade takes
+  one first (reason `pre-upgrade`); if it fails, the
+  upgrade stops before anything changed.
 
 == Node and host operations
 
@@ -676,6 +750,9 @@ privilege).
 | POST | `.../addons/{addon}/disable` | turn off a default add-on
 | POST | `.../addons/{addon}/update` | re-apply one add-on at its pinned version
 | POST | `.../addon-updates` | update every add-on that is behind
+| GET | `.../app-backups` | Velero application backups
+| POST | `.../app-backups` | back up every namespace now
+| POST | `.../app-backups/{backup}/restore` | restore one
 | POST | `.../nodes/{node}/drain` | drain a node
 | POST | `.../nodes/{node}/replace` | replace a node
 | POST | `.../nodes/{node}/force-retire` | retire a dead node
