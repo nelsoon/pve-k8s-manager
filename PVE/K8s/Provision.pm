@@ -5887,8 +5887,9 @@ sub user_kubeconfig {
 }
 
 # --- auto-refresh kubeconfigs ------------------------------
-# The kubeconfig holds a PVE API token (k8s-<cluster>, full
-# privileges of its user) instead of a Kubernetes token;
+# The kubeconfig holds a PVE API token (k8s-<cluster>, privilege
+# separated and with no permissions of its own, so a leaked
+# kubeconfig is not a PVE login) instead of a Kubernetes token;
 # kubectl runs pve-k8s-auth, which trades it for a 1h
 # Kubernetes token through the credential call below and
 # caches that. One such token per user and cluster: issuing
@@ -5900,6 +5901,34 @@ sub refresh_token_id {
     my ($name) = @_;
 
     return "k8s-$name";
+}
+
+# Pure: whose PVE privileges decide the Kubernetes role of a
+# credential call. The cluster's own refresh token (user!k8s-<name>)
+# has none of its own: its user's privileges decide, so the role
+# keeps following them. Any other caller (a login, another token)
+# is judged as itself.
+sub credential_principal {
+    my ($caller, $name) = @_;
+
+    my $tid = refresh_token_id($name);
+    return $1 if $caller =~ /^(.+)!\Q$tid\E\z/;
+    return $caller;
+}
+
+# Pure: the refresh tokens of cluster $name in a parsed user.cfg that
+# still act with their user's privileges (made before privilege
+# separation): [userid, tokenid] pairs.
+sub wide_refresh_tokens {
+    my ($usercfg, $name) = @_;
+
+    my $tid = refresh_token_id($name);
+    my @wide;
+    for my $u (sort keys %{ ($usercfg // {})->{users} // {} }) {
+        my $t = (($usercfg->{users}{$u}{tokens} // {})->{$tid}) or next;
+        push @wide, [$u, $tid] if defined $t->{privsep} && !$t->{privsep};
+    }
+    return @wide;
 }
 
 # The 1h token pve-k8s-auth asks for, for the calling user or token.
@@ -5977,8 +6006,9 @@ sub kubeconfig_exec_text {
 }
 
 # Create the user's k8s-<cluster> API token, or give it a new secret.
-# privsep off: the token acts with its user's privileges, so the
-# Kubernetes role keeps following them.
+# Privilege separated with no ACL: it can do nothing in the PVE API
+# but fetch credentials (where credential_principal judges it by
+# its user).
 my sub refresh_api_token {
     my ($userid, $tokenid, $comment) = @_;
 
@@ -5988,12 +6018,29 @@ my sub refresh_api_token {
     my $usercfg = PVE::Cluster::cfs_read_file('user.cfg');
     my $have = PVE::AccessControl::check_token_exist($usercfg, $userid,
         $tokenid, 1);
-    my %p = (userid => $userid, tokenid => $tokenid, privsep => 0,
+    my %p = (userid => $userid, tokenid => $tokenid, privsep => 1,
         comment => $comment);
     my $res = $have
         ? PVE::API2::User->update_token_info({ %p, regenerate => 1 })
         : PVE::API2::User->generate_token({ %p });
     return ($res->{'full-tokenid'}, $res->{value});
+}
+
+# Turn privilege separation on for this cluster's older refresh
+# tokens: the secret stays, so their kubeconfigs keep working.
+sub narrow_refresh_tokens {
+    my ($name) = @_;
+
+    require PVE::AccessControl;
+    require PVE::API2::User;
+    require PVE::Cluster;
+    my @wide = wide_refresh_tokens(PVE::Cluster::cfs_read_file('user.cfg'),
+        $name);
+    for my $w (@wide) {
+        PVE::API2::User->update_token_info({ userid => $w->[0],
+            tokenid => $w->[1], privsep => 1 });
+    }
+    return scalar @wide;
 }
 
 my sub remove_api_token {
@@ -8262,6 +8309,7 @@ sub warm_read_caches {
     if (!@st || $now - $st[9] > 2400) {
         eval { renew_api_credentials($name) };
     }
+    eval { narrow_refresh_tokens($name) };
     my $cp = cert_cache_path($name);
     my @cs = stat $cp;
     if (!@cs || $now - $cs[9] > 5 * 3600) {

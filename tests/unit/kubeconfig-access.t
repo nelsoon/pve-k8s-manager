@@ -182,7 +182,10 @@ like($src, qr/role => 'admin', seconds => 3600, exec_only => 1,/,
     'pve-k8s\'s own account bootstraps over guest exec');
 like($src, qr/my \@reqs = \$o\{exec_only\} \? \(\) : identity_requests\(%o\);/,
     'user identities go over vsock first');
-like($src, qr/privsep => 0,/, 'the API token acts with its user\'s privileges');
+like($src, qr/privsep => 1,/, 'the API token is privilege separated (no PVE rights of its own)');
+like($src, qr/eval \{ narrow_refresh_tokens\(\$name\) \};/, 'older wide tokens are narrowed by the timer');
+like($api, qr/my \$who = PVE::K8s::Provision::credential_principal\(\$user,\s+\$param->\{name\}\);\s+\$rpcenv->check\(\$who, '\/cluster', \['Sys\.Audit'\]\);/,
+    'credential: Sys.Audit checked on the principal');
 like($src, qr/PVE::API2::User->update_token_info\(\{ %p, regenerate => 1 \}\)/,
     'a new kubeconfig replaces the secret');
 like($src, qr/# a fresh identity[^\n]*\n\s+remove_identities\(\$name, \$nodes, user_sa_name\(\$full\)\);/,
@@ -193,8 +196,25 @@ like($src, qr/if \$userid =~ \/!\/;/, 'auto-refresh is for user logins');
 like($src, qr/renew_manager_token\(\$name, \$cp, \$tf, \$cf\)/, 'the manager token renews over vsock');
 like($api, qr/path => '\{name\}\/kubeconfig',\s+method => 'POST',[\s\S]*?\['Sys\.Audit'\]/,
     'auto-refresh kubeconfig: POST, Sys.Audit');
-like($api, qr/path => '\{name\}\/credential',\s+method => 'GET',[\s\S]*?\['Sys\.Audit'\]/,
-    'credential call for pve-k8s-auth');
+like($api, qr/path => '\{name\}\/credential',\s+method => 'GET',[\s\S]*?user => 'all',/,
+    'credential call for pve-k8s-auth: checked in code');
+
+my $who = $P->can('credential_principal');
+is($who->('alice@pve!k8s-local', 'local'), 'alice@pve', 'own refresh token: judged by its user');
+is($who->('alice@pve', 'local'), 'alice@pve', 'a login is itself');
+is($who->('alice@pve!k8s-other', 'local'), 'alice@pve!k8s-other', 'another cluster\'s token is itself');
+is($who->('alice@pve!ci', 'local'), 'alice@pve!ci', 'any other token is itself');
+is($who->('alice@pve!k8s-local2', 'local'), 'alice@pve!k8s-local2', 'name must match exactly');
+is($who->('a!k8s-local@pve!k8s-local', 'local'), 'a!k8s-local@pve', 'only the last token part');
+my $wide = $P->can('wide_refresh_tokens');
+is_deeply([$wide->({ users => {
+    'a@pve' => { tokens => { 'k8s-local' => { privsep => 0 } } },
+    'b@pve' => { tokens => { 'k8s-local' => { privsep => 1 } } },
+    'c@pve' => { tokens => { 'k8s-other' => { privsep => 0 } } },
+    'd@pve' => { tokens => { 'k8s-local' => {} } },
+    'e@pve' => {},
+} }, 'local')], [['a@pve', 'k8s-local']], 'only this cluster\'s wide tokens');
+is_deeply([$wide->(undef, 'local')], [], 'no user.cfg, nothing');
 like($js, qr/defaultFocus: 'no',/, 'replacing the token is confirmed');
 like($js, qr/itemId: 'helper',/, 'pve-k8s-auth can be downloaded');
 

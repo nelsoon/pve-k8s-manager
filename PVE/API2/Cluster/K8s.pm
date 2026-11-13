@@ -778,7 +778,10 @@ __PACKAGE__->register_method({
         . "token (what pve-k8s-auth asks for): cluster-admin with "
         . "Sys.Modify, read-only (view) with Sys.Audit.",
     permissions => {
-        check => ['perm', '/cluster', ['Sys.Audit']],
+        description => "Sys.Audit on /cluster. The cluster's own "
+            . "auto-refresh token (user!k8s-<name>) has no permissions "
+            . "of its own and is judged by its user's.",
+        user => 'all',
     },
     parameters => {
         additionalProperties => 0,
@@ -790,7 +793,10 @@ __PACKAGE__->register_method({
 
         my $rpcenv = PVE::RPCEnvironment::get();
         my $user = $rpcenv->get_user();
-        my $admin = $rpcenv->check($user, '/cluster', ['Sys.Modify'], 1);
+        my $who = PVE::K8s::Provision::credential_principal($user,
+            $param->{name});
+        $rpcenv->check($who, '/cluster', ['Sys.Audit']);
+        my $admin = $rpcenv->check($who, '/cluster', ['Sys.Modify'], 1);
         return PVE::K8s::Provision::user_credential($param->{name},
             $user, $admin ? 1 : 0);
     }});

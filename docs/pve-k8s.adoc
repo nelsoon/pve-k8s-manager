@@ -182,9 +182,14 @@ For daily use, choose *Auto-refresh* as the validity
 https://pve.example.com:8006`). Instead of a Kubernetes
 token, the kubeconfig carries a PVE API token,
 `<user>!k8s-<cluster>`, which pve-k8s creates under the
-calling user. Its privilege separation is off, so it
-acts with the user's privileges and the role keeps
-following them. kubectl runs `pve-k8s-auth` (an exec
+calling user. The token is privilege separated and has
+no permissions of its own, so it cannot do anything else
+in the PVE API and a leaked kubeconfig is not a PVE
+login. When it asks for credentials, its user's
+privileges decide the role, so the role keeps following
+them. Tokens made by earlier versions (without privilege
+separation) are narrowed by the scaler timer; their
+secret, and so their kubeconfig, stays valid. kubectl runs `pve-k8s-auth` (an exec
 credential plugin, like `aws eks get-token`), which
 trades the API token for a 1-hour Kubernetes token
 (`GET .../credential`) and caches it until 5 minutes
