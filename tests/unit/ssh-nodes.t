@@ -21,4 +21,11 @@ is_deeply($ssh->('cloud3', 'qm list'),
     is($ssh->('other', 'x')->[5], 'other', 'unknown node keeps its name');
 }
 
+# flat-mode node subnet must be on the host
+my $on = PVE::K8s::Provision->can('node_subnet_on_host');
+my $ipo = "2: vmbr0    inet 10.0.2.51/24 brd 10.0.2.255 scope global vmbr0\n";
+ok($on->('10.0.2', $ipo), 'LAN subnet is on the host');
+ok(!$on->('10.10.1', $ipo), 'unrouted subnet is not');
+ok(!$on->('10.0', "inet 10.0.20.5/24\n"), 'prefix match is exact');
+
 done_testing;

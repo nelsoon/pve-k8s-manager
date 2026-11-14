@@ -2503,6 +2503,27 @@ sub install_proxmox_csi {
     return 1;
 }
 
+# Flat mode (no SDN zone): node VMs attach to the host bridge, so the
+# node subnet must be one the host has an address in. Pure: takes the
+# prefix ("10.0.2") and `ip -o -4 addr` output.
+sub node_subnet_on_host {
+    my ($prefix, $ip_out) = @_;
+
+    return scalar($ip_out =~ /\binet \Q$prefix\E\.\d+\//) ? 1 : 0;
+}
+
+my sub assert_node_subnet_reachable {
+    my ($scfg, $prefix) = @_;
+
+    return if $scfg->{'sdn-zone'};
+    my $out = run(['ip', '-o', '-4', 'addr', 'show'], timeout => 30);
+    return if node_subnet_on_host($prefix, $out);
+    die "node-subnet $prefix.0/24 is not a subnet of this host's "
+        . "network and no SDN zone is set, so the nodes could "
+        . "never reach their gateway. Pick an SDN zone (nodes "
+        . "get a private VNet) or a node subnet on the LAN.\n";
+}
+
 sub provision_cluster {
     my ($name) = @_;
 
@@ -2525,6 +2546,7 @@ sub provision_cluster {
     $subnet =~ m|^(\d+\.\d+\.\d+)\.0/24$|
         or die "node-subnet must be a /24, got '$subnet'\n";
     my $prefix = $1;
+    assert_node_subnet_reachable($scfg, $prefix);
 
     # Addressing inside the /24: node IPs from .60 (CP) and
     # .70 (workers); the apiserver VIP at .59 of the public

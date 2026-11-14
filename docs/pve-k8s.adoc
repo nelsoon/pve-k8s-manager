@@ -60,6 +60,12 @@ pvesh create /cluster/k8s --name c1 --k8s-version 1.36 \
     --storage local-lvm --builder-ip 192.168.206.50
 ----
 
+Without an SDN zone the nodes sit on the host bridge, so the
+node subnet must be a subnet the PVE host has an address in;
+provision refuses any other subnet before it builds anything
+(the nodes could not reach their gateway). With a zone the
+nodes get a private VNet and any free subnet works.
+
 Creating records the cluster (`state: config-only`);
 nothing is built until provision. Kubernetes 1.35, 1.36
 and 1.37 can be created; 1.36 is the default. 1.37 is a
