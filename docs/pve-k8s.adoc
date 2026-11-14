@@ -692,6 +692,17 @@ Node identity is always verified against the live VM
 recycled by Proxmox, and the plugin will not touch a
 VM that merely inherited a dead node's ID.
 
+=== How PVE hosts reach each other
+
+Work on another PVE host (creating a VM there, reading its
+config) runs over the cluster's own ssh, the way PVE does it:
+the node's address from the cluster (not its name, so hosts
+need not resolve each other) and the cluster `known_hosts`
+under the node's name (`HostKeyAlias`). A cluster whose
+`/etc/pve/priv/known_hosts` lacks a node fails with "Host key
+verification failed"; `ssh-keyscan` that node into the file
+(PVE's own migration needs the same).
+
 == User interface
 
 * *Datacenter -> Kubernetes*: the cluster list only

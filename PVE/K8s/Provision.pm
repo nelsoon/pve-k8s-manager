@@ -65,6 +65,7 @@ sub local_node_name {
 # ssh command line for a PVE node. Nodes are not guaranteed to resolve
 # each other by name (a cluster only has to know their IPs), so use
 # the cluster's address for the node and fall back to the bare name.
+# The cluster's known_hosts is keyed by node name, hence HostKeyAlias.
 sub ssh_argv {
     my ($host, $cmd) = @_;
 
@@ -73,7 +74,7 @@ sub ssh_argv {
         PVE::Cluster::remote_node_ip($host);
     };
     $addr = $host if !$addr;
-    return ['ssh', '-o', 'BatchMode=yes', $addr, $cmd];
+    return ['ssh', '-o', 'BatchMode=yes', '-o', "HostKeyAlias=$host", $addr, $cmd];
 }
 
 my sub qm_on {
