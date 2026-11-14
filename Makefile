@@ -19,6 +19,7 @@ lint:
 	@echo "lint ok: $(words $(PERL_FILES)) perl modules, $(words $(JS_FILES)) js files"
 
 test: lint deb
+	@perl -I. -Itests/stubs tests/unit/ssh-nodes.t
 	@perl -I. -Itests/stubs tests/unit/provision-kubeadm.t
 	@perl -I. -Itests/stubs tests/unit/template-recipe.t
 	@perl -I. -Itests/stubs tests/unit/ui-k8s.t

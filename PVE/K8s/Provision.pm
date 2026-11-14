@@ -62,12 +62,26 @@ sub local_node_name {
     return $LOCAL_NODE;
 }
 
+# ssh command line for a PVE node. Nodes are not guaranteed to resolve
+# each other by name (a cluster only has to know their IPs), so use
+# the cluster's address for the node and fall back to the bare name.
+sub ssh_argv {
+    my ($host, $cmd) = @_;
+
+    my $addr = eval {
+        require PVE::Cluster;
+        PVE::Cluster::remote_node_ip($host);
+    };
+    $addr = $host if !$addr;
+    return ['ssh', '-o', 'BatchMode=yes', $addr, $cmd];
+}
+
 my sub qm_on {
     my ($host, @args) = @_;
 
     return qm(@args) if !$host || $host eq local_node_name();
     my $cmd = join ' ', 'qm', map { shq($_) } @args;
-    return run(['ssh', '-o', 'BatchMode=yes', $host, $cmd], timeout => 600);
+    return run(ssh_argv($host, $cmd), timeout => 600);
 }
 
 # Run an arbitrary command on a PVE host (local or via ssh).
@@ -76,7 +90,7 @@ my sub host_run_on {
 
     return run([@args], timeout => 120) if !$host || $host eq local_node_name();
     my $cmd = join ' ', map { shq($_) } @args;
-    return run(['ssh', '-o', 'BatchMode=yes', $host, $cmd], timeout => 120);
+    return run(ssh_argv($host, $cmd), timeout => 120);
 }
 
 # MTU of a bridge on a host; VXLAN SDN bridges are typically
@@ -97,7 +111,7 @@ my sub qm_raw_on {
         return run(['qm', @args], noerr => 1, timeout => 600);
     }
     my $cmd = join ' ', 'qm', map { shq($_) } @args;
-    return run(['ssh', '-o', 'BatchMode=yes', $host, $cmd],
+    return run(ssh_argv($host, $cmd),
         noerr => 1, timeout => 600);
 }
 
@@ -1036,10 +1050,10 @@ my sub write_snippet_on {
             if ($h eq local_node_name()) {
                 write_snippet($file, $content);
             } else {
-                run(['ssh', '-o', 'BatchMode=yes', $h,
+                run(ssh_argv($h,
                     "mkdir -p /var/lib/vz/snippets && "
                     . "echo $b64 | base64 -d "
-                    . "> /var/lib/vz/snippets/$file"],
+                    . "> /var/lib/vz/snippets/$file"),
                     timeout => 120);
             }
             1;
@@ -1063,8 +1077,8 @@ my sub remove_snippet_on {
         if ($h eq local_node_name()) {
             unlink "/var/lib/vz/snippets/$file";
         } else {
-            run(['ssh', '-o', 'BatchMode=yes', $h,
-                "rm -f /var/lib/vz/snippets/$file"],
+            run(ssh_argv($h,
+                "rm -f /var/lib/vz/snippets/$file"),
                 timeout => 60, noerr => 1);
         }
     }
@@ -3549,10 +3563,10 @@ my sub vsock_run {
             "PVE_K8S_CA_FILE=$cf", 'pve-k8s-vsock-get',
             '--cid', $cid, @args], timeout => 60);
     }
-    return run(['ssh', '-o', 'BatchMode=yes', $cp->{pvehost},
+    return run(ssh_argv($cp->{pvehost},
         "PVE_K8S_TOKEN_FILE=$tf PVE_K8S_CA_FILE=$cf "
         . "pve-k8s-vsock-get --cid $cid "
-        . join(' ', map { shq($_) } @args)], timeout => 60);
+        . join(' ', map { shq($_) } @args)), timeout => 60);
 }
 
 my sub vsock_requests {
