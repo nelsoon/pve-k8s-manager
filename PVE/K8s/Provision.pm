@@ -7717,7 +7717,8 @@ sub velero_name {
     return substr($n, 0, 63) =~ s/-+$//r;
 }
 
-# Pure: the Backup object pve-k8s creates (every namespace, volumes
+# Pure: the Backup object pve-k8s creates (every namespace but the
+# system ones pve-k8s rebuilds itself, volumes
 # copied from the running pods to the bucket, kept 30 days).
 sub app_backup_object {
     my ($bname, $reason) = @_;
@@ -7726,7 +7727,9 @@ sub app_backup_object {
         apiVersion => 'velero.io/v1', kind => 'Backup',
         metadata => { name => $bname, namespace => 'velero',
             labels => { 'pve-k8s.proxmox.com/reason' => $reason } },
-        spec => { includedNamespaces => ['*'], defaultVolumesToFsBackup => JSON::PP::true(),
+        spec => { includedNamespaces => ['*'],
+            excludedNamespaces => [qw(kube-system kube-public kube-node-lease velero spegel)],
+            defaultVolumesToFsBackup => JSON::PP::true(),
             storageLocation => 'default', ttl => '720h0m0s' },
     };
 }

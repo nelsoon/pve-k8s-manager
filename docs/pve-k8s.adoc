@@ -440,8 +440,8 @@ where its running version is read in the cluster.
 
 | snapshot-controller
 | default
-| VolumeSnapshot CRDs and controller (Proxmox CSI and
-  ceph-csi snapshots). Turning it off keeps the
+| VolumeSnapshot CRDs and controller (ceph-csi
+  snapshots). Turning it off keeps the
   CRDs, so existing snapshots stay.
 
 | node-problem-detector
@@ -676,7 +676,7 @@ metrics-server is a normal add-on.
   it fail-closed is a recorded follow-up.
 * With the velero add-on, the Backups panel also lists
   application backups. *Backup Now*
-  (`POST .../app-backups`) backs up every namespace,
+  (`POST .../app-backups`) backs up every namespace except the system ones (kube-system, velero, spegel),
   moving volume data to the bucket, and keeps it 30 days;
   *Restore* (`POST .../app-backups/{backup}/restore`)
   re-creates the objects that are missing and leaves

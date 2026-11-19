@@ -363,6 +363,7 @@ like($api, qr/path => '\{name\}\/addon-updates',[\s\S]*?Sys\.Modify/,
     like($vel, qr/create secret generic velero-s3/, 'credentials go into a cluster Secret');
     like($vel, qr/existingSecret: velero-s3/, 'the chart uses that Secret');
     unlike($vel, qr/VolumeSnapshotClass|EnableCSI/, 'no CSI snapshots: Proxmox CSI has none');
+    like($vel, qr/control-plane, operator: Exists/, 'the node agent also runs on control planes');
     like($vel, qr/defaultVolumesToFsBackup: true/, 'volumes are backed up from the pods');
     unlike($A->can('velero_install_cmd')->('/k', '1.36', { 's3-url' => 'https://s3:7480',
         bucket => 'b', region => 'default' }), qr/create secret/, 'an update keeps the Secret');
@@ -426,6 +427,7 @@ like($api, qr/path => '\{name\}\/addon-updates',[\s\S]*?Sys\.Modify/,
     is(length($P->can('velero_name')->('restore-' . ('x' x 80), 1)), 63, 'and at most 63 long');
     my $b = $P->can('app_backup_object')->('n', 'manual');
     is_deeply($b->{spec}{includedNamespaces}, ['*'], 'every namespace');
+    ok((grep { $_ eq 'kube-system' } $b->{spec}{excludedNamespaces}->@*), 'but not the system ones');
     ok($b->{spec}{defaultVolumesToFsBackup}, 'volumes backed up from the running pods');
     is($b->{spec}{ttl}, '720h0m0s', 'kept 30 days');
     ok(!$P->can('velero_enabled')->({}), 'no record: not enabled');

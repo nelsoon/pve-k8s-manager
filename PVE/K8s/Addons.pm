@@ -978,6 +978,9 @@ credentials:
   useSecret: true
   existingSecret: velero-s3
 deployNodeAgent: true
+nodeAgent:
+  tolerations:
+  - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
 snapshotsEnabled: false
 configuration:
   defaultVolumesToFsBackup: true
