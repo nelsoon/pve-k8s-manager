@@ -14,7 +14,8 @@ Decisions).
   reproducible from these pins plus this repo's git SHA.
 - `cloud-init/user-data.tmpl` — first-boot customisation applied
   to the pristine Debian cloud image inside the builder VM:
-  containerd, kubelet/kubeadm/kubectl (held), qemu-guest-agent,
+  containerd 2.x (Docker's apt repo; Debian 13's 1.7 is end of
+  life and too old for Spegel), kubelet/kubeadm/kubectl (held), qemu-guest-agent,
   kernel modules/sysctls for Kubernetes, SSH server removed.
 - `build-template.sh` — runs on a Proxmox node: creates the
   builder VM from the cloud image, waits for cloud-init to

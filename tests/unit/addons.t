@@ -262,6 +262,12 @@ like($api, qr/assert_network_config/,
     my $live = $A->can('probe_versions')->($lists, 'nfs');
     is($live->{cilium}, '1.20.3', 'cilium from its DaemonSet');
     is($live->{'gateway-api'}, '1.5.1', 'Gateway API from the CRD bundle annotation');
+    my $sp = $A->can('probe_versions')->({ daemonset => { items => [{
+        metadata => { namespace => 'spegel', name => 'spegel',
+            labels => { 'app.kubernetes.io/version' => 'v0.8.1' } },
+        spec => { template => { spec => { containers => [
+            { image => 'ghcr.io/spegel-org/spegel@sha256:abc' }] } } } }] } }, 'nfs');
+    is($sp->{spegel}, '0.8.1', 'Spegel version from its label (image is digest-pinned)');
     is($live->{'proxmox-csi'}, '0.20.0', 'the matching container, not a sidecar');
     is($live->{'shared-file'}, '4.13.6', 'NFS driver for an nfs file tier');
     is($live->{'cert-manager'}, 'unknown', 'present but unreadable tag: unknown');

@@ -1199,7 +1199,9 @@ our @CATALOG = (
     { name => 'spegel', tier => 'default',
       title => 'Nodes share cached image layers (faster rolls, scale-out and repairs)',
       version => sub { $SPEGEL_VERSION },
-      probe => { kind => 'daemonset', ns => 'spegel', name => 'spegel' } },
+      # the chart pins the image by digest; its label carries the version
+      probe => { kind => 'daemonset', ns => 'spegel', name => 'spegel',
+          label => 'app.kubernetes.io/version' } },
     { name => 'descheduler', tier => 'default',
       title => 'Rebalances pods; run by pve-k8s after rolls and scale-outs',
       version => sub { descheduler_version_for($_[0]) },
@@ -1395,9 +1397,11 @@ sub probe_versions {
         my $p = ref $e->{probe} eq 'CODE' ? $e->{probe}->($backend) : $e->{probe};
         my $o = $idx{$p->{kind}}{($p->{ns} // '') . '/' . $p->{name}} or next;
         my $ver;
-        if ($p->{annotation}) {
-            ($ver) = ((($o->{metadata} // {})->{annotations} // {})
-                ->{$p->{annotation}} // '') =~ /^v?(\d+\.\d+\.\d+)/;
+        if ($p->{annotation} || $p->{label}) {
+            my $kind = $p->{label} ? 'labels' : 'annotations';
+            ($ver) = ((($o->{metadata} // {})->{$kind} // {})
+                ->{$p->{label} // $p->{annotation}} // '')
+                =~ /^v?(\d+\.\d+\.\d+)/;
         } else {
             my $want = $p->{image} // $p->{name};
             my $spec = $o->{spec} // {};

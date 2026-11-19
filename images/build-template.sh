@@ -154,6 +154,10 @@ grep -q 'kubeadm: v' /tmp/k8s-build-report.$$.json \
     || { echo "image report missing kubeadm; build is bad" >&2; exit 1; }
 grep -q 'MISSING' /tmp/k8s-build-report.$$.json \
     && { echo "image report has MISSING components" >&2; exit 1; }
+grep -q 'containerd: containerd .* v2\.' /tmp/k8s-build-report.$$.json \
+    || { echo "image report: containerd is not 2.x; build is bad" >&2; exit 1; }
+grep -qE 'cri-config: [4-9]' /tmp/k8s-build-report.$$.json \
+    || { echo "image report: containerd config incomplete" >&2; exit 1; }
 rm -f /tmp/k8s-build-report.$$.json
 
 qm shutdown "$VMID" >/dev/null

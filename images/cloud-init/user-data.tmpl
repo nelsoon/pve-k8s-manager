@@ -14,7 +14,6 @@ package_update: true
 package_upgrade: false
 
 packages:
-  - containerd
   - qemu-guest-agent
   - apt-transport-https
   - ca-certificates
@@ -38,29 +37,6 @@ write_files:
       net.bridge.bridge-nf-call-iptables = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward = 1
-  - path: /etc/containerd/config.toml
-    content: |
-      version = 2
-      # Cilium drops its binary in /opt/cni/bin, but the
-      # Debian 13 containerd defaults bin_dir to
-      # /usr/lib/cni (Debian 12 defaulted to /opt/cni/bin,
-      # which is why old templates worked). Pin it.
-      [plugins."io.containerd.grpc.v1.cri".cni]
-        bin_dir = "/opt/cni/bin"
-      [plugins."io.containerd.grpc.v1.cri"]
-        sandbox_image = "registry.k8s.io/pause:3.10"
-      # Spegel (node-to-node image sharing): registry mirrors
-      # from certs.d, and unpacked layers kept so a node can
-      # serve what it has pulled.
-      [plugins."io.containerd.grpc.v1.cri".registry]
-        config_path = "/etc/containerd/certs.d"
-      [plugins."io.containerd.grpc.v1.cri".containerd]
-        default_runtime_name = "runc"
-        discard_unpacked_layers = false
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-        runtime_type = "io.containerd.runc.v2"
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-        SystemdCgroup = true
   # Management channel: the PVE host reaches the apiserver
   # over virtio-vsock (no IP route into the node zone).
   # Harmless on workers: nothing connects without a
@@ -85,6 +61,21 @@ runcmd:
   - systemctl mask apt-daily.service apt-daily-upgrade.service || true
   - modprobe overlay br_netfilter
   - sysctl --system
+  # containerd 2.x from Docker's signed apt repo (Debian 13 ships
+  # 1.7, which is end of life; Kubernetes needs the CRI RuntimeConfig
+  # method and Spegel needs 2.2+). Its package carries runc.
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian trixie stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y 'containerd.io=2.*'
+  - apt-mark hold containerd.io
+  # Start from the version's own defaults, change only what we need:
+  # systemd cgroups, Cilium's CNI dir, Spegel's registry mirrors and
+  # unpacked layers kept so a node can serve what it has pulled.
+  - |
+    containerd config default > /etc/containerd/config.toml
+    sed -i "s|SystemdCgroup = .*|SystemdCgroup = true|; s|discard_unpacked_layers = .*|discard_unpacked_layers = false|; s|^\( *config_path = \).*|\1'/etc/containerd/certs.d'|; s|^\( *bin_dirs\? = \).*|\1['/opt/cni/bin']|; s|^\( *bin_dir = \).*|\1'/opt/cni/bin'|" /etc/containerd/config.toml
   - systemctl enable --now containerd qemu-guest-agent open-iscsi iscsid
   - systemctl enable --now k8s-api-vsock || true
   # Kubernetes packages, pinned to the minor line and held.
@@ -94,6 +85,11 @@ runcmd:
   - apt-get update
   - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl
   - apt-mark hold kubelet kubeadm kubectl
+  # the sandbox (pause) image kubeadm expects, so nothing is pulled at runtime
+  - |
+    PAUSE=$(kubeadm config images list 2>/dev/null | grep '/pause:' | head -1)
+    sed -i "s|^\( *sandbox = \).*|\1'$PAUSE'|" /etc/containerd/config.toml
+    systemctl restart containerd
   - kubeadm config images pull
   # Nodes are appliances: no SSH server in the template.
   - systemctl disable --now ssh || true
@@ -106,6 +102,7 @@ runcmd:
       echo "kubeadm: $(kubeadm version -o short 2>/dev/null || echo MISSING)"
       echo "kubelet: $(kubelet --version 2>/dev/null || echo MISSING)"
       echo "containerd: $(containerd --version 2>/dev/null || echo MISSING)"
+      echo "cri-config: $(grep -cE "SystemdCgroup = true|config_path = '/etc/containerd/certs.d'|/opt/cni/bin|discard_unpacked_layers = false" /etc/containerd/config.toml)"
       echo "conntrack: $(conntrack --version 2>/dev/null || echo MISSING)"
       echo "agent: $(dpkg-query -W -f='${Version}' qemu-guest-agent 2>/dev/null || echo MISSING)"
       echo "ssh-listener: $(ss -tln | grep -c ':22 ' || true)"

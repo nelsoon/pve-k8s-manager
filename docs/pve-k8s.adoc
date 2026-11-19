@@ -456,7 +456,10 @@ where its running version is read in the cluster.
   a new node (roll, scale-out, repair) pulls mostly from
   its neighbours; stateless, the registry stays the
   fallback. Needs node images from this release (containerd
-  `config_path`); on older nodes it is inert.
+  2.2 or later with registry `config_path`; Spegel refuses
+  to start on containerd 1.7). Its version is read from the
+  chart's `app.kubernetes.io/version` label (the image is
+  pinned by digest).
 
 | descheduler
 | default
