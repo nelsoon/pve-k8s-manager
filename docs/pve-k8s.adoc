@@ -676,8 +676,9 @@ metrics-server is a normal add-on.
   it fail-closed is a recorded follow-up.
 * With the velero add-on, the Backups panel also lists
   application backups. *Backup Now*
-  (`POST .../app-backups`) backs up every namespace except the system ones (kube-system, velero, spegel),
-  moving volume data to the bucket, and keeps it 30 days;
+  (`POST .../app-backups`) backs up every namespace except the system ones
+  (kube-system, velero, spegel), copying volume data to
+  the bucket, and keeps it 30 days;
   *Restore* (`POST .../app-backups/{backup}/restore`)
   re-creates the objects that are missing and leaves
   existing ones as they are. A Kubernetes upgrade takes
