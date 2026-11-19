@@ -830,6 +830,9 @@ Ext.define('PVE.dc.K8sAddonOptionsWindow', {
             } else if (o.type === 'enum') {
                 Ext.apply(f, { xtype: 'proxmoxKVComboBox',
                     comboItems: o.values.map(v => [v, v]) });
+            } else if (o.type === 'pem') {
+                Ext.apply(f, { xtype: 'textarea', height: 110,
+                    fieldStyle: 'font-family: monospace;' });
             } else {
                 Ext.apply(f, { xtype: 'textfield',
                     inputType: o.secret ? 'password' : 'text' });

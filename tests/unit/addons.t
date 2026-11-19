@@ -370,6 +370,21 @@ like($api, qr/path => '\{name\}\/addon-updates',[\s\S]*?Sys\.Modify/,
     ok(!eval { $A->can('velero_install_cmd')->('/k', '1.36', { 's3-url' => 'ftp://x',
         bucket => 'b' }); 1 }, 'non-http S3 URL refused');
 
+    # a private CA for the S3 endpoint
+    my $pem = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKHBfpegPjMCMA0GCSqGSIb3DQEBCwUA\n-----END CERTIFICATE-----\n";
+    my $vv = $A->can('velero_values_yaml')->(bucket => 'b', 's3-url' => 'https://s3',
+        'ca-cert' => $pem);
+    like($vv, qr/^    caCert: [A-Za-z0-9+\/=]+$/m, 'the CA goes in as base64 (caCert)');
+    unlike($A->can('velero_values_yaml')->(bucket => 'b', 's3-url' => 'https://s3'),
+        qr/caCert/, 'no CA, no caCert');
+    my $ve = $A->can('catalog_entry')->('velero');
+    my ($all, $store) = $A->can('addon_options')->($ve, { 's3-url' => 'https://s3', bucket => 'b',
+        'access-key' => 'k', 'secret-key' => 's', 'ca-cert' => $pem });
+    ok($store->{'ca-cert'} && !exists $store->{'secret-key'}, 'CA is a plain option, keys stay secret');
+    ok(!eval { $A->can('addon_options')->($ve, { 's3-url' => 'https://s3', bucket => 'b',
+        'access-key' => 'k', 'secret-key' => 's', 'ca-cert' => 'not a cert' }); 1 },
+        'a non-PEM CA is refused');
+
     like($A->can('flux_install_cmd')->('/k', '1.36', {}), qr/annotate deploy source-controller\s+\\\n\s+pve-k8s\.proxmox\.com\/version=/,
         'Flux records its release version');
     unlike($A->can('flux_install_cmd')->('/k', '1.36', {}), qr/flagger/, 'no Flagger unless asked');

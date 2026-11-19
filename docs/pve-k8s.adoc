@@ -500,7 +500,9 @@ where its running version is read in the cluster.
 | velero
 | optional
 | application backups to any S3 (`s3-url`, `bucket`,
-  `region`, `prefix`; `access-key`/`secret-key` only go
+  `region`, `prefix`, `ca-cert` (PEM of a private CA that
+  signed the endpoint certificate; the S3 of pve-s3 needs it
+  with its lab CA); `access-key`/`secret-key` only go
   into the cluster's `velero-s3` Secret). Volume
   snapshots of Proxmox CSI volumes are moved to the
   bucket (data mover, Kopia). See Backups.

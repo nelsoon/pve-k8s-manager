@@ -961,6 +961,11 @@ sub velero_values_yaml {
 
     my $prefix = defined $o{prefix} && $o{prefix} ne ''
         ? "\n    prefix: " . yq1($o{prefix}) : '';
+    my $ca = '';
+    if (defined $o{'ca-cert'} && $o{'ca-cert'} ne '') {
+        require MIME::Base64;
+        $ca = "\n    caCert: " . MIME::Base64::encode_base64($o{'ca-cert'}, '');
+    }
     return <<EOF;
 initContainers:
 - name: velero-plugin-for-aws
@@ -979,7 +984,7 @@ configuration:
   - name: default
     provider: aws
     default: true
-    bucket: @{[ yq1($o{bucket}) ]}$prefix
+    bucket: @{[ yq1($o{bucket}) ]}$prefix$ca
     config:
       region: @{[ yq1($o{region} // 'default') ]}
       s3ForcePathStyle: "true"
@@ -1256,6 +1261,9 @@ our @CATALOG = (
           { name => 'bucket', type => 'string', required => 1 },
           { name => 'region', type => 'string', default => 'default' },
           { name => 'prefix', type => 'string' },
+          { name => 'ca-cert', type => 'pem',
+            description => 'PEM of the CA that signed the S3 endpoint certificate '
+                . '(for a private CA)' },
           { name => 'access-key', type => 'string', required => 1, secret => 1 },
           { name => 'secret-key', type => 'string', required => 1, secret => 1 },
       ] },
@@ -1334,6 +1342,12 @@ sub addon_options {
         } elsif ($t eq 'enum') {
             die "'$o->{name}' must be one of " . join(', ', $o->{values}->@*) . "\n"
                 if !grep { $_ eq $v } $o->{values}->@*;
+        } elsif ($t eq 'pem') {
+            $v =~ s/\r//g;
+            my $cert = qr/\s*-----BEGIN\ CERTIFICATE-----\n[A-Za-z0-9+\/=\n]+\n
+                -----END\ CERTIFICATE-----\s*/x;
+            die "'$o->{name}' must be PEM certificates\n"
+                if length($v) > 16384 || $v !~ /\A(?:$cert)+\z/;
         } else {
             die "'$o->{name}' is too long or has control characters\n"
                 if length($v) > 512 || $v =~ /[\x00-\x1f]/;
