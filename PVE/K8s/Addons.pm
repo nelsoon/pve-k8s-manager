@@ -951,7 +951,9 @@ EOF
 }
 
 # Velero: application backups to S3 (Ceph RGW, pve-s3, any S3),
-# CSI snapshots moved to the bucket by the data mover (Kopia).
+# volumes copied from the running pods by the node agent (Kopia file-system
+# backup): the Proxmox CSI driver has no snapshot support, so CSI snapshots
+# and the data mover cannot be used.
 our $VELERO_CHART_VERSION = '12.2.5';
 our $VELERO_VERSION = '1.18.2';
 our $VELERO_AWS_PLUGIN = '1.14.4';
@@ -978,8 +980,7 @@ credentials:
 deployNodeAgent: true
 snapshotsEnabled: false
 configuration:
-  features: EnableCSI
-  defaultSnapshotMoveData: true
+  defaultVolumesToFsBackup: true
   backupStorageLocation:
   - name: default
     provider: aws
@@ -1010,21 +1011,11 @@ sub velero_install_cmd {
             . "aws_secret_access_key=%s\\n' '$o{'access-key'}' '$o{'secret-key'}')\" "
             . "--dry-run=client -o yaml | kubectl apply -f -\n";
     }
-    # a snapshot class Velero picks for Proxmox CSI volumes
     return sprintf(<<'EOF', helm_ensure_cmd(), $kubeconfig, $secret,
 %s
 export KUBECONFIG=%s
 kubectl create namespace velero --dry-run=client -o yaml | kubectl apply -f -
-%skubectl apply -f - <<'VSC'
-apiVersion: snapshot.storage.k8s.io/v1
-kind: VolumeSnapshotClass
-metadata:
-  name: proxmox-velero
-  labels: {velero.io/csi-volumesnapshot-class: "true"}
-driver: csi.proxmox.sinextra.dev
-deletionPolicy: Delete
-VSC
-cat > /root/velero-values.yaml <<'VALUES'
+%scat > /root/velero-values.yaml <<'VALUES'
 %sVALUES
 helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts >/dev/null 2>&1 || true
 helm repo update vmware-tanzu >/dev/null

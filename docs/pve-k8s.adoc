@@ -441,7 +441,7 @@ where its running version is read in the cluster.
 | snapshot-controller
 | default
 | VolumeSnapshot CRDs and controller (Proxmox CSI and
-  ceph-csi snapshots, Velero). Turning it off keeps the
+  ceph-csi snapshots). Turning it off keeps the
   CRDs, so existing snapshots stay.
 
 | node-problem-detector
@@ -503,9 +503,11 @@ where its running version is read in the cluster.
   `region`, `prefix`, `ca-cert` (PEM of a private CA that
   signed the endpoint certificate; the S3 of pve-s3 needs it
   with its lab CA); `access-key`/`secret-key` only go
-  into the cluster's `velero-s3` Secret). Volume
-  snapshots of Proxmox CSI volumes are moved to the
-  bucket (data mover, Kopia). See Backups.
+  into the cluster's `velero-s3` Secret). Volumes
+  are copied from the running pods to the
+  bucket (Kopia file-system backup; the Proxmox CSI driver
+  has no snapshot support, so CSI snapshots are not
+  used). See Backups.
 
 | flux
 | optional
