@@ -70,12 +70,13 @@ runcmd:
   - apt-get update
   - DEBIAN_FRONTEND=noninteractive apt-get install -y 'containerd.io=2.*'
   - apt-mark hold containerd.io
-  # Start from the version's own defaults, change only what we need:
+  # Start from the version's own defaults, change only what we need
+  # (never a bare `bin_dir`: the image-verifier plugin has one too):
   # systemd cgroups, Cilium's CNI dir, Spegel's registry mirrors and
   # unpacked layers kept so a node can serve what it has pulled.
   - |
     containerd config default > /etc/containerd/config.toml
-    sed -i "s|SystemdCgroup = .*|SystemdCgroup = true|; s|discard_unpacked_layers = .*|discard_unpacked_layers = false|; s|^\( *config_path = \).*|\1'/etc/containerd/certs.d'|; s|^\( *bin_dirs\? = \).*|\1['/opt/cni/bin']|; s|^\( *bin_dir = \).*|\1'/opt/cni/bin'|" /etc/containerd/config.toml
+    sed -i "s|SystemdCgroup = .*|SystemdCgroup = true|; s|discard_unpacked_layers = .*|discard_unpacked_layers = false|; s|^\( *config_path = \).*|\1'/etc/containerd/certs.d'|; s|^\( *bin_dirs = \).*|\1['/opt/cni/bin']|" /etc/containerd/config.toml
   - systemctl enable --now containerd qemu-guest-agent open-iscsi iscsid
   - systemctl enable --now k8s-api-vsock || true
   # Kubernetes packages, pinned to the minor line and held.

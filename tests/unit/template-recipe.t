@@ -24,6 +24,8 @@ like($recipe, qr/containerd config default > \/etc\/containerd\/config\.toml/,
     'containerd config starts from the version defaults');
 like($recipe, qr/SystemdCgroup = true/,
     'containerd config uses the systemd cgroup driver to match kubelet');
+unlike($recipe, qr/bin_dirs\\\?|\( \*bin_dir = /,
+    'the sed never touches the image verifier bin_dir (blocks every pull)');
 like($recipe, qr/\/opt\/cni\/bin/,
     'containerd pins the CNI bin dir (Cilium installs there)');
 like($recipe, qr/certs\.d/, 'containerd reads registry mirrors from certs.d (Spegel)');
